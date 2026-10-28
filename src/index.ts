@@ -28,8 +28,9 @@ export const inject = []
 /** Largest accepted request body (bytes) — dispatch payloads are task text. */
 const BODY_LIMIT = 256 * 1024
 
-/** The settings namespace this plugin serves; the browser card spells the same string. */
-export const MAESTRO_NS = 'maestro-codex'
+/** The settings namespace this plugin serves — the composition entry id, which
+ * the browser half reads configForms by (the same string). */
+export const MAESTRO_NS = 'dsh-maestro-codex'
 
 /** Cordis resolves the composition entry's config through this schema before `apply` runs. */
 export { Config, validateConfig } from './config.js'

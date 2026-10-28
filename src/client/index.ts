@@ -12,8 +12,9 @@ import type { ClientContext } from './types.js'
 import { MaestroCard } from './MaestroCard.js'
 import { MaestroForm, type SectionValue } from './form.js'
 
-/** The host entry id — the same string the host spells as its settings namespace. */
-export const PLUGIN_ENTRY_ID = 'maestro-codex'
+/** The host entry id — the cordis.patch.yml row id, and the settings namespace
+ * the configForms service projects this plugin's volatile config under. */
+export const PLUGIN_ENTRY_ID = 'dsh-maestro-codex'
 
 /** The plugin package name: the key the Plugins page dispatches the card by. */
 export const PLUGIN_PACKAGE = 'dsh-maestro-codex'
@@ -35,22 +36,45 @@ export function apply(ctx: ClientContext): void {
 
   const describeFace = ctx.configForms.describe()
   let configDisposer: (() => void) | undefined
+  let sectionDisposer: (() => void) | undefined
   const syncCardSeat = (): void => {
     const snapshot = describeFace.getSnapshot()
     const served = snapshot.status === 'ready'
       && (snapshot.view?.namespaces?.some(entry => entry.ns === PLUGIN_ENTRY_ID) ?? false)
     if (served && configDisposer === undefined) {
-      configDisposer = ctx.slots.inject('plugins.bundle.config', () => ctx.slots.register({
+      const register = (): unknown => ctx.slots.register({
         name: 'plugins.bundle.config',
         key: PLUGIN_PACKAGE,
         inject: () => ({
           maestroStore: store,
           maestro: form.actions(),
         }),
-      }, MaestroCard))
+      }, MaestroCard)
+      configDisposer = ctx.slots.inject('plugins.bundle.config', register)
+      // A settings-page nav entry of our own (the left menu), rendering the
+      // same card. Registration options are plain data; a shape mismatch must
+      // not take the rest of the client down.
+      try {
+        sectionDisposer = ctx.slots.inject('settings.section', () => ctx.slots.register({
+          name: 'settings.section',
+          id: 'maestro-codex',
+          order: 90,
+          label: 'CLI 子代理（codex / claude）',
+          inject: () => ({
+            maestroStore: store,
+            maestro: form.actions(),
+          }),
+        }, MaestroCard))
+      } catch {
+        sectionDisposer = undefined
+      }
     } else if (!served && configDisposer !== undefined) {
       configDisposer()
       configDisposer = undefined
+      if (sectionDisposer !== undefined) {
+        sectionDisposer()
+        sectionDisposer = undefined
+      }
     }
   }
   const unsubscribeDescribe = describeFace.subscribe(syncCardSeat)
@@ -59,5 +83,6 @@ export function apply(ctx: ClientContext): void {
   ctx.effect(() => () => {
     unsubscribeDescribe()
     if (configDisposer !== undefined) configDisposer()
+    if (sectionDisposer !== undefined) sectionDisposer()
   }, 'maestro-codex: plugin config card lifecycle')
 }
