@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "CLI 子代理编排（codex / claude）",
+    "description": "按任务类型把任务派发给 codex cli 或 claude cli 执行并取回结果；配置页管理路由表、每个 CLI 的权限与模型，以及 CLI 的安装/更新/卸载"
+  }
+}

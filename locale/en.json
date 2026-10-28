@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "CLI Subagent Orchestration (codex / claude)",
+    "description": "Dispatch tasks to codex cli or claude cli by task type and bring the result back into the conversation; the config card manages routing, per-CLI permissions and models, and CLI install/update/uninstall"
+  }
+}
