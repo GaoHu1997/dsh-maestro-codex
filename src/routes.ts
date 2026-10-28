@@ -10,6 +10,7 @@ import { parseDispatchParams, runDispatch, type DispatchDeps } from './dispatch.
 import { detectCli, runNpmJob } from './cli-manager.js'
 import { isTerminalPhase } from './task-registry.js'
 import { routingHint } from './routing.js'
+import type { DshModelCatalog } from './dsh-models.js'
 import { CLI_PACKAGES, CLI_LABELS, MAESTRO_CLI_IDS, type MaestroCliId, type MaestroCliStatus, type MaestroOverview, type MaestroRouteError, type MaestroTaskDetail, type MaestroTaskRef, type MaestroTaskSummary } from './wire.js'
 
 /** One uniform handler outcome. */
@@ -32,6 +33,8 @@ export interface RouteDeps extends DispatchDeps {
   statusStore: StatusStore
   /** The registered tool name (hint text + dispatch echo). */
   toolName: () => string
+  /** The dsh model catalog for the card's model pickers. */
+  listDshModels: () => Promise<DshModelCatalog>
 }
 
 /**
@@ -222,4 +225,14 @@ export function handleCliNpmJob(deps: RouteDeps, action: 'install' | 'uninstall'
 export function handleHint(deps: RouteDeps): RouteOutcome {
   const config = deps.readConfig()
   return ok({ hint: routingHint(config, deps.toolName()), redacted: redactEffective(config) })
+}
+
+/** GET models — the dsh provider/model catalog for the card's pickers. */
+export async function handleModels(deps: RouteDeps): Promise<RouteOutcome> {
+  try {
+    const catalog = await deps.listDshModels()
+    return ok({ providers: catalog.providers })
+  } catch (error) {
+    return fail(500, error instanceof Error ? error.message : String(error))
+  }
 }

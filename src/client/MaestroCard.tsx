@@ -8,9 +8,9 @@
  */
 
 import { useCallback, useEffect, useRef, useState, useSyncExternalStore, type ReactNode } from 'react'
-import { cancelTask, dispatchManual, fetchOverview, fetchTaskDetail, installCli, refreshCli, uninstallCli, type Call } from './api.js'
+import { cancelTask, dispatchManual, fetchModels, fetchOverview, fetchTaskDetail, installCli, refreshCli, uninstallCli, type Call } from './api.js'
 import { fieldText, type MaestroFormActions, type MaestroFormState, type MaestroStore, type StagedField } from './form.js'
-import { CLI_LABELS, MAESTRO_CLI_IDS, type MaestroCliId, type MaestroOverview, type MaestroPhase, type MaestroTaskDetail, type MaestroTaskSummary } from '../wire.js'
+import { CLI_LABELS, MAESTRO_CLI_IDS, type DshProviderModels, type MaestroCliId, type MaestroOverview, type MaestroPhase, type MaestroTaskDetail, type MaestroTaskSummary } from '../wire.js'
 
 /** The props the slot entry injects (see client/index.ts). */
 export interface MaestroCardProps {
@@ -91,11 +91,44 @@ function SwitchRow(props: { label: string; checked: boolean; onChange: (value: b
 
 const CLI_OPTIONS = MAESTRO_CLI_IDS.map(cli => ({ value: cli, label: CLI_LABELS[cli] }))
 
+/** The dsh-model select: `<provider>::<model>` options grouped by provider, filtered by CLI protocol. */
+function DshModelSelect(props: { cli: MaestroCliId; value: string; providers: DshProviderModels[] | undefined; onChange: (value: string) => void }): ReactNode {
+  const usableApi = props.cli === 'claude' ? 'anthropic-messages' : 'openai-responses'
+  const providers = props.providers ?? []
+  const mappable = providers.filter(provider => provider.mappable && (usableApi === undefined || provider.api === usableApi))
+  const unusableCount = providers.filter(provider => provider.mappable && !(usableApi === undefined || provider.api === usableApi)).length
+  return (
+    <div style={S.row}>
+      <span style={S.label}>dsh 模型</span>
+      <select
+        style={S.select}
+        value={props.value}
+        onChange={event => { props.onChange(event.target.value) }}
+      >
+        <option value="">不使用（CLI 自身配置的模型）</option>
+        {mappable.map(provider => (
+          <optgroup key={provider.id} label={`${provider.displayName}（${provider.api}${provider.models.length === 0 ? '' : ` · ${String(provider.models.length)} 个模型`}）`}>
+            {provider.models.map(model => (
+              <option key={`${provider.id}::${model}`} value={`${provider.id}::${model}`}>{model}</option>
+            ))}
+          </optgroup>
+        ))}
+      </select>
+      <span style={S.hint}>
+        {props.cli === 'claude' ? '仅列出 Anthropic 兼容（anthropic-messages）供应商' : '仅列出 openai-responses 协议供应商（codex 0.146+ 已移除 chat 支持）'}
+        {unusableCount > 0 ? `；另有 ${String(unusableCount)} 个协议不匹配的供应商未列出` : ''}
+        {providers !== undefined && mappable.length === 0 ? '；当前 dsh 没有可映射的供应商' : ''}
+      </span>
+    </div>
+  )
+}
+
 export function MaestroCard(props: MaestroCardProps): ReactNode {
   const form = useStore(props.maestroStore)
   const actions = props.maestro
   const [overview, setOverview] = useState<MaestroOverview | undefined>(undefined)
   const [overviewError, setOverviewError] = useState('')
+  const [dshProviders, setDshProviders] = useState<DshProviderModels[] | undefined>(undefined)
   const [selectedId, setSelectedId] = useState('')
   const [detail, setDetail] = useState<MaestroTaskDetail | undefined>(undefined)
   const [busy, setBusy] = useState('')
@@ -123,6 +156,19 @@ export function MaestroCard(props: MaestroCardProps): ReactNode {
     const timer = setInterval(() => { void pollOverview() }, 4000)
     return () => { clearInterval(timer) }
   }, [pollOverview])
+
+  // The dsh model catalog: loaded once per card mount (the pickers' options).
+  useEffect(() => {
+    let disposed = false
+    void fetchModels().then(result => {
+      if (disposed) return
+      if (result.ok) {
+        const { ok: _ok, ...rest } = result
+        setDshProviders(rest.providers)
+      }
+    })
+    return () => { disposed = true }
+  }, [])
 
   // Poll the selected task's detail while it is interesting.
   useEffect(() => {
@@ -201,6 +247,12 @@ export function MaestroCard(props: MaestroCardProps): ReactNode {
           />
         </div>
         <TextRow label="模型" field="claudeModel" state={form} actions={actions} placeholder="留空用 CLI 默认，如 claude-sonnet-4-5" />
+        <DshModelSelect
+          cli="claude"
+          value={String(values.claudeDshModel ?? '')}
+          providers={dshProviders}
+          onChange={value => { actions.setImmediate('claudeDshModel', value) }}
+        />
         <SelectRow
           label="权限"
           value={String(values.claudePermissionMode ?? 'inherit')}
@@ -233,6 +285,12 @@ export function MaestroCard(props: MaestroCardProps): ReactNode {
           />
         </div>
         <TextRow label="模型" field="codexModel" state={form} actions={actions} placeholder="留空用 CLI 默认，如 gpt-5-codex" />
+        <DshModelSelect
+          cli="codex"
+          value={String(values.codexDshModel ?? '')}
+          providers={dshProviders}
+          onChange={value => { actions.setImmediate('codexDshModel', value) }}
+        />
         <SelectRow
           label="沙箱/权限"
           value={String(values.codexSandbox ?? 'workspace-write')}

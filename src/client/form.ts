@@ -29,6 +29,8 @@ export interface SectionValue {
   codexCliPath?: string
   codexTimeoutMinutes?: number
   codexConfigOverrides?: string[]
+  codexDshModel?: string
+  claudeDshModel?: string
   npmRegistry?: string
   maxConcurrentTasks?: number
 }
@@ -37,6 +39,7 @@ export interface SectionValue {
 export type ImmediateField =
   | 'enabled' | 'claudeEnabled' | 'codexEnabled'
   | 'defaultCli' | 'claudePermissionMode' | 'codexSandbox'
+  | 'claudeDshModel' | 'codexDshModel'
 
 /** Fields staged as text and committed on save. */
 export type StagedField =

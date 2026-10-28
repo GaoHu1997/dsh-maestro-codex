@@ -8,6 +8,7 @@
 
 import type { Volatile } from '@deepseek-ai/cordis'
 import z from '@deepseek-ai/schemastery'
+import { dshModelSelectionError } from './dsh-models.js'
 import type { MaestroCliId } from './wire.js'
 
 /** readVolatile: accept both a live projected value and a plain value. */
@@ -50,6 +51,8 @@ export const CONFIG_DEFAULTS = {
   codexCliPath: '',
   codexTimeoutMinutes: 20,
   codexConfigOverrides: [],
+  codexDshModel: '',
+  claudeDshModel: '',
   npmRegistry: '',
   maxConcurrentTasks: 2,
 } as const
@@ -75,6 +78,8 @@ export interface Config {
   codexCliPath?: Volatile<string> | string
   codexTimeoutMinutes?: Volatile<number> | number
   codexConfigOverrides?: Volatile<string[]> | string[]
+  codexDshModel?: Volatile<string> | string
+  claudeDshModel?: Volatile<string> | string
   npmRegistry?: Volatile<string> | string
   maxConcurrentTasks?: Volatile<number> | number
 }
@@ -103,6 +108,8 @@ export const Config: z = z.object({
   codexCliPath: z.string().default(CONFIG_DEFAULTS.codexCliPath).volatile(),
   codexTimeoutMinutes: z.number().default(CONFIG_DEFAULTS.codexTimeoutMinutes).volatile(),
   codexConfigOverrides: z.array(z.string()).default([]).volatile(),
+  codexDshModel: z.string().default(CONFIG_DEFAULTS.codexDshModel).volatile(),
+  claudeDshModel: z.string().default(CONFIG_DEFAULTS.claudeDshModel).volatile(),
   npmRegistry: z.string().default(CONFIG_DEFAULTS.npmRegistry).volatile(),
   maxConcurrentTasks: z.number().default(CONFIG_DEFAULTS.maxConcurrentTasks).volatile(),
 })
@@ -130,6 +137,16 @@ export function validateConfig(config: Config): void {
   }
   validateTimeout('claudeTimeoutMinutes', readVolatile(config.claudeTimeoutMinutes))
   validateTimeout('codexTimeoutMinutes', readVolatile(config.codexTimeoutMinutes))
+  const claudeDshModel = readVolatile(config.claudeDshModel)
+  if (claudeDshModel !== undefined) {
+    const error = dshModelSelectionError(claudeDshModel)
+    if (error !== undefined) throw new Error(`MaestroConfig: "claudeDshModel" ${error}`)
+  }
+  const codexDshModel = readVolatile(config.codexDshModel)
+  if (codexDshModel !== undefined) {
+    const error = dshModelSelectionError(codexDshModel)
+    if (error !== undefined) throw new Error(`MaestroConfig: "codexDshModel" ${error}`)
+  }
   const concurrency = readVolatile(config.maxConcurrentTasks)
   if (concurrency !== undefined && (!Number.isInteger(concurrency) || concurrency < 1 || concurrency > 8)) {
     throw new Error('MaestroConfig: "maxConcurrentTasks" must be an integer between 1 and 8')
@@ -167,6 +184,8 @@ export interface EffectiveConfig {
     enabled: boolean
     taskTypes: string[]
     model: string
+    /** `<provider>::<model>` selection from the dsh catalog; '' = not used. */
+    dshModel: string
     permissionMode: ClaudePermissionMode
     baseUrl: string
     authToken: string
@@ -177,6 +196,7 @@ export interface EffectiveConfig {
     enabled: boolean
     taskTypes: string[]
     model: string
+    dshModel: string
     sandbox: CodexSandboxMode
     baseUrl: string
     apiKey: string
@@ -201,6 +221,7 @@ export function effectiveOf(config: Config): EffectiveConfig {
       enabled: readVolatile(config.claudeEnabled) ?? CONFIG_DEFAULTS.claudeEnabled,
       taskTypes: readVolatile(config.claudeTaskTypes) ?? [...CONFIG_DEFAULTS.claudeTaskTypes],
       model: readVolatile(config.claudeModel) ?? '',
+      dshModel: readVolatile(config.claudeDshModel) ?? '',
       permissionMode: (CLAUDE_PERMISSION_MODES as readonly string[]).includes(permissionMode)
         ? permissionMode as ClaudePermissionMode
         : CONFIG_DEFAULTS.claudePermissionMode,
@@ -213,6 +234,7 @@ export function effectiveOf(config: Config): EffectiveConfig {
       enabled: readVolatile(config.codexEnabled) ?? CONFIG_DEFAULTS.codexEnabled,
       taskTypes: readVolatile(config.codexTaskTypes) ?? [...CONFIG_DEFAULTS.codexTaskTypes],
       model: readVolatile(config.codexModel) ?? '',
+      dshModel: readVolatile(config.codexDshModel) ?? '',
       sandbox: (CODEX_SANDBOX_MODES as readonly string[]).includes(sandbox)
         ? sandbox as CodexSandboxMode
         : CONFIG_DEFAULTS.codexSandbox,

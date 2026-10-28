@@ -5,9 +5,9 @@
  */
 
 import {
-  ROUTE_CLI_INSTALL, ROUTE_CLI_REFRESH, ROUTE_CLI_UNINSTALL, ROUTE_DISPATCH, ROUTE_HINT, ROUTE_OVERVIEW,
+  ROUTE_CLI_INSTALL, ROUTE_CLI_REFRESH, ROUTE_CLI_UNINSTALL, ROUTE_DISPATCH, ROUTE_HINT, ROUTE_MODELS, ROUTE_OVERVIEW,
   ROUTE_TASK_CANCEL, ROUTE_TASK_DETAIL, ROUTE_TASKS,
-  type MaestroCliId, type MaestroOverview, type MaestroTaskDetail, type MaestroTaskRef, type MaestroTaskSummary,
+  type DshProviderModels, type MaestroCliId, type MaestroOverview, type MaestroTaskDetail, type MaestroTaskRef, type MaestroTaskSummary,
 } from '../wire.js'
 
 /** One route call outcome: the parsed body, or the error envelope. */
@@ -69,4 +69,8 @@ export async function uninstallCli(cli: MaestroCliId): Promise<Call<MaestroTaskR
 
 export async function fetchHint(): Promise<Call<{ hint: string }>> {
   return send<{ hint: string }>('GET', ROUTE_HINT)
+}
+
+export async function fetchModels(): Promise<Call<{ providers: DshProviderModels[] }>> {
+  return send<{ providers: DshProviderModels[] }>('GET', ROUTE_MODELS)
 }

@@ -38,6 +38,18 @@ export const ROUTE_CLI_UNINSTALL = `${ROUTE_PREFIX}/cli/uninstall`
 /** GET ROUTE_PREFIX/hint — the routing hint text the host injects into the system prompt. */
 export const ROUTE_HINT = `${ROUTE_PREFIX}/hint`
 
+/** GET ROUTE_PREFIX/models — dsh providers/models joined with CLI-mappability facts. */
+export const ROUTE_MODELS = `${ROUTE_PREFIX}/models`
+
+/** One dsh provider as the card's model picker renders it. */
+export interface DshProviderModels {
+  readonly id: string
+  readonly displayName: string
+  readonly api: string
+  readonly mappable: boolean
+  readonly models: readonly string[]
+}
+
 /** The CLIs this plugin drives. */
 export type MaestroCliId = 'claude' | 'codex'
 

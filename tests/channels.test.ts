@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest'
 import { claudeArgs, claudeEnv, claudeFrameEvents, claudePermissionArgs, claudeResultOf, lastLines, runClaudeTask } from '../src/channels/claude.js'
-import { codexArgs, codexEnv, codexFrameEvents, codexSandboxArgs, runCodexTask } from '../src/channels/codex.js'
+import { codexArgs, codexDshModelArgs, codexEnv, codexFrameEvents, codexSandboxArgs, runCodexTask, tomlString } from '../src/channels/codex.js'
 import { scriptedSpawn } from './fake-child.js'
 
 describe('claude argv/env', () => {
@@ -118,6 +118,26 @@ describe('codex argv/env', () => {
     expect(codexArgs('', 'read-only', ['model_instructions_file="C:\\x.md"'])).toEqual([
       'exec', '--json', '--skip-git-repo-check', '-c', 'model_instructions_file="C:\\x.md"', '--sandbox', 'read-only', '-',
     ])
+  })
+
+  it('synthesizes the dsh provider overrides in place of -m', () => {
+    const args = codexArgs('cli-model', 'workspace-write', [], { model: 'group/deepseek-v4.1-flash', baseUrl: 'https://gw/v1', wireApi: 'chat' })
+    expect(args).toEqual([
+      'exec', '--json', '--skip-git-repo-check',
+      '-c', 'model="group/deepseek-v4.1-flash"',
+      '-c', 'model_provider=maestro_dsh',
+      '-c', 'model_providers.maestro_dsh.name="dsh-maestro"',
+      '-c', 'model_providers.maestro_dsh.base_url="https://gw/v1"',
+      '-c', 'model_providers.maestro_dsh.env_key="MAESTRO_DSH_PROVIDER_KEY"',
+      '-c', 'model_providers.maestro_dsh.wire_api="chat"',
+      '--sandbox', 'workspace-write',
+      '-',
+    ])
+    expect(codexDshModelArgs('m', 'https://x', 'responses').envKey).toBe('MAESTRO_DSH_PROVIDER_KEY')
+  })
+
+  it('quotes TOML strings for -c overrides', () => {
+    expect(tomlString('a"b\\c')).toBe('"a\\"b\\\\c"')
   })
 
   it('maps sandbox modes', () => {

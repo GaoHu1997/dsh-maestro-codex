@@ -38,10 +38,41 @@ export function codexSandboxArgs(sandbox: CodexSandboxMode): string[] {
   return ['--sandbox', 'read-only']
 }
 
+/** Quote one value as a TOML basic string for `-c key=value` overrides. */
+export function tomlString(value: string): string {
+  return `"${value.replaceAll('\\', '\\\\').replaceAll('"', '\\"')}"`
+}
+
+/**
+ * Synthesized `model_providers` overrides that point codex at one dsh-configured
+ * provider: the model, a `maestro_dsh` provider route (base URL + key via env
+ * var) and the wire dialect. The key VALUE travels in the child env under
+ * `envKey`, never on the command line.
+ */
+export function codexDshModelArgs(model: string, baseUrl: string, wireApi: 'responses' | 'chat'): { args: string[]; envKey: string } {
+  return {
+    args: [
+      '-c', `model=${tomlString(model)}`,
+      '-c', 'model_provider=maestro_dsh',
+      '-c', 'model_providers.maestro_dsh.name="dsh-maestro"',
+      '-c', `model_providers.maestro_dsh.base_url=${tomlString(baseUrl)}`,
+      '-c', 'model_providers.maestro_dsh.env_key="MAESTRO_DSH_PROVIDER_KEY"',
+      '-c', `model_providers.maestro_dsh.wire_api=${tomlString(wireApi)}`,
+    ],
+    envKey: 'MAESTRO_DSH_PROVIDER_KEY',
+  }
+}
+
 /** The argv for one non-interactive run (before the resolved path is prepended). */
-export function codexArgs(model: string, sandbox: CodexSandboxMode, configOverrides: readonly string[] = []): string[] {
+export function codexArgs(model: string, sandbox: CodexSandboxMode, configOverrides: readonly string[] = [], dshModel?: { model: string; baseUrl: string; wireApi: 'responses' | 'chat' }): string[] {
   const args = ['exec', '--json', '--skip-git-repo-check']
-  if (model !== '') args.push('-m', model)
+  if (dshModel !== undefined) {
+    // A dsh-catalog model wins: the synthesized provider overrides pin the
+    // model, route, base URL and key source, so no `-m` and no config edit.
+    args.push(...codexDshModelArgs(dshModel.model, dshModel.baseUrl, dshModel.wireApi).args)
+  } else if (model !== '') {
+    args.push('-m', model)
+  }
   for (const override of configOverrides) {
     const trimmed = override.trim()
     if (trimmed !== '') args.push('-c', trimmed)
@@ -116,14 +147,16 @@ export async function runCodexTask(options: {
   model: string
   sandbox: CodexSandboxMode
   configOverrides?: readonly string[]
+  dshModel?: { model: string; baseUrl: string; apiKey: string; wireApi: 'responses' | 'chat' }
   baseUrl: string
   apiKey: string
   timeoutMs: number
   signal: AbortSignal
   onEvent: (kind: 'text' | 'note' | 'error', text: string) => void
 }): Promise<CodexRunResult> {
-  const args = codexArgs(options.model, options.sandbox, options.configOverrides ?? [])
+  const args = codexArgs(options.model, options.sandbox, options.configOverrides ?? [], options.dshModel === undefined ? undefined : { model: options.dshModel.model, baseUrl: options.dshModel.baseUrl, wireApi: options.dshModel.wireApi })
   const env = codexEnv(options.baseUrl, options.apiKey)
+  if (options.dshModel !== undefined) env['MAESTRO_DSH_PROVIDER_KEY'] = options.dshModel.apiKey
 
   let finalText = ''
   let threadId = ''

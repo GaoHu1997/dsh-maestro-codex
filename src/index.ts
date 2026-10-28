@@ -15,9 +15,10 @@ import { CliPathCache } from './dispatch.js'
 import { Limiter, TaskRegistry } from './task-registry.js'
 import { registerDispatchTool } from './tool.js'
 import { routingHint } from './routing.js'
-import { StatusStore, handleCliNpmJob, handleCliRefresh, handleDispatch, handleHint, handleOverview, handleTaskCancel, handleTaskDetail, handleTasks, fail, ok, type RouteDeps, type RouteOutcome } from './routes.js'
+import { listDshModels, resolveDshModelEndpoint, type SettingsDescribeFace } from './dsh-models.js'
+import { StatusStore, handleCliNpmJob, handleCliRefresh, handleDispatch, handleHint, handleModels, handleOverview, handleTaskCancel, handleTaskDetail, handleTasks, fail, ok, type RouteDeps, type RouteOutcome } from './routes.js'
 import {
-  ROUTE_DISPATCH, ROUTE_HINT, ROUTE_OVERVIEW, ROUTE_CLI_INSTALL, ROUTE_CLI_REFRESH, ROUTE_CLI_UNINSTALL, ROUTE_TASK_CANCEL, ROUTE_TASK_DETAIL, ROUTE_TASKS,
+  ROUTE_DISPATCH, ROUTE_HINT, ROUTE_MODELS, ROUTE_OVERVIEW, ROUTE_CLI_INSTALL, ROUTE_CLI_REFRESH, ROUTE_CLI_UNINSTALL, ROUTE_TASK_CANCEL, ROUTE_TASK_DETAIL, ROUTE_TASKS,
 } from './wire.js'
 
 export const name = 'dsh-maestro-codex'
@@ -51,6 +52,10 @@ export function apply(ctx: Context, config: Config = {}): void {
   const statusStore = new StatusStore(readConfig)
 
   let toolName = 'dispatch_cli_task'
+  // The settings face arrives with the settings service; the dsh model catalog
+  // and the CLI model resolver both read the composed llm-pi-ai providers
+  // through it (baseURL / api / apiKeyEnv per provider route).
+  let settingsFace: SettingsDescribeFace | undefined
   const deps: RouteDeps = {
     readConfig,
     registry,
@@ -59,13 +64,18 @@ export function apply(ctx: Context, config: Config = {}): void {
     pathCache,
     statusStore,
     toolName: () => toolName,
+    listDshModels: () => listDshModels(ctx, settingsFace),
+    resolveDshModel: (selection: string) => resolveDshModelEndpoint(ctx, settingsFace, selection),
   }
 
   // In dsh 0.1.7+, the settings service projects volatile Config fields into
   // forms. auto: false — this plugin provides its own dedicated configuration
   // card (via `plugins.bundle.config`).
   ctx.inject(['settings'], (settingsCtx) => {
-    settingsCtx.effect(() => settingsCtx.settings.configure({ auto: false }, ctx.fiber), 'maestro-codex: settings presentation policy')
+    settingsCtx.effect(() => {
+      settingsFace = settingsCtx.settings as unknown as SettingsDescribeFace
+      return settingsCtx.settings.configure({ auto: false }, ctx.fiber)
+    }, 'maestro-codex: settings presentation policy')
   })
 
   ctx.inject(['webServer'], (webCtx) => {
@@ -128,6 +138,7 @@ export function apply(ctx: Context, config: Config = {}): void {
     route(ROUTE_CLI_INSTALL, 'cli-install', (_req, body) => handleCliNpmJob(deps, 'install', body))
     route(ROUTE_CLI_UNINSTALL, 'cli-uninstall', (_req, body) => handleCliNpmJob(deps, 'uninstall', body))
     route(ROUTE_HINT, 'hint', () => handleHint(deps))
+    route(ROUTE_MODELS, 'models', () => handleModels(deps))
   })
 
   // The dispatch tool: the conversation model's primary entry. Deferred on

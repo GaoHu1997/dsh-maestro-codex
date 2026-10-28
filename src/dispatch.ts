@@ -15,6 +15,7 @@ import { detectCli, type CliDetection } from './cli-manager.js'
 import { RoutingError, pickCli } from './routing.js'
 import { Limiter, TaskRegistry } from './task-registry.js'
 import type { SpawnFn } from './spawn.js'
+import type { DshModelEndpoint } from './dsh-models.js'
 import type { MaestroCliId } from './wire.js'
 
 /** Faces the dispatcher needs; the host apply builds one stable instance. */
@@ -25,6 +26,8 @@ export interface DispatchDeps {
   /** Abort controllers by task id — the cancel route kills through these. */
   controllers: Map<string, AbortController>
   pathCache: CliPathCache
+  /** Resolve a `<provider>::<model>` dsh-catalog selection into a CLI endpoint. */
+  resolveDshModel?: ((selection: string) => Promise<DshModelEndpoint>) | undefined
   /** Injectable spawn seam (tests); absent = the real system spawn. */
   spawnFn?: SpawnFn | undefined
   logger?: { warn(message: string): void }
@@ -175,16 +178,44 @@ export async function runDispatch(deps: DispatchDeps, params: DispatchParams, si
         deps.registry.push(task, kind, text)
       }
 
+      // dsh-catalog model mapping: a `<provider>::<model>` selection wins over
+      // the CLI's own configured model; a tool-arg model override wins over
+      // both. claude only maps over anthropic-protocol providers. Resolution
+      // failures land on the task record — never a stuck 'running'.
+      let dshEndpoint: DshModelEndpoint | undefined
+      const dshSelection = decision.cli === 'claude' ? config.claude.dshModel : config.codex.dshModel
+      if (params.model === undefined && dshSelection !== '' && deps.resolveDshModel !== undefined) {
+        try {
+          dshEndpoint = await deps.resolveDshModel(dshSelection)
+        } catch (error) {
+          const message = error instanceof Error ? error.message : String(error)
+          deps.registry.setPhase(task, 'failed', message)
+          throw error
+        }
+        if (decision.cli === 'claude' && dshEndpoint.api !== 'anthropic-messages') {
+          const message = `dsh 供应商 "${dshEndpoint.provider}" 使用 ${dshEndpoint.api} 协议，claude cli 只能映射 Anthropic 兼容（anthropic-messages）的供应商`
+          deps.registry.setPhase(task, 'failed', message)
+          throw new DispatchError(message)
+        }
+        if (decision.cli === 'codex' && dshEndpoint.api === 'openai-completions') {
+          // codex ≥0.146 removed chat-completions support entirely (wire_api="chat").
+          const message = `dsh 供应商 "${dshEndpoint.provider}" 是 chat-completions（openai-completions）协议，codex 0.146+ 已移除该支持；请在配置页选择 openai-responses 协议的供应商`
+          deps.registry.setPhase(task, 'failed', message)
+          throw new DispatchError(message)
+        }
+      }
+      const effectiveModel = params.model ?? (dshEndpoint !== undefined ? dshEndpoint.model : model)
+
       const run = decision.cli === 'claude'
         ? runClaudeTask({
             ...(deps.spawnFn === undefined ? {} : { spawnFn: deps.spawnFn }),
             claudePath: cliPath,
             task: params.task,
             cwd,
-            model,
+            model: effectiveModel,
             permissionMode: config.claude.permissionMode,
-            baseUrl: config.claude.baseUrl,
-            authToken: config.claude.authToken,
+            baseUrl: dshEndpoint !== undefined ? dshEndpoint.baseURL : config.claude.baseUrl,
+            authToken: dshEndpoint !== undefined ? dshEndpoint.apiKey : config.claude.authToken,
             timeoutMs: timeoutMinutes * 60_000,
             signal: abort.signal,
             onEvent,
@@ -194,9 +225,17 @@ export async function runDispatch(deps: DispatchDeps, params: DispatchParams, si
             codexPath: cliPath,
             task: params.task,
             cwd,
-            model,
+            model: effectiveModel,
             sandbox: config.codex.sandbox,
             configOverrides: config.codex.configOverrides,
+            ...(dshEndpoint === undefined ? {} : {
+              dshModel: {
+                model: dshEndpoint.model,
+                baseUrl: dshEndpoint.baseURL,
+                apiKey: dshEndpoint.apiKey,
+                wireApi: dshEndpoint.api === 'openai-responses' ? 'responses' as const : 'chat' as const,
+              },
+            }),
             baseUrl: config.codex.baseUrl,
             apiKey: config.codex.apiKey,
             timeoutMs: timeoutMinutes * 60_000,
