@@ -98,6 +98,9 @@ export function routingHint(config: EffectiveConfig, toolName: string): string {
     '本环境接入了外部 CLI 子代理。当任务整体适合交给外部编码代理完成（用户明确点名 claude/codex，或任务类型命中下表）时，调用该工具把完整任务描述交给对应 CLI，取回结果后向用户汇报。',
     '路由表：',
     ...sections,
-    `不指定 cli 参数时按任务类型自动路由，缺省使用 ${config.defaultCli}。调用时给出自包含的完整任务描述（CLI 看不到本会话上下文）。`,
+    `不指定 cli 参数时按任务类型自动路由，缺省使用 ${config.defaultCli}。调用要求：`,
+    '- task 必须自包含（CLI 看不到本会话上下文）：目标、涉及文件、验收标准、输出格式写全；若任务依赖本会话的技能或上下文，把关键指令内联进 task。',
+    '- cwd 传入当前工作区目录（你正在工作的目录），CLI 子代理会在同一目录执行。',
+    '- 桥接的 dsh MCP 服务器对子代理可用，task 里可直接要求使用相应工具。',
   ].join('\n')
 }

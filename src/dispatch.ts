@@ -15,6 +15,7 @@ import { detectCli, type CliDetection } from './cli-manager.js'
 import { RoutingError, pickCli } from './routing.js'
 import { Limiter, TaskRegistry } from './task-registry.js'
 import type { SpawnFn } from './spawn.js'
+import { writeClaudeMcpConfig, unlinkQuiet, type DshMcpServer } from './mcp.js'
 import type { DshModelEndpoint } from './dsh-models.js'
 import type { MaestroCliId } from './wire.js'
 
@@ -28,6 +29,8 @@ export interface DispatchDeps {
   pathCache: CliPathCache
   /** Resolve a `<provider>::<model>` dsh-catalog selection into a CLI endpoint. */
   resolveDshModel?: ((selection: string) => Promise<DshModelEndpoint>) | undefined
+  /** dsh's own MCP servers (the bridge hands them to every dispatched run). */
+  listMcpServers?: (() => DshMcpServer[]) | undefined
   /** Injectable spawn seam (tests); absent = the real system spawn. */
   spawnFn?: SpawnFn | undefined
   logger?: { warn(message: string): void }
@@ -206,76 +209,89 @@ export async function runDispatch(deps: DispatchDeps, params: DispatchParams, si
       }
       const effectiveModel = params.model ?? (dshEndpoint !== undefined ? dshEndpoint.model : model)
 
-      const run = decision.cli === 'claude'
-        ? runClaudeTask({
-            ...(deps.spawnFn === undefined ? {} : { spawnFn: deps.spawnFn }),
-            claudePath: cliPath,
-            task: params.task,
-            cwd,
-            model: effectiveModel,
-            permissionMode: config.claude.permissionMode,
-            baseUrl: dshEndpoint !== undefined ? dshEndpoint.baseURL : config.claude.baseUrl,
-            authToken: dshEndpoint !== undefined ? dshEndpoint.apiKey : config.claude.authToken,
-            timeoutMs: timeoutMinutes * 60_000,
-            signal: abort.signal,
-            onEvent,
-          })
-        : runCodexTask({
-            ...(deps.spawnFn === undefined ? {} : { spawnFn: deps.spawnFn }),
-            codexPath: cliPath,
-            task: params.task,
-            cwd,
-            model: effectiveModel,
-            sandbox: config.codex.sandbox,
-            configOverrides: config.codex.configOverrides,
-            ...(dshEndpoint === undefined ? {} : {
-              dshModel: {
-                model: dshEndpoint.model,
-                baseUrl: dshEndpoint.baseURL,
-                apiKey: dshEndpoint.apiKey,
-                wireApi: dshEndpoint.api === 'openai-responses' ? 'responses' as const : 'chat' as const,
-              },
-            }),
-            baseUrl: config.codex.baseUrl,
-            apiKey: config.codex.apiKey,
-            timeoutMs: timeoutMinutes * 60_000,
-            signal: abort.signal,
-            onEvent,
-          })
-
-      // Two cancel paths meet here: the outer signal (tool exec / HTTP cancel)
-      // aborts `abort`, the child dies, and the run settles with a failure —
-      // no separate race needed.
-      const raced = await run
-
-      const durationMs = Date.now() - startedAt
-      if (raced.ok) {
-        task.exitCode = raced.exitCode ?? 0
-        task.finalText = raced.finalText
-        task.stats = raced.stats
-        deps.registry.setPhase(task, 'done', '执行完成')
-        const sessionRef = 'sessionId' in raced ? raced.sessionId : raced.threadId
-        if (sessionRef !== '') notes.push(`${decision.cli} session: ${sessionRef}`)
-        for (const [key, stat] of Object.entries(raced.stats)) notes.push(`${key}: ${String(stat)}`)
-        return {
-          ok: true,
-          cli: decision.cli,
-          model,
-          cwd: cwd ?? '',
-          durationMs,
-          exitCode: raced.exitCode ?? 0,
-          sessionRef,
-          finalText: raced.finalText,
-          notes,
+      // MCP bridge: the same servers dsh itself runs, handed to the CLI run.
+      const mcpServers = config.bridgeMcp === true ? deps.listMcpServers?.() ?? [] : []
+      let mcpConfigPath: string | undefined
+      try {
+        if (decision.cli === 'claude' && mcpServers.length > 0) {
+          mcpConfigPath = await writeClaudeMcpConfig(mcpServers)
         }
+
+        const run = decision.cli === 'claude'
+          ? runClaudeTask({
+              ...(deps.spawnFn === undefined ? {} : { spawnFn: deps.spawnFn }),
+              claudePath: cliPath,
+              task: params.task,
+              cwd,
+              model: effectiveModel,
+              permissionMode: config.claude.permissionMode,
+              baseUrl: dshEndpoint !== undefined ? dshEndpoint.baseURL : config.claude.baseUrl,
+              authToken: dshEndpoint !== undefined ? dshEndpoint.apiKey : config.claude.authToken,
+              ...(mcpConfigPath === undefined ? {} : { mcpConfigPath, mcpServerNames: mcpServers.map(server => server.name) }),
+              timeoutMs: timeoutMinutes * 60_000,
+              signal: abort.signal,
+              onEvent,
+            })
+          : runCodexTask({
+              ...(deps.spawnFn === undefined ? {} : { spawnFn: deps.spawnFn }),
+              codexPath: cliPath,
+              task: params.task,
+              cwd,
+              model: effectiveModel,
+              sandbox: config.codex.sandbox,
+              configOverrides: config.codex.configOverrides,
+              ...(dshEndpoint === undefined ? {} : {
+                dshModel: {
+                  model: dshEndpoint.model,
+                  baseUrl: dshEndpoint.baseURL,
+                  apiKey: dshEndpoint.apiKey,
+                  wireApi: dshEndpoint.api === 'openai-responses' ? 'responses' as const : 'chat' as const,
+                },
+              }),
+              ...(mcpServers.length > 0 ? { mcpServers } : {}),
+              baseUrl: config.codex.baseUrl,
+              apiKey: config.codex.apiKey,
+              timeoutMs: timeoutMinutes * 60_000,
+              signal: abort.signal,
+              onEvent,
+            })
+
+        // Two cancel paths meet here: the outer signal (tool exec / HTTP cancel)
+        // aborts `abort`, the child dies, and the run settles with a failure —
+        // no separate race needed.
+        const raced = await run
+
+        const durationMs = Date.now() - startedAt
+        if (raced.ok) {
+          task.exitCode = raced.exitCode ?? 0
+          task.finalText = raced.finalText
+          task.stats = raced.stats
+          deps.registry.setPhase(task, 'done', '执行完成')
+          const sessionRef = 'sessionId' in raced ? raced.sessionId : raced.threadId
+          if (sessionRef !== '') notes.push(`${decision.cli} session: ${sessionRef}`)
+          for (const [key, stat] of Object.entries(raced.stats)) notes.push(`${key}: ${String(stat)}`)
+          return {
+            ok: true,
+            cli: decision.cli,
+            model: effectiveModel,
+            cwd: cwd ?? '',
+            durationMs,
+            exitCode: raced.exitCode ?? 0,
+            sessionRef,
+            finalText: raced.finalText,
+            notes,
+          }
+        }
+        const message = abort.signal.aborted
+          ? '任务已取消'
+          : raced.error ?? '任务失败（原因未知）'
+        const timedOut = raced.stats['timedOut'] === true
+        deps.registry.setPhase(task, timedOut ? 'timeout' : abort.signal.aborted ? 'cancelled' : 'failed', message)
+        task.exitCode = raced.exitCode ?? undefined
+        throw new DispatchError(`${decision.cli} 任务失败：${message}`)
+      } finally {
+        if (mcpConfigPath !== undefined) await unlinkQuiet(mcpConfigPath)
       }
-      const message = abort.signal.aborted
-        ? '任务已取消'
-        : raced.error ?? '任务失败（原因未知）'
-      const timedOut = raced.stats['timedOut'] === true
-      deps.registry.setPhase(task, timedOut ? 'timeout' : abort.signal.aborted ? 'cancelled' : 'failed', message)
-      task.exitCode = raced.exitCode ?? undefined
-      throw new DispatchError(`${decision.cli} 任务失败：${message}`)
     } finally {
       slot.release()
     }

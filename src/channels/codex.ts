@@ -64,7 +64,7 @@ export function codexDshModelArgs(model: string, baseUrl: string, wireApi: 'resp
 }
 
 /** The argv for one non-interactive run (before the resolved path is prepended). */
-export function codexArgs(model: string, sandbox: CodexSandboxMode, configOverrides: readonly string[] = [], dshModel?: { model: string; baseUrl: string; wireApi: 'responses' | 'chat' }): string[] {
+export function codexArgs(model: string, sandbox: CodexSandboxMode, configOverrides: readonly string[] = [], dshModel?: { model: string; baseUrl: string; wireApi: 'responses' | 'chat' }, mcpServers?: ReadonlyArray<{ name: string; command: string; args: readonly string[]; env: Readonly<Record<string, string>> }>): string[] {
   const args = ['exec', '--json', '--skip-git-repo-check']
   if (dshModel !== undefined) {
     // A dsh-catalog model wins: the synthesized provider overrides pin the
@@ -77,9 +77,29 @@ export function codexArgs(model: string, sandbox: CodexSandboxMode, configOverri
     const trimmed = override.trim()
     if (trimmed !== '') args.push('-c', trimmed)
   }
+  if (mcpServers !== undefined) args.push(...codexMcpArgs(mcpServers))
   args.push(...codexSandboxArgs(sandbox))
   // `-` reads the prompt from stdin — no quoting surface for task text.
   args.push('-')
+  return args
+}
+
+/**
+ * `-c mcp_servers.*` overrides handing dsh's MCP servers to codex. The whole
+ * server record rides ONE TOML inline table per `-c` pair, so each server is
+ * a single atomic override (no multi-pair ordering hazards).
+ */
+export function codexMcpArgs(servers: ReadonlyArray<{ name: string; command: string; args: readonly string[]; env: Readonly<Record<string, string>> }>): string[] {
+  const args: string[] = []
+  for (const server of servers) {
+    const parts = [`command = ${tomlString(server.command)}`]
+    if (server.args.length > 0) parts.push(`args = [${server.args.map(tomlString).join(', ')}]`)
+    const envEntries = Object.entries(server.env)
+    if (envEntries.length > 0) {
+      parts.push(`env = { ${envEntries.map(([key, value]) => `${key} = ${tomlString(value)}`).join(', ')} }`)
+    }
+    args.push('-c', `mcp_servers.${server.name} = { ${parts.join(', ')} }`)
+  }
   return args
 }
 
@@ -108,6 +128,9 @@ export function codexFrameEvents(frame: CodexFrame): Array<{ kind: 'text' | 'not
       events.push({ kind: 'text', text: item.text ?? '' })
     } else if (item.type === 'error' && (item.text ?? '').trim() !== '') {
       events.push({ kind: 'error', text: item.text ?? '' })
+    } else if (item.type !== undefined && item.type !== 'reasoning' && frame.type === 'item.started') {
+      // Unknown item kinds (subagent spawns, MCP calls, …) stay visible.
+      events.push({ kind: 'note', text: `codex item: ${item.type}` })
     }
     return events
   }
@@ -148,13 +171,14 @@ export async function runCodexTask(options: {
   sandbox: CodexSandboxMode
   configOverrides?: readonly string[]
   dshModel?: { model: string; baseUrl: string; apiKey: string; wireApi: 'responses' | 'chat' }
+  mcpServers?: ReadonlyArray<{ name: string; command: string; args: readonly string[]; env: Readonly<Record<string, string>> }>
   baseUrl: string
   apiKey: string
   timeoutMs: number
   signal: AbortSignal
   onEvent: (kind: 'text' | 'note' | 'error', text: string) => void
 }): Promise<CodexRunResult> {
-  const args = codexArgs(options.model, options.sandbox, options.configOverrides ?? [], options.dshModel === undefined ? undefined : { model: options.dshModel.model, baseUrl: options.dshModel.baseUrl, wireApi: options.dshModel.wireApi })
+  const args = codexArgs(options.model, options.sandbox, options.configOverrides ?? [], options.dshModel === undefined ? undefined : { model: options.dshModel.model, baseUrl: options.dshModel.baseUrl, wireApi: options.dshModel.wireApi }, options.mcpServers)
   const env = codexEnv(options.baseUrl, options.apiKey)
   if (options.dshModel !== undefined) env['MAESTRO_DSH_PROVIDER_KEY'] = options.dshModel.apiKey
 

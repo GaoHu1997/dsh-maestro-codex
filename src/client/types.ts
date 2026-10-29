@@ -27,6 +27,12 @@ export type ClientContext = Context & {
   locale?: {
     register(ns: string, dictionaries: Record<string, unknown>): unknown
   }
+  /** The workspace registry face (for the cwd auto-fill in the dispatch form). */
+  workspaces?: {
+    list: {
+      getSnapshot(): { items?: ReadonlyArray<{ path?: string }> }
+    }
+  }
 }
 
 /** The host-projected config form for this plugin's entry. */

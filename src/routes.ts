@@ -11,6 +11,7 @@ import { detectCli, runNpmJob } from './cli-manager.js'
 import { isTerminalPhase } from './task-registry.js'
 import { routingHint } from './routing.js'
 import type { DshModelCatalog } from './dsh-models.js'
+import type { DshMcpServer } from './mcp.js'
 import { CLI_PACKAGES, CLI_LABELS, MAESTRO_CLI_IDS, type MaestroCliId, type MaestroCliStatus, type MaestroOverview, type MaestroRouteError, type MaestroTaskDetail, type MaestroTaskRef, type MaestroTaskSummary } from './wire.js'
 
 /** One uniform handler outcome. */
@@ -35,6 +36,12 @@ export interface RouteDeps extends DispatchDeps {
   toolName: () => string
   /** The dsh model catalog for the card's model pickers. */
   listDshModels: () => Promise<DshModelCatalog>
+  /** dsh's own MCP servers (names surfaced in the card, bridge feeds dispatches). */
+  listMcpServers: () => DshMcpServer[]
+  /** Diagnostics switch (query `?diag=1` era — enabled via config for now). */
+  mcpDiagnosticsEnabled?: (() => boolean) | undefined
+  /** The raw composed-settings describe (diagnostics only). */
+  describeSettings?: () => Array<{ ns: string; value?: unknown }>
 }
 
 /**
@@ -227,12 +234,33 @@ export function handleHint(deps: RouteDeps): RouteOutcome {
   return ok({ hint: routingHint(config, deps.toolName()), redacted: redactEffective(config) })
 }
 
-/** GET models — the dsh provider/model catalog for the card's pickers. */
+/** GET models — the dsh provider/model catalog for the card's pickers, plus the bridged MCP server names. */
 export async function handleModels(deps: RouteDeps): Promise<RouteOutcome> {
   try {
     const catalog = await deps.listDshModels()
-    return ok({ providers: catalog.providers })
+    const servers = deps.listMcpServers()
+    const diagnostics = mcpDiscoveryDiagnostics(deps)
+    return ok({
+      providers: catalog.providers,
+      mcpServers: servers.map(server => ({ name: server.name, source: server.source })),
+      ...(diagnostics === undefined ? {} : { mcpDiagnostics: diagnostics }),
+    })
   } catch (error) {
     return fail(500, error instanceof Error ? error.message : String(error))
+  }
+}
+
+/** One-shot visibility into what the composed settings expose (key names only). */
+function mcpDiscoveryDiagnostics(deps: RouteDeps): string[] | undefined {
+  if (deps.mcpDiagnosticsEnabled?.() !== true) return undefined
+  try {
+    const entries = deps.describeSettings?.() ?? []
+    return entries.map(entry => {
+      const value = entry.value
+      const keys = typeof value === 'object' && value !== null ? Object.keys(value as Record<string, unknown>).slice(0, 8).join(',') : typeof value
+      return `${entry.ns}: ${keys}`
+    })
+  } catch (error) {
+    return [`describe failed: ${error instanceof Error ? error.message : String(error)}`]
   }
 }

@@ -31,7 +31,8 @@ interface ClaudeFrame {
   duration_ms?: number
   duration_api_ms?: number
   total_cost_usd?: number
-  message?: { content?: Array<{ type?: string; text?: string; name?: string }> }
+  usage?: { input_tokens?: number; output_tokens?: number; cache_read_input_tokens?: number; cache_creation_input_tokens?: number }
+  message?: { content?: Array<{ type?: string; text?: string; name?: string; input?: Record<string, unknown>; tool_use_id?: string }> }
 }
 
 /** `--permission-mode` value for the configured mode; `inherit` sends none. */
@@ -41,11 +42,21 @@ export function claudePermissionArgs(permissionMode: ClaudePermissionMode): stri
   return ['--permission-mode', permissionMode]
 }
 
+/** MCP bridge argv: ONLY the bridged dsh servers, claude's own global config ignored. */
+export function claudeMcpArgs(mcpConfigPath: string, serverNames: readonly string[]): string[] {
+  return [
+    '--strict-mcp-config',
+    '--mcp-config', mcpConfigPath,
+    ...serverNames.map(name => `mcp__${name}`),
+  ].concat(serverNames.length > 0 ? ['--allowedTools', serverNames.map(name => `mcp__${name}`).join(',')] : [])
+}
+
 /** The argv for one headless run (before the resolved path is prepended). */
-export function claudeArgs(model: string, permissionMode: ClaudePermissionMode): string[] {
+export function claudeArgs(model: string, permissionMode: ClaudePermissionMode, mcpConfigPath?: string, mcpServerNames?: readonly string[]): string[] {
   const args = ['-p', '--output-format', 'stream-json', '--verbose']
   if (model !== '') args.push('--model', model)
   args.push(...claudePermissionArgs(permissionMode))
+  if (mcpConfigPath !== undefined) args.push(...claudeMcpArgs(mcpConfigPath, mcpServerNames ?? []))
   return args
 }
 
@@ -69,7 +80,7 @@ export function claudeFrameEvents(frame: ClaudeFrame): Array<{ kind: 'text' | 'n
       if (block.type === 'text' && (block.text ?? '').trim() !== '') {
         events.push({ kind: 'text', text: block.text ?? '' })
       } else if (block.type === 'tool_use' && block.name !== undefined) {
-        events.push({ kind: 'note', text: `调用工具 ${block.name}` })
+        events.push({ kind: 'note', text: `调用工具 ${block.name}${toolUseDetail(block)}` })
       }
     }
     return events
@@ -81,6 +92,36 @@ export function claudeFrameEvents(frame: ClaudeFrame): Array<{ kind: 'text' | 'n
   return events
 }
 
+/** A short detail suffix for tool calls the user tracks (subagents notably). */
+function toolUseDetail(block: { name?: string; input?: Record<string, unknown> }): string {
+  const input = block.input
+  if (typeof input !== 'object' || input === null) return ''
+  const subagentType = input['subagent_type']
+  const description = input['description']
+  const pattern = input['pattern']
+  const command = input['command']
+  if (typeof subagentType === 'string' && subagentType !== '') {
+    return typeof description === 'string' && description !== '' ? `（子代理 ${subagentType}：${description.slice(0, 80)}）` : `（子代理 ${subagentType}）`
+  }
+  if (typeof pattern === 'string' && pattern !== '') return `（${pattern.slice(0, 60)}）`
+  if (typeof command === 'string' && command !== '') return `（${command.slice(0, 60)}）`
+  return ''
+}
+
+/** The tool_result frames of one user message (for subagent completion notes). */
+export function claudeToolResultEvents(frame: ClaudeFrame, toolNamesById: ReadonlyMap<string, string>): Array<{ kind: 'text' | 'note' | 'error'; text: string }> {
+  const events: Array<{ kind: 'text' | 'note' | 'error'; text: string }> = []
+  if (frame.type !== 'user') return events
+  for (const block of frame.message?.content ?? []) {
+    if (block.type !== 'tool_result' || typeof block.tool_use_id !== 'string') continue
+    const name = toolNamesById.get(block.tool_use_id)
+    if (name === 'Task' || name === 'Agent') {
+      events.push({ kind: 'note', text: `子代理完成（${name}）` })
+    }
+  }
+  return events
+}
+
 /** The final answer of a `result` frame, plus the stats worth keeping. */
 export function claudeResultOf(frame: ClaudeFrame): { finalText: string; stats: Record<string, string | number | boolean> } {
   const stats: Record<string, string | number | boolean> = {}
@@ -88,6 +129,13 @@ export function claudeResultOf(frame: ClaudeFrame): { finalText: string; stats: 
   if (typeof frame.duration_ms === 'number') stats['cliDurationMs'] = frame.duration_ms
   if (typeof frame.total_cost_usd === 'number') stats['costUsd'] = Number(frame.total_cost_usd.toFixed(4))
   if (frame.session_id !== undefined) stats['sessionId'] = frame.session_id
+  const usage = frame.usage
+  if (typeof usage === 'object' && usage !== null) {
+    if (typeof usage.input_tokens === 'number') stats['inputTokens'] = usage.input_tokens
+    if (typeof usage.output_tokens === 'number') stats['outputTokens'] = usage.output_tokens
+    if (typeof usage.cache_read_input_tokens === 'number') stats['cachedInputTokens'] = usage.cache_read_input_tokens
+    if (typeof usage.cache_creation_input_tokens === 'number') stats['cacheWriteTokens'] = usage.cache_creation_input_tokens
+  }
   return { finalText: frame.result ?? '', stats }
 }
 
@@ -104,17 +152,20 @@ export async function runClaudeTask(options: {
   permissionMode: ClaudePermissionMode
   baseUrl: string
   authToken: string
+  mcpConfigPath?: string
+  mcpServerNames?: readonly string[]
   timeoutMs: number
   signal: AbortSignal
   onEvent: (kind: 'text' | 'note' | 'error', text: string) => void
 }): Promise<ClaudeRunResult> {
-  const args = claudeArgs(options.model, options.permissionMode)
+  const args = claudeArgs(options.model, options.permissionMode, options.mcpConfigPath, options.mcpServerNames)
   const env = claudeEnv(options.baseUrl, options.authToken)
 
   let finalText = ''
   let sessionId = ''
   let resultError: string | undefined
   let resultStats: Record<string, string | number | boolean> = {}
+  const toolNamesById = new Map<string, string>()
 
   const handleLine = (line: string): void => {
     let frame: ClaudeFrame
@@ -128,6 +179,13 @@ export async function runClaudeTask(options: {
     }
     if (frame.session_id !== undefined && sessionId === '') sessionId = frame.session_id
     for (const event of claudeFrameEvents(frame)) options.onEvent(event.kind, event.text)
+    for (const block of frame.message?.content ?? []) {
+      if (block.type === 'tool_use' && typeof block.name === 'string') {
+        const id = typeof (block as { id?: unknown }).id === 'string' ? (block as { id: string }).id : undefined
+        if (id !== undefined) toolNamesById.set(id, block.name)
+      }
+    }
+    for (const event of claudeToolResultEvents(frame, toolNamesById)) options.onEvent(event.kind, event.text)
     if (frame.type === 'result') {
       const parsed = claudeResultOf(frame)
       finalText = parsed.finalText

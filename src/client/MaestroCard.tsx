@@ -16,6 +16,8 @@ import { CLI_LABELS, MAESTRO_CLI_IDS, type DshProviderModels, type MaestroCliId,
 export interface MaestroCardProps {
   maestroStore: MaestroStore
   maestro: MaestroFormActions
+  /** Workspace paths for the dispatch form's cwd auto-fill. */
+  workspaces?: string[]
 }
 
 const S = {
@@ -354,6 +356,16 @@ export function MaestroCard(props: MaestroCardProps): ReactNode {
             <option value="auto">自动路由</option>
             {CLI_OPTIONS.map(option => <option key={option.value} value={option.value}>{option.label}</option>)}
           </select>
+          {(props.workspaces ?? []).length > 0 && (
+            <select
+              style={S.select}
+              value=""
+              onChange={event => { if (event.target.value !== '') setDispatchCwd(event.target.value) }}
+            >
+              <option value="">选择工作区目录…</option>
+              {(props.workspaces ?? []).map(path => <option key={path} value={path}>{path}</option>)}
+            </select>
+          )}
           <input style={{ ...S.input, flex: 0.6 }} placeholder="执行目录（可选，绝对路径）" value={dispatchCwd} onChange={event => { setDispatchCwd(event.target.value) }} />
           <button
             style={{ ...S.button, ...S.primary }}
@@ -399,6 +411,14 @@ export function MaestroCard(props: MaestroCardProps): ReactNode {
           })}
           {detail.finalText !== undefined && <div style={{ marginTop: 6, borderTop: '1px dashed rgba(255,255,255,0.2)', paddingTop: 6 }}>{detail.finalText}</div>}
           {detail.error !== undefined && <div style={{ color: '#f87171' }}>{detail.error}</div>}
+          </div>
+        )}
+        {detail !== undefined && detail.stats !== undefined && Object.keys(detail.stats).length > 0 && (
+          <div style={S.row}>
+            <span style={S.label}>用量</span>
+            {Object.entries(detail.stats).map(([key, stat]) => (
+              <span key={key} style={S.code}>{key}: {String(stat)}</span>
+            ))}
           </div>
         )}
       </div>

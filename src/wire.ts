@@ -50,6 +50,12 @@ export interface DshProviderModels {
   readonly models: readonly string[]
 }
 
+/** One bridged dsh MCP server (name only over the wire). */
+export interface MaestroMcpServerRef {
+  readonly name: string
+  readonly source: string
+}
+
 /** The CLIs this plugin drives. */
 export type MaestroCliId = 'claude' | 'codex'
 

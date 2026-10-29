@@ -53,6 +53,8 @@ export const CONFIG_DEFAULTS = {
   codexConfigOverrides: [],
   codexDshModel: '',
   claudeDshModel: '',
+  bridgeMcp: true,
+  mcpDiagnostics: false,
   npmRegistry: '',
   maxConcurrentTasks: 2,
 } as const
@@ -80,6 +82,8 @@ export interface Config {
   codexConfigOverrides?: Volatile<string[]> | string[]
   codexDshModel?: Volatile<string> | string
   claudeDshModel?: Volatile<string> | string
+  bridgeMcp?: Volatile<boolean> | boolean
+  mcpDiagnostics?: Volatile<boolean> | boolean
   npmRegistry?: Volatile<string> | string
   maxConcurrentTasks?: Volatile<number> | number
 }
@@ -110,6 +114,8 @@ export const Config: z = z.object({
   codexConfigOverrides: z.array(z.string()).default([]).volatile(),
   codexDshModel: z.string().default(CONFIG_DEFAULTS.codexDshModel).volatile(),
   claudeDshModel: z.string().default(CONFIG_DEFAULTS.claudeDshModel).volatile(),
+  bridgeMcp: z.boolean().default(CONFIG_DEFAULTS.bridgeMcp).volatile(),
+  mcpDiagnostics: z.boolean().default(CONFIG_DEFAULTS.mcpDiagnostics).volatile(),
   npmRegistry: z.string().default(CONFIG_DEFAULTS.npmRegistry).volatile(),
   maxConcurrentTasks: z.number().default(CONFIG_DEFAULTS.maxConcurrentTasks).volatile(),
 })
@@ -207,6 +213,10 @@ export interface EffectiveConfig {
   }
   npmRegistry: string
   maxConcurrentTasks: number
+  /** Hand dsh's own MCP servers to the dispatched CLI runs. */
+  bridgeMcp: boolean
+  /** Temporary discovery diagnostics for the /models route. */
+  mcpDiagnostics: boolean
 }
 
 /** Layer the (possibly volatile) config over the shipped defaults. */
@@ -246,6 +256,8 @@ export function effectiveOf(config: Config): EffectiveConfig {
     },
     npmRegistry: readVolatile(config.npmRegistry) ?? '',
     maxConcurrentTasks: readVolatile(config.maxConcurrentTasks) ?? CONFIG_DEFAULTS.maxConcurrentTasks,
+    bridgeMcp: readVolatile(config.bridgeMcp) ?? CONFIG_DEFAULTS.bridgeMcp,
+    mcpDiagnostics: readVolatile(config.mcpDiagnostics) ?? CONFIG_DEFAULTS.mcpDiagnostics,
   }
 }
 
