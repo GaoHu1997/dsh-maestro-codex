@@ -31,6 +31,7 @@ export interface SectionValue {
   codexConfigOverrides?: string[]
   codexDshModel?: string
   claudeDshModel?: string
+  bridgeMcp?: boolean
   npmRegistry?: string
   maxConcurrentTasks?: number
 }
@@ -40,6 +41,7 @@ export type ImmediateField =
   | 'enabled' | 'claudeEnabled' | 'codexEnabled'
   | 'defaultCli' | 'claudePermissionMode' | 'codexSandbox'
   | 'claudeDshModel' | 'codexDshModel'
+  | 'bridgeMcp'
 
 /** Fields staged as text and committed on save. */
 export type StagedField =

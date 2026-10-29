@@ -65,7 +65,7 @@ export function apply(ctx: ClientContext): void {
           name: 'settings.section',
           id: 'maestro-codex',
           order: 90,
-          label: 'CLI 子代理（codex / claude）',
+          label: 'CLI 配置',
           inject: () => ({
             maestroStore: store,
             maestro: form.actions(),
