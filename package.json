@@ -15,6 +15,16 @@
   ],
   "license": "MIT",
   "author": "GaoHu1997 (奋斗的小高) <gaohu9712@163.com>",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/GaoHu1997/dsh-maestro-codex.git"
+  },
+  "homepage": "https://github.com/GaoHu1997/dsh-maestro-codex#readme",
+  "bugs": "https://github.com/GaoHu1997/dsh-maestro-codex/issues",
+  "publishConfig": {
+    "registry": "https://registry.npmjs.org/",
+    "access": "public"
+  },
   "type": "module",
   "main": "lib/index.js",
   "types": "lib/index.d.ts",
