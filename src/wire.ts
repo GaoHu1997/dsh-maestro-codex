@@ -14,7 +14,8 @@ export const ROUTE_PREFIX = `/plugin/${PLUGIN_ID}`
 /** GET ROUTE_PREFIX/overview — CLI statuses, safe config view, recent tasks. */
 export const ROUTE_OVERVIEW = `${ROUTE_PREFIX}/overview`
 
-/** GET ROUTE_PREFIX/tasks — the full task list (summaries). */
+/** GET ROUTE_PREFIX/tasks?sessions=<id,id,…> — task summaries, optionally scoped
+ * to a session tree (owner-less npm jobs always stay visible). */
 export const ROUTE_TASKS = `${ROUTE_PREFIX}/tasks`
 
 /** GET ROUTE_PREFIX/task?id=<id>&cursor=<seq> — one task's detail plus events after the cursor. */
@@ -23,13 +24,13 @@ export const ROUTE_TASK_DETAIL = `${ROUTE_PREFIX}/task`
 /** POST ROUTE_PREFIX/task/cancel {id} — abort one queued/running task. */
 export const ROUTE_TASK_CANCEL = `${ROUTE_PREFIX}/task/cancel`
 
-/** POST ROUTE_PREFIX/dispatch {cli,task,cwd?} — manual dispatch from the card (smoke-test entry). */
-export const ROUTE_DISPATCH = `${ROUTE_PREFIX}/dispatch`
-
 /** POST ROUTE_PREFIX/cli/refresh {cli} — re-detect one CLI's install state. */
 export const ROUTE_CLI_REFRESH = `${ROUTE_PREFIX}/cli/refresh`
 
-/** POST ROUTE_PREFIX/cli/install {cli} — install (or update) via npm -g. */
+/** GET ROUTE_PREFIX/cli/versions?cli= — versions published on the npm registry. */
+export const ROUTE_CLI_VERSIONS = `${ROUTE_PREFIX}/cli/versions`
+
+/** POST ROUTE_PREFIX/cli/install {cli,version?} — install one version via npm -g. */
 export const ROUTE_CLI_INSTALL = `${ROUTE_PREFIX}/cli/install`
 
 /** POST ROUTE_PREFIX/cli/uninstall {cli} — uninstall via npm -g. */
@@ -90,6 +91,44 @@ export const CLI_LABELS: Record<MaestroCliId, string> = {
   codex: 'codex cli',
 }
 
+/**
+ * The task-type catalog the card offers as clickable chips. Config still holds
+ * a plain keyword list per CLI (routing scores these against the task text);
+ * the card only decides which catalog entries are on.
+ */
+export const TASK_TYPE_CATALOG: readonly string[] = [
+  '需求分析', '代码生成', '代码审查', '文档写作', '数据处理', '项目测试', '重构', '调试修复',
+]
+
+/** One CLI's published versions (npm registry) for the SDK card's picker. */
+export interface MaestroCliVersions {
+  readonly cli: MaestroCliId
+  /** The registry's `latest` dist-tag ('' when it is a prerelease). */
+  readonly latest: string
+  /** Stable releases only, oldest first (prereleases are filtered out). */
+  readonly versions: readonly string[]
+  /** The machine this host runs on, e.g. `win32-x64`. */
+  readonly platform: string
+}
+
+/**
+ * Strip terminal escape sequences and stray control characters out of CLI
+ * output before it reaches the log view. Codex/claude paint progress bars with
+ * ANSI colours and carriage-return redraws; rendered as text those bytes show
+ * up as mojibake, so both the host (event ring) and the card clean the text.
+ */
+export function cleanLogText(text: string): string {
+  return text
+    // OSC sequences: ESC ] … (BEL | ESC \)
+    .replace(/\u001b\][^\u0007\u001b]*(?:\u0007|\u001b\\)/g, '')
+    // CSI sequences: ESC [ params/intermediates final-byte
+    .replace(/\u001b\[[0-9;?]*[ -/]*[@-~]/g, '')
+    // Any other two-byte ESC sequence.
+    .replace(/\u001b[@-Z\\-_]/g, '')
+    // C0 controls except TAB and LF, plus DEL.
+    .replace(/[\u0000-\u0008\u000B-\u001F\u007F]/g, '')
+}
+
 /** Detected install state of one CLI. */
 export interface MaestroCliStatus {
   readonly installed: boolean
@@ -105,10 +144,14 @@ export interface MaestroTaskSummary {
   readonly title: string
   readonly phase: MaestroPhase
   readonly model: string
+  /** The session (agent) that dispatched the task; absent = no owner (npm jobs). */
+  readonly sessionId?: string
   readonly startedAt: number
   readonly endedAt?: number
   readonly exitCode?: number
   readonly durationMs?: number
+  /** The event ring dropped older entries: a client must not trust gaps as idle time. */
+  readonly truncated?: boolean
 }
 
 /** Task detail: summary plus the outcome fields and events after a cursor. */
@@ -128,6 +171,7 @@ export interface MaestroOverview {
   readonly clis: Readonly<Record<MaestroCliId, MaestroCliStatus>>
   readonly enabled: boolean
   readonly defaultCli: MaestroCliId
+  readonly minTaskDifficulties: Readonly<Record<MaestroCliId, 'low' | 'medium' | 'high' | 'extreme'>>
   readonly tasks: readonly MaestroTaskSummary[]
 }
 

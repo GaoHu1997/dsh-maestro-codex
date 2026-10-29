@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest'
 import { launchPlan, windowsQuote } from '../src/spawn.js'
-import { findNpmCliJs, npmArgv } from '../src/cli-manager.js'
+import { extractVersion, findNpmCliJs, npmArgv } from '../src/cli-manager.js'
 
 describe('windowsQuote', () => {
   it('leaves plain tokens bare', () => {
@@ -49,6 +49,28 @@ describe('npm argv building', () => {
   it('uninstall spells the package', () => {
     const argv = npmArgv('uninstall', '@anthropic-ai/claude-code', '', undefined)
     expect(argv.args).toEqual(['uninstall', '-g', '@anthropic-ai/claude-code'])
+  })
+
+  it('pins an install target when a version is given', () => {
+    const argv = npmArgv('install', '@openai/codex', '', undefined, '0.152.1')
+    expect(argv.args).toEqual(['install', '-g', '@openai/codex@0.152.1'])
+  })
+
+  it('never appends a version to uninstall', () => {
+    const argv = npmArgv('uninstall', '@openai/codex', '', undefined, '0.152.1')
+    expect(argv.args).toEqual(['uninstall', '-g', '@openai/codex'])
+  })
+})
+
+describe('extractVersion', () => {
+  it('pulls the semver token out of CLI banners', () => {
+    expect(extractVersion('codex-cli 0.152.1')).toBe('0.152.1')
+    expect(extractVersion('2.1.0 (Claude Code)')).toBe('2.1.0')
+    expect(extractVersion('0.166.0-alpha.6')).toBe('0.166.0-alpha.6')
+  })
+
+  it('falls back to the trimmed text when no semver is present', () => {
+    expect(extractVersion('  unknown  ')).toBe('unknown')
   })
 })
 

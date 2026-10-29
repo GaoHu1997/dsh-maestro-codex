@@ -7,61 +7,143 @@
  */
 
 import type { Context } from '@deepseek-ai/cordis'
+import { TASK_DIFFICULTIES } from './config.js'
 import { parseDispatchParams, runDispatch, type DispatchDeps, type DispatchParams, type DispatchValue } from './dispatch.js'
+import { sessionUsageAppendOf, type CliUsageSession } from './usage.js'
 
 export const TOOL_NAME = 'dispatch_cli_task'
 
 /** The deps the tool needs — the same stable dispatch instance the routes use. */
 export type MaestroToolDeps = DispatchDeps
 
-/** The model-facing JSON schema of the canonical value (harness dialect). */
-const OUTPUT_SCHEMA = {
-  type: 'object', additionalProperties: false, properties: {
-    ok: { type: 'boolean', required: true },
-    cli: { type: 'string', required: true },
-    model: { type: 'string', required: true },
-    cwd: { type: 'string', required: true },
-    durationMs: { type: 'integer', required: true },
+/**
+ * The model-facing JSON schema of the canonical value. This must stay inside
+ * the harness's *enforced* JSON Schema subset: `required` is only legal as a
+ * string array on an object node. Per-property `required: true` makes
+ * `tools.register` throw `JsonSchemaError`, the tool then never exists, and
+ * the routing hint advertises a tool the model cannot call.
+ */
+export const TOOL_OUTPUT_SCHEMA = {
+  type: 'object',
+  additionalProperties: false,
+  properties: {
+    ok: { type: 'boolean' },
+    cli: { type: 'string' },
+    model: { type: 'string' },
+    cwd: { type: 'string' },
+    durationMs: { type: 'integer' },
     exitCode: { type: 'integer' },
-    sessionRef: { type: 'string', required: true },
-    finalText: { type: 'string', required: true },
-    notes: { type: 'array', required: true, items: { type: 'string' } },
+    sessionRef: { type: 'string' },
+    finalText: { type: 'string' },
+    notes: { type: 'array', items: { type: 'string' } },
   },
-} as const
-
-const TOOL_PARAMETERS = {
-  task: { type: 'string', required: true, description: '完整、自包含的任务描述。CLI 子代理看不到本会话上下文：目标、涉及的文件路径、验收标准、输出格式都要写全。' },
-  cli: { type: 'string', description: '"claude" / "codex" / 缺省 auto。auto 时按任务类型路由表自动选择；用户点名 CLI 时必须照办。' },
-  cwd: { type: 'string', description: '执行目录（绝对路径），缺省用当前工作区根目录。' },
-  model: { type: 'string', description: '覆盖该 CLI 配置的模型；用户点名模型时才填。' },
-  timeout_minutes: { type: 'number', description: '超时（分钟），缺省用配置页的每 CLI 超时。' },
+  required: ['ok', 'cli', 'model', 'cwd', 'durationMs', 'sessionRef', 'finalText', 'notes'],
 } as const
 
 /**
+ * The model-facing parameter schema. `tools.register` does not convert the
+ * tool DSL — it hands this object to the model as-is — so it is plain JSON
+ * Schema (object wrapper, `required` array).
+ */
+export const TOOL_PARAMETER_SCHEMA = {
+  type: 'object',
+  additionalProperties: false,
+  properties: {
+    task: { type: 'string', description: '完整、自包含的任务描述。CLI 子代理看不到本会话上下文：目标、涉及的文件路径、验收标准、输出格式都要写全。' },
+    cli: { type: 'string', description: '"claude" / "codex" / 缺省 auto。auto 按任务类型和默认配置路由，然后检查实际选定 CLI 的独立最低难度（停用请求回落时检查回落 CLI）；指定 CLI 或用户点名均不能绕过，也不会因另一 CLI 门槛较低而重新路由。' },
+    task_difficulty: { type: 'string', enum: [...TASK_DIFFICULTIES], description: '主代理对任务实际范围、步骤、依赖和风险的语义评估：简短问答/小范围编辑 low，多步一般任务 medium，跨模块重构 high，系统级复杂任务 extreme；不要按关键词或为了触发 CLI 夸大难度。' },
+    difficulty_reason: { type: 'string', description: '非空评估依据（最多 2000 字符），说明真实任务范围、步骤、依赖或风险；必须与 task_difficulty 同时提供，不能仅用任务类型关键词当理由。' },
+    cwd: { type: 'string', description: '执行目录（绝对路径）。省略时沿用本会话工作区，并在返回的 notes 里标注实际使用的目录。' },
+    model: { type: 'string', description: '临时指定该子代理的模型；不填则默认沿用主代理当前选择的模型（协议不支持该 CLI 时回退配置页的 dsh 模型），仍未选则用 CLI 默认模型。' },
+    timeout_minutes: { type: 'number', description: '超时（分钟，1–240），缺省用配置页的每 CLI 超时。' },
+  },
+  required: ['task', 'task_difficulty', 'difficulty_reason'],
+} as const
+
+/**
+ * The slice of the host's tool-execution context this plugin reads. `agent` is
+ * absent in headless/SDK runs, so both the session tag and the primary model
+ * route are optional — a missing one only costs the auto-derived model.
+ */
+export interface ToolExec {
+  readonly signal: AbortSignal
+  readonly agent?: {
+    readonly id?: string
+    readonly options?: { readonly provider?: string; readonly model?: string }
+    readonly session?: {
+      requestHeader?: () => { readonly config?: { readonly provider?: string; readonly model?: string } } | undefined
+      readonly append?: (type: string, data: unknown) => unknown
+    }
+  } | undefined
+}
+
+/**
+ * The calling agent's effective model route. The request header is what the
+ * last request actually used (registered provider + model); `options` is the
+ * configured choice before routing. Either may be missing.
+ */
+export function primaryRouteOf(exec: ToolExec): { provider: string; model: string } | undefined {
+  const agent = exec.agent
+  if (agent === undefined) return undefined
+  let header: { readonly provider?: string; readonly model?: string } | undefined
+  try {
+    header = agent.session?.requestHeader?.()?.config
+  } catch {
+    // A session without a header fold must not break the dispatch.
+    header = undefined
+  }
+  const provider = header?.provider ?? agent.options?.provider
+  const model = header?.model ?? agent.options?.model
+  if (typeof provider !== 'string' || provider === '' || typeof model !== 'string' || model === '') return undefined
+  return { provider, model }
+}
+
+/** The owning session id, when the host exposes one. */
+export function ownerSessionOf(exec: ToolExec): string | undefined {
+  const id = exec.agent?.id
+  return typeof id === 'string' && id !== '' ? id : undefined
+}
+
+/**
+ * The owning session's append handle (usage reporting). `undefined` when the
+ * host session does not expose `append` — the dispatch then simply reports
+ * nothing, and the board still shows the per-task stats.
+ */
+export function usageSessionOf(exec: ToolExec): CliUsageSession | undefined {
+  return sessionUsageAppendOf(exec.agent?.session)
+}
+
+/**
  * Register the dispatch tool (and return its disposer). Name collisions fall
- * back to `maestro_dispatch_task` so a hard failure never takes the plugin down.
+ * back to `maestro_dispatch_task`; any other registration failure (a schema
+ * the host refuses, a missing service) propagates so the caller can log it
+ * instead of silently losing the tool.
  */
 export function registerDispatchTool(ctx: Context, deps: MaestroToolDeps): { readonly name: string; readonly dispose: () => void } {
   const tools = (ctx as unknown as { tools: { register(definition: unknown): unknown } }).tools
 
-  const execute = async (rawArgs: unknown, exec: { signal: AbortSignal }): Promise<DispatchValue> => {
+  const execute = async (rawArgs: unknown, exec: ToolExec): Promise<DispatchValue> => {
     const parsed = parseToolArgs(rawArgs)
     if (typeof parsed === 'string') throw new Error(parsed)
-    try {
-      return await runDispatch(deps, parsed, exec.signal)
-    } catch (error) {
-      // DispatchError messages are already agent-facing; anything else keeps
-      // its own shape (the abort reason included).
-      throw error
-    }
+    const primaryModel = primaryRouteOf(exec)
+    const sessionId = ownerSessionOf(exec)
+    const usageSession = usageSessionOf(exec)
+    // DispatchError messages are already agent-facing; anything else keeps its
+    // own shape (the abort reason included).
+    return runDispatch(deps, {
+      ...parsed,
+      ...(primaryModel === undefined ? {} : { primaryModel }),
+      ...(sessionId === undefined ? {} : { sessionId }),
+      ...(usageSession === undefined ? {} : { usageSession }),
+    }, exec.signal)
   }
 
   const definitionFor = (name: string): unknown => ({
     name,
-    description: '把一个完整任务派发给外部 CLI 子代理（claude cli 或 codex cli）执行并取回结果。适合：用户点名 claude/codex，或任务类型命中配置的路由表（如重构/测试/文档给 claude，脚本/快速修复给 codex）。CLI 子代理看不到本会话上下文，task 参数必须自包含。',
-    parameters: TOOL_PARAMETERS,
+    description: '仅将主代理语义评估达到实际选定 CLI 独立最低难度的完整任务派发给外部 CLI 子代理（claude cli 或 codex cli）执行并取回结果。简短问答/小范围编辑 low，多步一般任务 medium，跨模块重构 high，系统级复杂任务 extreme。先评估真实难度并提供 task_difficulty 和 difficulty_reason，按请求或 auto 路由确定真实 CLI（含停用回落），再检查该 CLI 的配置门槛；低于门槛由主代理直接完成，禁止改选门槛更低的 CLI 绕过限制。任务类型命中、指定 cli 或用户点名均不能绕过门槛。CLI 看不到会话上下文，task 必须自包含。',
+    parameters: TOOL_PARAMETER_SCHEMA,
     output: {
-      schema: OUTPUT_SCHEMA,
+      schema: TOOL_OUTPUT_SCHEMA,
       render: (_args: unknown, value: DispatchValue) => [
         { type: 'text' as const, text: renderSummary(value) },
       ],
@@ -85,9 +167,8 @@ export function registerDispatchTool(ctx: Context, deps: MaestroToolDeps): { rea
   try {
     disposer = tools.register(definitionFor(name))
   } catch (error) {
-    const message = error instanceof Error ? error.message : String(error)
-    if (!/already registered/i.test(message)) throw error
-    name = 'maestro_dispatch_task'
+    if (!isToolNameTaken(error)) throw error
+    name = FALLBACK_TOOL_NAME
     deps.logger?.warn(`dsh-maestro-codex: tool name "${TOOL_NAME}" is taken — registering as "${name}"`)
     disposer = tools.register(definitionFor(name))
   }
@@ -97,6 +178,14 @@ export function registerDispatchTool(ctx: Context, deps: MaestroToolDeps): { rea
       if (typeof disposer === 'function') (disposer as () => void)()
     },
   }
+}
+
+/** The fallback name used when another plugin already owns `dispatch_cli_task`. */
+export const FALLBACK_TOOL_NAME = 'maestro_dispatch_task'
+
+function isToolNameTaken(error: unknown): boolean {
+  const message = error instanceof Error ? error.message : String(error)
+  return /already registered|already exists|duplicate/i.test(message)
 }
 
 /** Validate one raw args record; a string return is the error. */

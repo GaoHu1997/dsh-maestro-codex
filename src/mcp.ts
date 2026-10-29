@@ -12,10 +12,9 @@
 
 import { randomUUID } from 'node:crypto'
 import { existsSync, readFileSync, readdirSync } from 'node:fs'
-import { tmpdir } from 'node:os'
+import { unlink, writeFile } from 'node:fs/promises'
+import { homedir, tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { readFile, writeFile, unlink } from 'node:fs/promises'
-import { homedir } from 'node:os'
 import { parseDocument } from 'yaml'
 
 /** One dsh MCP server as the CLI bridge needs it. */
@@ -33,29 +32,40 @@ export interface DshMcpServer {
 
 const MCP_PLUGIN_NAME = '@deepseek-ai/dsh-mcp-client'
 
-/** The patch file of the profile this plugin is installed into (cached). */
-let patchPathCache: string | undefined
+/**
+ * The patch file of the profile this plugin is installed into. Cached briefly:
+ * the profile can change at runtime (`DSH_PROFILE`, a profile added in the app),
+ * and a process-lifetime cache would keep reading the old profile's file.
+ */
+let patchPathCache: { key: string; path: string; at: number } | undefined
+const PATCH_PATH_TTL_MS = 5_000
 
 export function activeProfilePatchPath(dshHome: string | undefined = process.env['DSH_HOME'], home: string = homedir()): string {
-  if (patchPathCache !== undefined) return patchPathCache
   const profilesRoot = join(dshHome !== undefined && dshHome.trim() !== '' ? dshHome : join(home, '.dsh'), 'profiles')
-  const fromEnv = process.env['DSH_PROFILE']
-  const candidates = fromEnv !== undefined && fromEnv.trim() !== ''
-    ? [fromEnv.trim()]
+  const envProfile = process.env['DSH_PROFILE'] ?? ''
+  const cacheKey = `${profilesRoot}|${envProfile}`
+  const now = Date.now()
+  if (patchPathCache !== undefined && patchPathCache.key === cacheKey && now - patchPathCache.at < PATCH_PATH_TTL_MS) {
+    return patchPathCache.path
+  }
+  const fromEnv = envProfile.trim()
+  const candidates = fromEnv !== ''
+    ? [fromEnv]
     : existsSync(profilesRoot)
       ? readdirSync(profilesRoot)
       : []
+  let resolved = join(profilesRoot, 'desktop', 'cordis.patch.yml')
   for (const profile of candidates) {
     if (existsSync(join(profilesRoot, profile, 'node_modules', 'dsh-maestro-codex'))) {
-      patchPathCache = join(profilesRoot, profile, 'cordis.patch.yml')
-      return patchPathCache
+      resolved = join(profilesRoot, profile, 'cordis.patch.yml')
+      break
     }
   }
-  patchPathCache = join(profilesRoot, 'desktop', 'cordis.patch.yml')
-  return patchPathCache
+  patchPathCache = { key: cacheKey, path: resolved, at: now }
+  return resolved
 }
 
-/** Reset the cached patch path (tests). */
+/** Drop the cached patch path (tests, and profile switches that must be instant). */
 export function resetPatchPathCache(): void {
   patchPathCache = undefined
 }
@@ -142,10 +152,6 @@ export function readMcpServersFromPatch(path: string): DshMcpServer[] {
   return servers
 }
 
-function readFileSync2(path: string): string {
-  return readFileSync(path, 'utf8')
-}
-
 /** Discover the dsh MCP servers of the active profile. */
 export function discoverMcpServers(): DshMcpServer[] {
   return readMcpServersFromPatch(activeProfilePatchPath())
@@ -167,7 +173,9 @@ export async function writeClaudeMcpConfig(servers: readonly DshMcpServer[]): Pr
     }
   }
   const file = join(tmpdir(), `dsh-maestro-mcp-${randomUUID().slice(0, 8)}.json`)
-  await writeFile(file, JSON.stringify({ mcpServers }, null, 2), 'utf8')
+  // The file carries server env (possibly credentials): owner-only where the
+  // platform honours the mode. It is unlinked as soon as the run settles.
+  await writeFile(file, JSON.stringify({ mcpServers }, null, 2), { encoding: 'utf8', mode: 0o600 })
   return file
 }
 

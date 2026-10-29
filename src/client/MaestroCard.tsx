@@ -1,11 +1,11 @@
 /**
- * The plugin configuration card on the dsh settings page — "CLI 配置".
+ * The plugin configuration card on the dsh settings page — "CLI 子代理".
  *
  * Tabbed layout, one concern per tab: per-CLI configuration (CLI 管理 — one
  * expandable row per CLI with model / task-type / permission / connection
- * settings and a test-run form), CLI binary management (SDK 管理 — npm
- * install / update / uninstall per package), routing defaults (调度设置) and
- * the task monitor with the manual dispatch smoke-test entry (任务监视).
+ * settings), CLI binary management (SDK 管理 — one card per npm package with
+ * a version picker, install / uninstall), routing defaults (调度设置) and the
+ * task monitor (任务监视).
  *
  * Plain React + one injected stylesheet: the web shell has no CSS pipeline
  * and the card must be self-contained in the plugin bundle. The stylesheet
@@ -16,13 +16,13 @@
 
 import { useCallback, useEffect, useState, useSyncExternalStore, type CSSProperties, type ReactNode } from 'react'
 import {
-  cancelTask, dispatchManual, fetchHint, fetchModels, fetchOverview, fetchTaskDetail,
+  cancelTask, fetchCliVersions, fetchHint, fetchModels, fetchOverview, fetchTaskDetail,
   installCli, refreshCli, uninstallCli, type Call,
 } from './api.js'
-import { fieldText, type MaestroFormActions, type MaestroFormState, type MaestroStore, type StagedField } from './form.js'
+import { cliMinTaskDifficulty, fieldText, type MaestroFormActions, type MaestroFormState, type MaestroStore, type SectionValue, type StagedField } from './form.js'
 import {
-  CLI_LABELS, CLI_PACKAGES, MAESTRO_CLI_IDS,
-  type DshProviderModels, type MaestroCliId, type MaestroOverview, type MaestroPhase,
+  cleanLogText, CLI_LABELS, CLI_PACKAGES, MAESTRO_CLI_IDS, TASK_TYPE_CATALOG,
+  type DshProviderModels, type MaestroCliId, type MaestroCliVersions, type MaestroOverview, type MaestroPhase,
   type MaestroTaskDetail,
 } from '../wire.js'
 
@@ -30,8 +30,6 @@ import {
 export interface MaestroCardProps {
   maestroStore: MaestroStore
   maestro: MaestroFormActions
-  /** Workspace paths for the dispatch form's cwd auto-fill. */
-  workspaces?: string[] | undefined
 }
 
 /** Per-CLI identity colors, reused by the row monograms and the task list. */
@@ -39,6 +37,42 @@ const CLI_BRAND: Record<MaestroCliId, string> = { claude: '#d97757', codex: '#10
 const CLI_MONOGRAM: Record<MaestroCliId, string> = { claude: 'CL', codex: 'CX' }
 
 const CLI_OPTIONS = MAESTRO_CLI_IDS.map(cli => ({ value: cli, label: CLI_LABELS[cli] }))
+
+export const TASK_DIFFICULTY_OPTIONS = [
+  { value: 'low', label: '低' },
+  { value: 'medium', label: '中' },
+  { value: 'high', label: '高' },
+  { value: 'extreme', label: '极高' },
+] as const
+
+/** One independent, immediately persisted task-difficulty selector per CLI. */
+export function CliDifficultySelect(props: { cli: MaestroCliId; values: SectionValue; onChange: (value: string) => void }): ReactNode {
+  return (
+    <SelectField
+      label={`${CLI_LABELS[props.cli]} 最低任务难度`}
+      value={cliMinTaskDifficulty(props.values, props.cli)}
+      options={TASK_DIFFICULTY_OPTIONS}
+      onChange={props.onChange}
+      hint="仅控制此 CLI；评估达到门槛才启动，未达门槛由主代理直接完成。默认中；未单独设置时沿用旧的统一设置。"
+    />
+  )
+}
+
+/** SDK card titles / descriptions (dependency-manager wording, per CLI). */
+const SDK_TITLES: Record<MaestroCliId, string> = {
+  claude: 'Claude Code SDK',
+  codex: 'Codex SDK',
+}
+const SDK_DESCRIPTIONS: Record<MaestroCliId, string> = {
+  claude: 'Claude AI 功能所需。包含 Claude Code SDK 及相关依赖。',
+  codex: 'Codex AI 功能所需。包含 OpenAI Codex SDK。',
+}
+
+/** Task-monitor owner labels: every row there is an external CLI subagent. */
+const SUBAGENT_LABELS: Record<MaestroCliId, string> = {
+  claude: 'claude 子代理',
+  codex: 'codex 子代理',
+}
 
 const PHASE_LABELS: Record<MaestroPhase, string> = {
   queued: '排队中', running: '执行中', done: '已完成', failed: '失败', cancelled: '已取消', timeout: '超时',
@@ -84,9 +118,9 @@ const CARD_CSS = `
    * resolves against that — the card follows the shell it is embedded in. */
   display: flex;
   flex-direction: column;
-  gap: 14px;
+  gap: 18px;
   max-width: 880px;
-  font-size: 13px;
+  font-size: 12.5px;
   line-height: 1.55;
   color: var(--dmc-fg);
 }
@@ -94,8 +128,8 @@ const CARD_CSS = `
 
 /* --- header --- */
 .dmc-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 16px; }
-.dmc-title { margin: 0; font-size: 16px; font-weight: 650; }
-.dmc-subtitle { margin: 2px 0 0; font-size: 12px; color: var(--dmc-fg3); }
+.dmc-title { margin: 0; font-size: 18px; font-weight: 650; letter-spacing: -.01em; }
+.dmc-subtitle { margin: 3px 0 0; font-size: 12.5px; color: var(--dmc-fg3); }
 .dmc-headside { display: flex; align-items: center; gap: 10px; flex: none; padding-top: 2px; }
 
 /* --- chips --- */
@@ -128,17 +162,27 @@ const CARD_CSS = `
 .dmc-chevron { flex: none; color: var(--dmc-fg3); transition: transform .18s; }
 .dmc-chevron-open { transform: rotate(180deg); }
 .dmc-detail { border-top: 1px solid var(--dmc-border); }
-.dmc-body { padding: 14px; display: flex; flex-direction: column; gap: 14px; }
+.dmc-body { padding: 16px; display: flex; flex-direction: column; gap: 22px; }
 
-/* --- groups & fields --- */
-.dmc-group { display: flex; flex-direction: column; gap: 10px; }
-.dmc-grouptitle { margin: 0; font-size: 11px; font-weight: 650; text-transform: uppercase; letter-spacing: .08em; color: var(--dmc-fg3); }
-.dmc-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 10px 16px; }
-.dmc-field { display: flex; flex-direction: column; gap: 4px; min-width: 0; }
+/* --- groups & fields ---
+ * Vertical rhythm: a group is a heading plus its body (6px apart); groups are
+ * 22px apart, so heading→content always reads tighter than heading→heading. */
+.dmc-group { display: flex; flex-direction: column; gap: 6px; }
+.dmc-grouptitle { margin: 0; font-size: 13.5px; font-weight: 600; letter-spacing: -.005em; color: var(--dmc-fg); }
+.dmc-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 14px 18px; }
+.dmc-field { display: flex; flex-direction: column; gap: 3px; min-width: 0; }
 .dmc-fieldwide { grid-column: 1 / -1; }
-.dmc-label { font-size: 12px; font-weight: 550; color: var(--dmc-fg2); display: flex; align-items: center; gap: 6px; }
+.dmc-label { font-size: 12.5px; font-weight: 550; color: var(--dmc-fg2); display: flex; align-items: center; gap: 6px; }
 .dmc-dirty { width: 6px; height: 6px; border-radius: 999px; background: var(--dmc-warn); flex: none; }
-.dmc-hint { font-size: 11px; color: var(--dmc-fg3); line-height: 1.5; }
+.dmc-hint { font-size: 11.5px; color: var(--dmc-fg3); line-height: 1.5; }
+
+/* --- advanced (collapsed connection settings) --- */
+.dmc-advanced { border-top: 1px dashed var(--dmc-border); padding-top: 12px; display: flex; flex-direction: column; gap: 10px; }
+.dmc-advanced > summary { font-size: 12.5px; font-weight: 550; color: var(--dmc-fg2); cursor: pointer; list-style: none; display: flex; align-items: center; gap: 6px; user-select: none; }
+.dmc-advanced > summary::-webkit-details-marker { display: none; }
+.dmc-advanced > summary::before { content: '▸'; font-size: 10px; color: var(--dmc-fg3); transition: transform .15s; }
+.dmc-advanced[open] > summary::before { transform: rotate(90deg); }
+.dmc-advanced[open] > summary { margin-bottom: 2px; }
 
 /* --- inputs --- */
 .dmc-input, .dmc-select, .dmc-textarea {
@@ -174,6 +218,29 @@ const CARD_CSS = `
 .dmc-savebar { position: sticky; bottom: 0; z-index: 2; display: flex; align-items: center; gap: 10px; flex-wrap: wrap; padding: 10px 14px; border-radius: 10px; border: 1px solid color-mix(in srgb, var(--dmc-warn) 40%, transparent); background: color-mix(in srgb, var(--dmc-warn) 8%, var(--dmc-panel)); box-shadow: 0 -4px 14px rgba(0,0,0,.08); }
 .dmc-savebar-text { flex: 1; min-width: 220px; font-size: 12px; color: var(--dmc-fg2); }
 
+/* --- task-type cards (highlight only, no check mark) --- */
+.dmc-typegrid { display: flex; flex-wrap: wrap; gap: 6px; }
+.dmc-typecard { appearance: none; display: inline-flex; align-items: center; padding: 4px 10px; border-radius: 8px; border: 1px solid var(--dmc-border); background: var(--dmc-input); color: var(--dmc-fg2); font-size: 12px; font-weight: 500; cursor: pointer; transition: background .15s, border-color .15s, color .15s; }
+.dmc-typecard:hover { background: var(--dmc-hover); }
+.dmc-typecard-on { border-color: color-mix(in srgb, var(--dmc-accent) 55%, transparent); background: var(--dmc-accent-soft); color: var(--dmc-accent); font-weight: 600; }
+.dmc-typecard:focus-visible { outline: 2px solid var(--dmc-accent); outline-offset: 2px; }
+
+/* --- SDK cards (one per CLI, dependency-manager layout) --- */
+.dmc-sdkcard { border: 1px solid var(--dmc-border); border-radius: 12px; background: var(--dmc-panel); padding: 14px 16px; display: flex; flex-direction: column; gap: 11px; }
+.dmc-sdkhead { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+.dmc-sdkcheck { width: 18px; height: 18px; border-radius: 999px; display: inline-flex; align-items: center; justify-content: center; font-size: 11px; font-weight: 700; color: var(--dmc-ok); background: color-mix(in srgb, var(--dmc-ok) 15%, transparent); flex: none; }
+.dmc-sdkcheck-off { color: var(--dmc-fg3); background: color-mix(in srgb, var(--dmc-fg3) 15%, transparent); }
+.dmc-sdkname { font-size: 14px; font-weight: 650; }
+.dmc-sdkver { font-size: 12px; color: var(--dmc-fg2); font-variant-numeric: tabular-nums; }
+.dmc-sdkarrow { color: var(--dmc-fg3); font-size: 12px; }
+.dmc-sdkdesc { margin: 0; font-size: 12px; color: var(--dmc-fg3); }
+.dmc-sdkfield { display: flex; flex-direction: column; gap: 4px; }
+.dmc-sdkactions { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.dmc-sdkmeta { font-size: 11.5px; color: var(--dmc-fg3); display: flex; gap: 14px; flex-wrap: wrap; font-variant-numeric: tabular-nums; }
+.dmc-sdkpath { border-top: 1px solid var(--dmc-border); padding-top: 9px; display: flex; align-items: center; gap: 8px; font-size: 11.5px; color: var(--dmc-fg3); min-width: 0; }
+.dmc-sdkpath span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-family: ui-monospace, SFMono-Regular, Consolas, 'Courier New', monospace; }
+.dmc-sdkloading { font-size: 11.5px; color: var(--dmc-fg3); }
+
 /* --- log, code, banners --- */
 .dmc-code { font-family: ui-monospace, SFMono-Regular, Consolas, 'Courier New', monospace; font-size: 11.5px; }
 .dmc-log { max-height: 240px; overflow: auto; background: var(--dmc-input); border: 1px solid var(--dmc-border); border-radius: 8px; padding: 8px 10px; font-family: ui-monospace, SFMono-Regular, Consolas, 'Courier New', monospace; font-size: 11.5px; line-height: 1.65; white-space: pre-wrap; word-break: break-word; color: var(--dmc-fg2); }
@@ -192,6 +259,8 @@ const CARD_CSS = `
 .dmc-taskrow-active { border-color: var(--dmc-accent); background: var(--dmc-accent-soft); }
 .dmc-tasktitle { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 12.5px; }
 .dmc-tasktime { flex: none; font-size: 11px; color: var(--dmc-fg3); }
+.dmc-taskbar { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.dmc-taskowner { flex: none; font-size: 11px; font-weight: 600; color: var(--dmc-fg2); padding: 1px 8px; border-radius: 999px; border: 1px solid var(--dmc-border); background: var(--dmc-panel); }
 `
 
 const STYLE_ID = 'dsh-maestro-codex-card-styles'
@@ -320,16 +389,6 @@ function PhaseChip(props: { phase: MaestroPhase }): ReactNode {
   )
 }
 
-/** Keyword chips previewing a task-type list. */
-function KeywordChips(props: { items: readonly string[] }): ReactNode {
-  if (props.items.length === 0) return undefined
-  return (
-    <div className="dmc-chips">
-      {props.items.map(item => <span key={item} className="dmc-chip dmc-chip-accent">{item}</span>)}
-    </div>
-  )
-}
-
 /** The dsh-model select: `<provider>::<model>` options grouped by provider, filtered by CLI protocol. */
 function DshModelSelect(props: {
   cli: MaestroCliId; value: string; providers: DshProviderModels[] | undefined; onChange: (value: string) => void
@@ -359,19 +418,12 @@ function DshModelSelect(props: {
   )
 }
 
-/** A cwd field: workspace quick-pick over a free-form absolute path. */
-function CwdField(props: { label: string; value: string; workspaces: readonly string[]; onChange: (value: string) => void; hint?: string | undefined }): ReactNode {
-  return (
-    <Field label={props.label} hint={props.hint}>
-      {props.workspaces.length > 0 && (
-        <select className="dmc-select" value="" onChange={event => { if (event.target.value !== '') props.onChange(event.target.value) }}>
-          <option value="">选择工作区目录…</option>
-          {props.workspaces.map(path => <option key={path} value={path}>{path}</option>)}
-        </select>
-      )}
-      <input className="dmc-input" value={props.value} placeholder="留空用插件进程的当前目录" onChange={event => { props.onChange(event.target.value) }} />
-    </Field>
-  )
+/** One CLI's npm registry versions, or the failure that kept them away. */
+interface RegistryVersions {
+  latest: string
+  versions: string[]
+  platform: string
+  error: string
 }
 
 export function MaestroCard(props: MaestroCardProps): ReactNode {
@@ -379,11 +431,9 @@ export function MaestroCard(props: MaestroCardProps): ReactNode {
   const form = useStore(props.maestroStore)
   const actions = props.maestro
   const values = form.values
-  const workspaces = props.workspaces ?? []
 
   const [tab, setTab] = useState<TabId>('cli')
   const [openCli, setOpenCli] = useState<MaestroCliId | undefined>(undefined)
-  const [openSdk, setOpenSdk] = useState<MaestroCliId | undefined>(undefined)
 
   const [overview, setOverview] = useState<MaestroOverview | undefined>(undefined)
   const [overviewError, setOverviewError] = useState('')
@@ -391,12 +441,10 @@ export function MaestroCard(props: MaestroCardProps): ReactNode {
   const [busy, setBusy] = useState('')
   const [notice, setNotice] = useState('')
 
-  // Test-run drafts (tab 1, one per CLI) and the manual dispatch form (tab 4).
-  const [testTask, setTestTask] = useState<Partial<Record<MaestroCliId, string>>>({})
-  const [testCwd, setTestCwd] = useState('')
-  const [dispatchCli, setDispatchCli] = useState('auto')
-  const [dispatchTask, setDispatchTask] = useState('')
-  const [dispatchCwd, setDispatchCwd] = useState('')
+  // SDK tab: each CLI's published versions (loaded on demand) and the version
+  // each card's picker currently points at.
+  const [registryVersions, setRegistryVersions] = useState<Partial<Record<MaestroCliId, RegistryVersions>>>({})
+  const [versionDraft, setVersionDraft] = useState<Partial<Record<MaestroCliId, string>>>({})
 
   const [selectedId, setSelectedId] = useState('')
   const [detail, setDetail] = useState<MaestroTaskDetail | undefined>(undefined)
@@ -429,7 +477,26 @@ export function MaestroCard(props: MaestroCardProps): ReactNode {
     return () => { disposed = true }
   }, [])
 
-  // The routing hint preview: (re)loaded whenever the routing tab opens.
+  // The SDK tab's version pickers: load each CLI's registry versions once.
+  useEffect(() => {
+    if (tab !== 'sdk') return
+    let disposed = false
+    for (const cli of MAESTRO_CLI_IDS) {
+      if (registryVersions[cli] !== undefined) continue
+      void fetchCliVersions(cli).then(result => {
+        if (disposed) return
+        setRegistryVersions(previous => ({
+          ...previous,
+          [cli]: result.ok
+            ? { latest: result.latest, versions: [...result.versions], platform: result.platform, error: '' }
+            : { latest: '', versions: [], platform: '', error: result.error },
+        }))
+      })
+    }
+    return () => { disposed = true }
+  }, [tab])
+
+  // Refresh the routing hint on tab entry and immediate routing config changes.
   useEffect(() => {
     if (tab !== 'routing') return
     let disposed = false
@@ -438,7 +505,7 @@ export function MaestroCard(props: MaestroCardProps): ReactNode {
       setHint(result.ok ? { text: result.hint, error: '' } : { text: '', error: result.error })
     })
     return () => { disposed = true }
-  }, [tab])
+  }, [tab, values.minTaskDifficulty, values.claudeMinTaskDifficulty, values.codexMinTaskDifficulty, values.defaultCli, values.claudeTaskTypes, values.codexTaskTypes, values.claudeEnabled, values.codexEnabled])
 
   // Poll the selected task's detail while it is interesting.
   useEffect(() => {
@@ -473,41 +540,24 @@ export function MaestroCard(props: MaestroCardProps): ReactNode {
     return result
   }
 
-  /** Dispatch a test task for one CLI; on success jump to the task monitor. */
-  const runTest = async (cli: MaestroCliId): Promise<void> => {
-    const task = (testTask[cli] ?? '').trim()
-    if (busy !== '' || task === '') return
-    const ref = await withBusy(`test-${cli}`, () => dispatchManual({
-      cli,
-      task,
-      ...(testCwd.trim() === '' ? {} : { cwd: testCwd.trim() }),
-    }))
-    if (ref.ok) {
-      setSelectedId(ref.id)
-      setTab('tasks')
-      setTestTask(previous => ({ ...previous, [cli]: '' }))
-    }
-  }
-
-  /** Manual dispatch from the task monitor's smoke-test form. */
-  const runDispatch = async (): Promise<void> => {
-    const task = dispatchTask.trim()
-    if (busy !== '' || task === '') return
-    const ref = await withBusy('dispatch', () => dispatchManual({
-      cli: dispatchCli,
-      task,
-      ...(dispatchCwd.trim() === '' ? {} : { cwd: dispatchCwd.trim() }),
-    }))
-    if (ref.ok) {
-      setSelectedId(ref.id)
-      setDispatchTask('')
-    }
-  }
-
-  /** npm install / update / uninstall for one CLI package (confirm on uninstall). */
-  const npmAction = (cli: MaestroCliId, action: 'install' | 'uninstall'): void => {
+  /** npm install one version (empty = registry latest) / uninstall (confirm first). */
+  const npmAction = (cli: MaestroCliId, action: 'install' | 'uninstall', version?: string): void => {
     if (action === 'uninstall' && globalThis.confirm(`确认卸载 ${CLI_PACKAGES[cli]}？（npm -g uninstall）`) === false) return
-    void withBusy(`${action}-${cli}`, () => action === 'install' ? installCli(cli) : uninstallCli(cli))
+    void (async () => {
+      const result = await withBusy(`${action}-${cli}`, () => action === 'install'
+        ? installCli(cli, version === undefined || version === '' ? undefined : version)
+        : uninstallCli(cli))
+      if (!result.ok) return
+      if (action === 'install') {
+        setVersionDraft(previous => {
+          const next = { ...previous }
+          delete next[cli]
+          return next
+        })
+      }
+      // The npm job may still be running; re-detect to pick the new binary up.
+      await withBusy(`refresh-${cli}`, () => refreshCli(cli))
+    })()
   }
 
   const refreshAll = (): void => { void withBusy('refresh', () => refreshCli()) }
@@ -518,10 +568,7 @@ export function MaestroCard(props: MaestroCardProps): ReactNode {
   /** The model summary shown on a collapsed CLI row. */
   const modelSummary = (cli: MaestroCliId): string => {
     const dsh = cli === 'claude' ? values.claudeDshModel : values.codexDshModel
-    const own = cli === 'claude' ? values.claudeModel : values.codexModel
-    if (typeof dsh === 'string' && dsh !== '') return `dsh 模型 ${dsh}`
-    if (typeof own === 'string' && own !== '') return own
-    return 'CLI 默认模型'
+    return typeof dsh === 'string' && dsh !== '' ? `dsh 模型 ${dsh}` : 'CLI 默认模型'
   }
 
   const statusOf = (cli: MaestroCliId) => overview?.clis?.[cli]
@@ -531,9 +578,12 @@ export function MaestroCard(props: MaestroCardProps): ReactNode {
     const open = openCli === cli
     const status = statusOf(cli)
     const enabled = cli === 'claude' ? values.claudeEnabled === true : values.codexEnabled === true
-    const taskTypes = fieldText(form, cli === 'claude' ? 'claudeTaskTypes' : 'codexTaskTypes')
-      .split(/\r?\n/).map(line => line.trim()).filter(line => line !== '')
-    const testText = testTask[cli] ?? ''
+    const taskTypes: readonly string[] = (cli === 'claude' ? values.claudeTaskTypes : values.codexTaskTypes) ?? []
+    const taskTypeField = cli === 'claude' ? 'claudeTaskTypes' : 'codexTaskTypes'
+    const toggleTaskType = (type: string): void => {
+      const next = taskTypes.includes(type) ? taskTypes.filter(entry => entry !== type) : [...taskTypes, type]
+      actions.setImmediate(taskTypeField, next)
+    }
     return (
       <div key={cli} className="dmc-row">
         <button type="button" className="dmc-rowbtn" aria-expanded={open} onClick={() => { setOpenCli(open ? undefined : cli) }}>
@@ -547,7 +597,7 @@ export function MaestroCard(props: MaestroCardProps): ReactNode {
               {enabled ? undefined : <StateChip tone="idle">已停用</StateChip>}
             </span>
             <span className="dmc-rowsub">
-              {`${modelSummary(cli)} · ${String(taskTypes.length)} 类任务`}
+              {`${modelSummary(cli)} · ${String(taskTypes.length)} 类任务 · 最低难度 ${TASK_DIFFICULTY_OPTIONS.find(option => option.value === cliMinTaskDifficulty(values, cli))?.label ?? '中'}`}
             </span>
           </span>
           <Chevron open={open} />
@@ -566,13 +616,6 @@ export function MaestroCard(props: MaestroCardProps): ReactNode {
             <div className="dmc-group">
               <p className="dmc-grouptitle">模型</p>
               <div className="dmc-grid">
-                <StagedInput
-                  label="CLI 模型"
-                  field={cli === 'claude' ? 'claudeModel' : 'codexModel'}
-                  state={form}
-                  actions={actions}
-                  placeholder={cli === 'claude' ? '留空用 CLI 默认，如 claude-sonnet-4-5' : '留空用 CLI 默认，如 gpt-5-codex'}
-                />
                 <DshModelSelect
                   cli={cli}
                   value={String(cli === 'claude' ? values.claudeDshModel ?? '' : values.codexDshModel ?? '')}
@@ -580,21 +623,38 @@ export function MaestroCard(props: MaestroCardProps): ReactNode {
                   onChange={value => { actions.setImmediate(cli === 'claude' ? 'claudeDshModel' : 'codexDshModel', value) }}
                 />
               </div>
+              <span className="dmc-hint">从 dsh 已配置的供应商/模型里选；不选则由 CLI 使用它自己的默认模型。</span>
             </div>
 
-            <StagedArea
+            <CliDifficultySelect
+              cli={cli}
+              values={values}
+              onChange={value => { actions.setImmediate(cli === 'claude' ? 'claudeMinTaskDifficulty' : 'codexMinTaskDifficulty', value) }}
+            />
+
+            <Field
               label="任务类型"
-              field={cli === 'claude' ? 'claudeTaskTypes' : 'codexTaskTypes'}
-              state={form}
-              actions={actions}
-              placeholder={cli === 'claude' ? '每行一个关键词，如：\n重构\n测试\n文档' : '每行一个关键词，如：\n脚本\n快速修复'}
-              hint="任务描述命中关键词时优先派发给该 CLI"
+              wide
+              hint="关键词只用于选择此 CLI；还须达到此 CLI 的最低任务难度才会派发，全部未命中时用「调度设置」里的默认 CLI。"
             >
-              <KeywordChips items={taskTypes} />
-            </StagedArea>
+              <div className="dmc-typegrid">
+                {[...TASK_TYPE_CATALOG, ...taskTypes.filter(type => !TASK_TYPE_CATALOG.includes(type))].map(type => {
+                  const on = taskTypes.includes(type)
+                  return (
+                    <button
+                      key={type}
+                      type="button"
+                      className={on ? 'dmc-typecard dmc-typecard-on' : 'dmc-typecard'}
+                      aria-pressed={on}
+                      onClick={() => { toggleTaskType(type) }}
+                    >{type}</button>
+                  )
+                })}
+              </div>
+            </Field>
 
             <div className="dmc-group">
-              <p className="dmc-grouptitle">权限与连接</p>
+              <p className="dmc-grouptitle">权限</p>
               <div className="dmc-grid">
                 {cli === 'claude' ? (
                   <SelectField
@@ -623,6 +683,12 @@ export function MaestroCard(props: MaestroCardProps): ReactNode {
                     hint="codex exec 非交互，沙箱即权限边界"
                   />
                 )}
+              </div>
+            </div>
+
+            <details className="dmc-advanced">
+              <summary>高级连接设置（一般不需要改）</summary>
+              <div className="dmc-grid">
                 <StagedInput
                   label="API 地址"
                   field={cli === 'claude' ? 'claudeBaseUrl' : 'codexBaseUrl'}
@@ -663,85 +729,92 @@ export function MaestroCard(props: MaestroCardProps): ReactNode {
                   />
                 )}
               </div>
-            </div>
-
-            <div className="dmc-group">
-              <p className="dmc-grouptitle">测试调用</p>
-              <Field label="测试任务" hint="以该 CLI 手动派发一次；成功后自动跳到「任务监视」跟踪执行">
-                <textarea
-                  className="dmc-textarea"
-                  style={{ minHeight: 48 }}
-                  placeholder={cli === 'claude' ? '例如：阅读 src/routes.ts，整理一份接口清单' : '例如：写一个脚本统计各目录的代码行数'}
-                  value={testText}
-                  onChange={event => { setTestTask(previous => ({ ...previous, [cli]: event.target.value })) }}
-                />
-              </Field>
-              <CwdField label="执行目录" value={testCwd} workspaces={workspaces} onChange={setTestCwd} hint="可选，绝对路径；选择工作区可快速填入" />
-              <div className="dmc-toolbar">
-                <button
-                  type="button"
-                  className="dmc-btn dmc-btn-primary"
-                  disabled={busy !== '' || testText.trim() === ''}
-                  onClick={() => { void runTest(cli) }}
-                >派发测试任务</button>
-              </div>
-            </div>
+              <span className="dmc-hint">API 地址 / Token 让 CLI 走自定义兼容端点；CLI 路径留空自动从 PATH 检测；超时到点自动终止任务。</span>
+            </details>
           </div>
         )}
       </div>
     )
   }
 
-  /** One SDK row (tab 2): package identity, install state, npm actions. */
+  /** One SDK card (tab 2): dependency-manager layout — status header, version picker, actions, path. */
   const sdkRow = (cli: MaestroCliId): ReactNode => {
-    const open = openSdk === cli
     const status = statusOf(cli)
+    const installed = status?.installed === true
+    const current = installed ? status.version : ''
+    const registry = registryVersions[cli]
+    const loading = registry === undefined
+    const latest = registry?.latest ?? ''
+    const options = registry?.versions ?? []
+    const selected = versionDraft[cli] ?? current
+    const hasUpdate = installed && latest !== '' && current !== '' && current !== latest
+    const sameAsCurrent = installed && selected === current
     return (
-      <div key={cli} className="dmc-row">
-        <div
-          className="dmc-rowbtn"
-          role="button"
-          tabIndex={0}
-          onClick={() => { setOpenSdk(open ? undefined : cli) }}
-          onKeyDown={event => { if (event.key === 'Enter' || event.key === ' ') { event.preventDefault(); setOpenSdk(open ? undefined : cli) } }}
-        >
-          <Monogram cli={cli} />
-          <span className="dmc-rowmain">
-            <span className="dmc-rowname">
-              <span className="dmc-code" style={{ fontSize: 12.5 }}>{CLI_PACKAGES[cli]}</span>
-              <StateChip tone={status === undefined ? 'idle' : status.installed ? 'ok' : 'warn'}>
-                {status === undefined ? '检测中…' : status.installed ? (status.version !== '' ? `v${status.version}` : '已安装') : '未安装'}
-              </StateChip>
-            </span>
-            <span className="dmc-rowsub">
-              {status?.installed === true ? status.path : (status?.error ?? '')}
-            </span>
-          </span>
-          <span className="dmc-toolbar" onClick={event => { event.stopPropagation() }}>
-            <button type="button" className="dmc-btn dmc-btn-sm" disabled={busy !== ''} onClick={() => { void withBusy(`refresh-${cli}`, () => refreshCli(cli)) }}>检测</button>
-            <button type="button" className="dmc-btn dmc-btn-sm" disabled={busy !== ''} onClick={() => { npmAction(cli, 'install') }}>
-              {status?.installed === true ? '更新' : '安装'}
-            </button>
-            <button
-              type="button"
-              className="dmc-btn dmc-btn-sm dmc-btn-danger"
-              disabled={busy !== '' || status?.installed !== true}
-              onClick={() => { npmAction(cli, 'uninstall') }}
-            >卸载</button>
-          </span>
-          <Chevron open={open} />
+      <div key={cli} className="dmc-sdkcard">
+        <div className="dmc-sdkhead">
+          <span className={installed ? 'dmc-sdkcheck' : 'dmc-sdkcheck dmc-sdkcheck-off'} aria-hidden>{installed ? '✓' : '·'}</span>
+          <span className="dmc-sdkname">{SDK_TITLES[cli]}</span>
+          <span className="dmc-sdkver">{current === '' ? '未安装' : `v${current}`}</span>
+          {hasUpdate && (
+            <>
+              <span className="dmc-sdkarrow">→</span>
+              <span className="dmc-sdkver">{`v${latest}`}</span>
+              <StateChip tone="accent">有更新</StateChip>
+            </>
+          )}
+          <span style={{ flex: 1 }} />
+          <button type="button" className="dmc-btn dmc-btn-sm" disabled={busy !== ''} onClick={() => { void withBusy(`refresh-${cli}`, () => refreshCli(cli)) }}>重新检测</button>
         </div>
-        {open && (
-          <div className="dmc-detail dmc-body">
-            <div className="dmc-grid">
-              <Field label="npm 包"><span className="dmc-code">{CLI_PACKAGES[cli]}</span></Field>
-              <Field label="安装路径"><span className="dmc-code">{status?.installed === true ? status.path : '—'}</span></Field>
-              {status?.error !== undefined && status.error !== '' && (
-                <Field label="检测信息" wide><span className="dmc-hint">{status.error}</span></Field>
-              )}
-            </div>
-          </div>
+        <p className="dmc-sdkdesc">{SDK_DESCRIPTIONS[cli]}</p>
+
+        <Field label="目标版本" hint={`只列正式版（不含 alpha / beta）· 当前平台 ${registry?.platform ?? '—'}`}>
+          <select
+            className="dmc-select"
+            value={selected}
+            disabled={loading || options.length === 0}
+            onChange={event => { setVersionDraft(previous => ({ ...previous, [cli]: event.target.value })) }}
+          >
+            <option value="">{loading ? '加载版本列表…' : (latest === '' ? '最新版' : `最新版（v${latest}）`)}</option>
+            {options.map(version => (
+              <option key={version} value={version}>{version === current ? `v${version}（当前）` : `v${version}`}</option>
+            ))}
+          </select>
+        </Field>
+
+        <div className="dmc-sdkactions">
+          <button
+            type="button"
+            className="dmc-btn dmc-btn-primary"
+            disabled={busy !== '' || sameAsCurrent}
+            onClick={() => { npmAction(cli, 'install', selected) }}
+          >{sameAsCurrent ? '当前版本' : selected === '' ? '安装最新版' : `安装 v${selected}`}</button>
+          <button
+            type="button"
+            className="dmc-btn dmc-btn-danger"
+            disabled={busy !== '' || !installed}
+            onClick={() => { npmAction(cli, 'uninstall') }}
+          >卸载</button>
+          {loading && <span className="dmc-sdkloading">正在读取 npm registry 版本…</span>}
+        </div>
+
+        <div className="dmc-sdkmeta">
+          <span>{`当前版本 ${current === '' ? '—' : `v${current}`}`}</span>
+          <span>{`最新稳定版 ${latest === '' ? (loading ? '加载中…' : '—') : `v${latest}`}`}</span>
+        </div>
+
+        {registry !== undefined && registry.error !== '' && (
+          <div className="dmc-banner dmc-banner-err">{`无法读取 npm registry：${registry.error}`}</div>
         )}
+        {status?.error !== undefined && status.error !== '' && (
+          <div className="dmc-banner dmc-banner-err">{status.error}</div>
+        )}
+
+        <div className="dmc-sdkpath">
+          <span aria-hidden>📁</span>
+          <span title={installed ? status.path : CLI_PACKAGES[cli]}>
+            {installed ? status.path : `未安装 · npm -g ${CLI_PACKAGES[cli]}`}
+          </span>
+        </div>
       </div>
     )
   }
@@ -750,10 +823,11 @@ export function MaestroCard(props: MaestroCardProps): ReactNode {
     <div className="dmc">
       <header className="dmc-head">
         <div>
-          <h3 className="dmc-title">CLI 配置</h3>
+          <h3 className="dmc-title">CLI 子代理</h3>
           <p className="dmc-subtitle">把任务按类型派发给 codex / claude 子代理（headless），取回结果回填主会话</p>
         </div>
         <div className="dmc-headside">
+          {activeCount > 0 && <StateChip tone="accent">{`子代理运行中 ${String(activeCount)}`}</StateChip>}
           <StateChip tone={values.enabled === true ? 'ok' : 'idle'}>{values.enabled === true ? '调度开启' : '调度已停用'}</StateChip>
           <Toggle checked={values.enabled === true} onChange={value => { actions.setImmediate('enabled', value) }} />
         </div>
@@ -793,7 +867,7 @@ export function MaestroCard(props: MaestroCardProps): ReactNode {
             <button type="button" className="dmc-btn" disabled={busy !== ''} onClick={refreshAll}>全部重新检测</button>
           </div>
           {MAESTRO_CLI_IDS.map(sdkRow)}
-          <div className="dmc-hint">安装 / 更新 / 卸载通过 npm -g 执行，过程与结果在「任务监视」标签页实时可见；registry 改动需保存。</div>
+          <div className="dmc-hint">「目标版本」来自 npm registry，可安装任意已发布版本；安装 / 卸载通过 npm -g 执行，过程与结果在「任务监视」标签页实时可见。registry 改动需保存。</div>
         </div>
       )}
 
@@ -821,7 +895,7 @@ export function MaestroCard(props: MaestroCardProps): ReactNode {
                   />
                 </div>
                 <span className="dmc-hint">
-                  任务描述命中某 CLI 的任务类型关键词时优先派发给该 CLI；都未命中时使用默认 CLI。关键词在「CLI 管理」各行的任务类型里配置。
+                  最低任务难度在「CLI 管理」的 Claude / Codex 中分别设置。主代理先评估难度并给出理由，再按任务类型选择 CLI，达到该 CLI 的门槛才启动；未达门槛直接完成，不改选门槛更低的 CLI 绕过限制。仅指定 CLI 名称也不能绕过门槛。低：问答、查询、小范围编辑；中：常规多步骤任务；高：跨模块重构、复杂调试；极高：系统级设计或迁移。关键词只用于选 CLI，不用于抬高难度。
                 </span>
               </div>
               <div className="dmc-group">
@@ -856,36 +930,12 @@ export function MaestroCard(props: MaestroCardProps): ReactNode {
           <div className="dmc-row">
             <div className="dmc-body">
               <div className="dmc-group">
-                <p className="dmc-grouptitle">手动派发 · 冒烟测试</p>
-                <div className="dmc-grid">
-                  <SelectField label="CLI" value={dispatchCli} options={[{ value: 'auto', label: '自动路由' }, ...CLI_OPTIONS]} onChange={setDispatchCli} />
-                  <CwdField label="执行目录" value={dispatchCwd} workspaces={workspaces} onChange={setDispatchCwd} />
-                </div>
-                <Field label="任务描述" wide>
-                  <textarea
-                    className="dmc-textarea"
-                    style={{ minHeight: 48 }}
-                    placeholder="手动派发一个任务做冒烟测试（等同主会话调用 dispatch 工具）"
-                    value={dispatchTask}
-                    onChange={event => { setDispatchTask(event.target.value) }}
-                  />
-                </Field>
-                <div className="dmc-toolbar">
-                  <button
-                    type="button"
-                    className="dmc-btn dmc-btn-primary"
-                    disabled={busy !== '' || dispatchTask.trim() === ''}
-                    onClick={() => { void runDispatch() }}
-                  >派发任务</button>
-                </div>
-              </div>
-            </div>
-          </div>
-
-          <div className="dmc-row">
-            <div className="dmc-body">
-              <div className="dmc-group">
                 <p className="dmc-grouptitle">任务记录</p>
+                <div className="dmc-taskbar">
+                  <span className="dmc-chip dmc-chip-accent">{`CLI 子代理任务 ${String(tasks.length)}`}</span>
+                  {activeCount > 0 && <span className="dmc-chip dmc-chip-warn">{`运行中 ${String(activeCount)}`}</span>}
+                  <span className="dmc-hint">只有主会话通过 dispatch_cli_task 派发的任务会记录在这里；主智能体自己执行的工作不会出现。</span>
+                </div>
                 {overviewError !== '' && <div className="dmc-banner dmc-banner-err">无法连接宿主路由：{overviewError}</div>}
                 <div className="dmc-stack" style={{ gap: 6 }}>
                   {tasks.map(task => (
@@ -895,7 +945,8 @@ export function MaestroCard(props: MaestroCardProps): ReactNode {
                       onClick={() => { setSelectedId(task.id === selectedId ? '' : task.id) }}
                     >
                       <PhaseChip phase={task.phase} />
-                      <span className="dmc-dot" style={{ background: CLI_BRAND[task.cli] }} title={CLI_LABELS[task.cli]} />
+                      <span className="dmc-dot" style={{ background: CLI_BRAND[task.cli] }} />
+                      <span className="dmc-taskowner">{SUBAGENT_LABELS[task.cli]}</span>
                       <span className="dmc-tasktitle" title={task.title}>{task.title}</span>
                       <span className="dmc-tasktime">{new Date(task.startedAt).toLocaleTimeString()}</span>
                       {task.phase === 'running' || task.phase === 'queued'
@@ -917,10 +968,13 @@ export function MaestroCard(props: MaestroCardProps): ReactNode {
                 {detail !== undefined && (
                   <div>
                     <div className="dmc-log">
+                      {detail.summary.truncated === true && (
+                        <div className="dmc-hint">事件过多，较早的日志已被裁剪（仅保留最近的事件）</div>
+                      )}
                       {detail.events.map(event => (
-                        <div key={event.seq}>{`[${new Date(event.at).toLocaleTimeString()}] ${event.kind === 'error' ? '✗ ' : ''}${event.text}`}</div>
+                        <div key={event.seq}>{`[${new Date(event.at).toLocaleTimeString()}] ${event.kind === 'error' ? '✗ ' : ''}${cleanLogText(event.text)}`}</div>
                       ))}
-                      {detail.finalText !== undefined && <div className="dmc-log-final">{detail.finalText}</div>}
+                      {detail.finalText !== undefined && <div className="dmc-log-final">{cleanLogText(detail.finalText)}</div>}
                     </div>
                     {detail.error !== undefined && <div className="dmc-banner dmc-banner-err" style={{ marginTop: 8 }}>{detail.error}</div>}
                     {detail.stats !== undefined && Object.keys(detail.stats).length > 0 && (
@@ -941,7 +995,7 @@ export function MaestroCard(props: MaestroCardProps): ReactNode {
       {form.dirty.length > 0 && (
         <div className="dmc-savebar">
           <span className="dmc-savebar-text">
-            {`有 ${String(form.dirty.length)} 处文本改动待保存 — 模型 / 路径 / 任务类型等保存后生效；开关与下拉即时生效。`}
+            {`有 ${String(form.dirty.length)} 处文本改动待保存 — 模型 / 路径 / 超时等保存后生效；开关、下拉与任务类型即时生效。`}
             {form.invalid !== undefined && <span style={{ color: 'var(--dmc-danger)' }}>{`（${form.invalid.message}）`}</span>}
             {form.failed && <span style={{ color: 'var(--dmc-danger)' }}>上次保存未生效，请重试。</span>}
           </span>

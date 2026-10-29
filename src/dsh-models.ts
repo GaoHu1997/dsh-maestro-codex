@@ -14,6 +14,7 @@ import { readFileSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { join } from 'node:path'
 import type { Context } from '@deepseek-ai/cordis'
+import { parse } from 'yaml'
 
 /** Wire protocols a CLI subprocess can speak directly. */
 export type MappableApi = 'anthropic-messages' | 'openai-completions' | 'openai-responses'
@@ -168,41 +169,44 @@ async function resolveKey(ctx: Context, apiKeyEnv: string): Promise<string> {
     // control flow, not paranoia.
     const credentials = (ctx as unknown as { credentials?: CredentialsFace }).credentials
     if (credentials !== undefined && typeof credentials.resolve === 'function') {
-      const resolved = await Promise.race([
-        credentials.resolve(apiKeyEnv),
-        new Promise<undefined>(resolvePromise => { setTimeout(() => resolvePromise(undefined), 5_000) }),
-      ])
-      if (resolved?.value !== undefined && resolved.value !== '') return resolved.value
+      let timer: NodeJS.Timeout | undefined
+      const timeout = new Promise<undefined>(resolvePromise => {
+        timer = setTimeout(() => resolvePromise(undefined), 5_000)
+        timer.unref?.()
+      })
+      try {
+        const resolved = await Promise.race([credentials.resolve(apiKeyEnv), timeout])
+        if (resolved?.value !== undefined && resolved.value !== '') return resolved.value
+      } finally {
+        if (timer !== undefined) clearTimeout(timer)
+      }
     }
   } catch { /* no credentials service on this context */ }
   return process.env[apiKeyEnv] ?? ''
 }
 
-/** The `refs:` map of `$DSH_HOME/.credentials.yaml`, parsed once per process. */
-let credentialRefsCache: Record<string, string> | undefined
-
+/**
+ * The `refs:` map of `$DSH_HOME/.credentials.yaml`. Read on every call — the
+ * file is tiny, and a process-lifetime cache meant a key edited in the app
+ * never reached a dispatch until the next restart.
+ */
 export function credentialFileRefs(home: string = homedir(), dshHome: string | undefined = process.env['DSH_HOME']): Record<string, string> {
-  if (credentialRefsCache !== undefined) return credentialRefsCache
   const refs: Record<string, string> = {}
   try {
     const file = join(dshHome ?? join(home, '.dsh'), '.credentials.yaml')
-    const lines = readFileSync(file, 'utf8').split(/\r?\n/)
-    let inRefs = false
-    for (const line of lines) {
-      if (/^refs:\s*$/.test(line)) {
-        inRefs = true
-        continue
+    const parsed = parse(readFileSync(file, 'utf8')) as unknown
+    const raw = typeof parsed === 'object' && parsed !== null ? (parsed as Record<string, unknown>)['refs'] : undefined
+    if (typeof raw === 'object' && raw !== null) {
+      for (const [key, value] of Object.entries(raw as Record<string, unknown>)) {
+        if (typeof value === 'string') {
+          if (value !== '') refs[key] = value
+        } else if (typeof value === 'number' || typeof value === 'boolean') {
+          refs[key] = String(value)
+        }
       }
-      if (!inRefs) continue
-      if (/^\S/.test(line)) break // next top-level key: refs section over
-      const match = /^ {2}([A-Za-z0-9_-]+):\s*(.*)$/.exec(line)
-      const name = match?.[1]
-      const value = match?.[2]
-      if (name !== undefined && value !== undefined) refs[name] = value.trim()
     }
   } catch {
     // No credentials file (or unreadable) — the ambient env is the last resort.
   }
-  credentialRefsCache = refs
   return refs
 }

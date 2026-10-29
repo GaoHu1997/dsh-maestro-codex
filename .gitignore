@@ -3,3 +3,6 @@ lib/
 *.tsbuildinfo
 .research/
 .tmp/
+pnpm-lock.yaml
+pnpm-workspace.yaml
+dist/

@@ -8,16 +8,17 @@
 import { randomUUID } from 'node:crypto'
 import { existsSync } from 'node:fs'
 import { isAbsolute } from 'node:path'
-import { modelTokenError, type EffectiveConfig } from './config.js'
+import { modelTokenError, type EffectiveConfig, type TaskDifficulty } from './config.js'
 import { runClaudeTask } from './channels/claude.js'
 import { runCodexTask } from './channels/codex.js'
 import { detectCli, type CliDetection } from './cli-manager.js'
-import { RoutingError, pickCli } from './routing.js'
+import { RoutingError, assertTaskDifficulty, pickCli, taskDifficultyError } from './routing.js'
 import { Limiter, TaskRegistry } from './task-registry.js'
 import type { SpawnFn } from './spawn.js'
 import { writeClaudeMcpConfig, unlinkQuiet, type DshMcpServer } from './mcp.js'
 import type { DshModelEndpoint } from './dsh-models.js'
-import type { MaestroCliId } from './wire.js'
+import { reportCliUsage, type CliUsageSession } from './usage.js'
+import { cleanLogText, type MaestroCliId } from './wire.js'
 
 /** Faces the dispatcher needs; the host apply builds one stable instance. */
 export interface DispatchDeps {
@@ -33,16 +34,34 @@ export interface DispatchDeps {
   listMcpServers?: (() => DshMcpServer[]) | undefined
   /** Injectable spawn seam (tests); absent = the real system spawn. */
   spawnFn?: SpawnFn | undefined
-  logger?: { warn(message: string): void }
+  logger?: { warn(message: string): void; error?(message: string): void }
 }
 
 /** One dispatch request (already validated by the caller). */
 export interface DispatchParams {
   cli: string
   task: string
+  /** Semantic assessment by the main agent; absent legacy assessments rank low. */
+  taskDifficulty?: TaskDifficulty | undefined
+  difficultyReason?: string | undefined
   cwd?: string | undefined
   model?: string | undefined
   timeoutMinutes?: number | undefined
+  /** The calling agent's session id — the task board scopes by it. Not a model
+   * parameter: the tool injects it from `exec.agent`. */
+  sessionId?: string | undefined
+  /**
+   * The calling agent's own model route. The dispatch prefers it over the
+   * configuration card's dsh model (see the resolution order in
+   * {@link runDispatch}). Injected from `exec.agent`; never model-supplied.
+   */
+  primaryModel?: { provider: string; model: string } | undefined
+  /**
+   * The calling agent's session, used only to append the `maestro/cli-usage`
+   * event so dsh and other plugins can read CLI spend. Injected from
+   * `exec.agent`; headless runs have none.
+   */
+  usageSession?: CliUsageSession | undefined
 }
 
 /** The structured answer the tool returns and the card renders. */
@@ -94,12 +113,37 @@ function notInstalledMessage(cli: MaestroCliId, error: string | undefined): stri
   return `${cli} cli 未安装或不可用${error === undefined ? '' : `（${error}）`}。可在本插件的配置页点击「安装」。`
 }
 
+/** `<provider>::<model>`, the selection shape `resolveDshModelEndpoint` consumes. */
+function selectionOf(route: { provider: string; model: string } | undefined): string | undefined {
+  if (route === undefined) return undefined
+  const provider = route.provider.trim()
+  const model = route.model.trim()
+  if (provider === '' || model === '') return undefined
+  return `${provider}::${model}`
+}
+
+/** Why a resolved dsh endpoint cannot drive this CLI, or undefined when it can. */
+function protocolProblem(cli: MaestroCliId, endpoint: DshModelEndpoint): string | undefined {
+  if (cli === 'claude' && endpoint.api !== 'anthropic-messages') {
+    return `dsh 供应商 "${endpoint.provider}" 使用 ${endpoint.api} 协议，claude cli 只能映射 Anthropic 兼容（anthropic-messages）的供应商`
+  }
+  if (cli === 'codex' && endpoint.api === 'openai-completions') {
+    // codex ≥0.146 removed chat-completions support entirely (wire_api="chat").
+    return `dsh 供应商 "${endpoint.provider}" 是 chat-completions（openai-completions）协议，codex 0.146+ 已移除该支持；请在配置页选择 openai-responses 协议的供应商`
+  }
+  return undefined
+}
+
 /** Validate one raw dispatch body; a string return is the error message. */
 export function parseDispatchParams(raw: unknown): DispatchParams | string {
   const record = typeof raw === 'object' && raw !== null ? raw as Record<string, unknown> : {}
   const task = record['task']
   if (typeof task !== 'string' || task.trim() === '') return '"task" 不能为空：CLI 子代理需要完整任务描述'
   if (task.length > 100_000) return '"task" 超过 100k 字符上限'
+  const taskDifficulty = record['task_difficulty']
+  const difficultyReason = record['difficulty_reason']
+  const assessmentError = taskDifficultyError(taskDifficulty, difficultyReason)
+  if (assessmentError !== undefined) return assessmentError
   const cli = typeof record['cli'] === 'string' && record['cli'].trim() !== '' ? record['cli'].trim() : 'auto'
   const cwd = typeof record['cwd'] === 'string' && record['cwd'].trim() !== '' ? record['cwd'].trim() : undefined
   if (cwd !== undefined && (!isAbsolute(cwd) || !existsSync(cwd))) return `"cwd" 必须是已存在的绝对路径：${cwd}`
@@ -112,7 +156,15 @@ export function parseDispatchParams(raw: unknown): DispatchParams | string {
   if (typeof record['timeout_minutes'] === 'number' && Number.isFinite(record['timeout_minutes'])) {
     timeoutMinutes = Math.min(240, Math.max(1, Math.round(record['timeout_minutes'])))
   }
-  return { cli, task, cwd, ...(model === undefined ? {} : { model }), ...(timeoutMinutes === undefined ? {} : { timeoutMinutes }) }
+  return {
+    cli, task, cwd,
+    ...(taskDifficulty === undefined ? {} : {
+      taskDifficulty: taskDifficulty as TaskDifficulty,
+      difficultyReason: (difficultyReason as string).trim(),
+    }),
+    ...(model === undefined ? {} : { model }),
+    ...(timeoutMinutes === undefined ? {} : { timeoutMinutes }),
+  }
 }
 
 /**
@@ -127,17 +179,26 @@ export async function runDispatch(deps: DispatchDeps, params: DispatchParams, si
   if (!config.enabled) throw new DispatchError('CLI 子代理插件已停用（配置页可重新开启）')
 
   let decision
+  let taskDifficulty: TaskDifficulty
   try {
     decision = pickCli(config, params.cli, params.task)
+    taskDifficulty = assertTaskDifficulty(config, decision.cli, params.taskDifficulty, params.difficultyReason)
   } catch (error) {
     throw error instanceof RoutingError ? new DispatchError(error.message) : error
   }
 
-  const notes: string[] = []
+  const notes: string[] = [
+    `难度评估：${taskDifficulty}；${decision.cli} 最低难度：${config[decision.cli].minTaskDifficulty}；依据：${params.difficultyReason === undefined ? '旧调用未提供评估，保守按 low 处理' : cleanLogText(params.difficultyReason.trim())}`,
+  ]
   if (decision.note !== undefined) notes.push(decision.note)
-  const model = params.model ?? (decision.cli === 'claude' ? config.claude.model : config.codex.model)
+  const model = params.model ?? ''
   const timeoutMinutes = params.timeoutMinutes ?? (decision.cli === 'claude' ? config.claude.timeoutMinutes : config.codex.timeoutMinutes)
-  const cwd = params.cwd
+  // A missing cwd used to travel as `undefined`, silently inheriting whatever
+  // directory the host process happened to be in. Resolve it once, say which
+  // directory the run really used, and hand that same path to the child.
+  const requestedCwd = params.cwd
+  const cwd = requestedCwd ?? process.cwd()
+  if (requestedCwd === undefined) notes.push(`未指定 cwd，沿用宿主进程目录：${cwd}`)
 
   const id = `task-${randomUUID().slice(0, 8)}`
   const abort = new AbortController()
@@ -154,6 +215,7 @@ export async function runDispatch(deps: DispatchDeps, params: DispatchParams, si
     title: params.task.replace(/\s+/g, ' ').slice(0, 80),
     cwd,
     model,
+    ...(params.sessionId === undefined ? {} : { sessionId: params.sessionId }),
   })
   hooks?.onTaskId?.(id)
 
@@ -175,39 +237,68 @@ export async function runDispatch(deps: DispatchDeps, params: DispatchParams, si
     }
 
     try {
-      deps.registry.setPhase(task, 'running', `开始执行（${decision.cli}${model === '' ? '' : `, model=${model}`}${cwd === undefined ? '' : `, cwd=${cwd}`}，超时 ${timeoutMinutes} 分钟）`)
+      deps.registry.setPhase(task, 'running', `开始执行（${decision.cli}${model === '' ? '' : `, model=${model}`}, cwd=${cwd}，超时 ${timeoutMinutes} 分钟）`)
       const startedAt = Date.now()
       const onEvent = (kind: 'text' | 'note' | 'error', text: string): void => {
         deps.registry.push(task, kind, text)
       }
 
-      // dsh-catalog model mapping: a `<provider>::<model>` selection wins over
-      // the CLI's own configured model; a tool-arg model override wins over
-      // both. claude only maps over anthropic-protocol providers. Resolution
-      // failures land on the task record — never a stuck 'running'.
+      // Model resolution order, narrowest first:
+      //   1. an explicit tool-arg model (already validated),
+      //   2. the calling agent's own route — but only when the CLI speaks its
+      //      protocol (see `protocolProblem`),
+      //   3. the configuration card's `<provider>::<model>` selection,
+      //   4. the CLI's own default model.
+      // The protocol check comes first for (2) on purpose: the main agent may
+      // run on a provider the CLI cannot speak, and that is expected — the
+      // dispatch drops straight to the configured model instead of failing.
+      // A mismatch on (3) is an explicit operator choice and stays a hard error.
       let dshEndpoint: DshModelEndpoint | undefined
-      const dshSelection = decision.cli === 'claude' ? config.claude.dshModel : config.codex.dshModel
-      if (params.model === undefined && dshSelection !== '' && deps.resolveDshModel !== undefined) {
-        try {
-          dshEndpoint = await deps.resolveDshModel(dshSelection)
-        } catch (error) {
-          const message = error instanceof Error ? error.message : String(error)
-          deps.registry.setPhase(task, 'failed', message)
-          throw error
-        }
-        if (decision.cli === 'claude' && dshEndpoint.api !== 'anthropic-messages') {
-          const message = `dsh 供应商 "${dshEndpoint.provider}" 使用 ${dshEndpoint.api} 协议，claude cli 只能映射 Anthropic 兼容（anthropic-messages）的供应商`
-          deps.registry.setPhase(task, 'failed', message)
-          throw new DispatchError(message)
-        }
-        if (decision.cli === 'codex' && dshEndpoint.api === 'openai-completions') {
-          // codex ≥0.146 removed chat-completions support entirely (wire_api="chat").
-          const message = `dsh 供应商 "${dshEndpoint.provider}" 是 chat-completions（openai-completions）协议，codex 0.146+ 已移除该支持；请在配置页选择 openai-responses 协议的供应商`
-          deps.registry.setPhase(task, 'failed', message)
-          throw new DispatchError(message)
+      // One note reaches both readers: the board's event trail and the tool
+      // result the model sees.
+      const note = (text: string): void => {
+        notes.push(text)
+        deps.registry.push(task, 'note', text)
+      }
+      if (params.model === undefined) {
+        const configuredSelection = decision.cli === 'claude' ? config.claude.dshModel : config.codex.dshModel
+        // Where a rejected primary route falls back to, named in the note so the
+        // model never has to guess.
+        const fallbackLabel = configuredSelection === '' ? 'CLI 默认模型' : '配置页模型'
+        const attempts: Array<{ selection: string; label: string; fatal: boolean }> = []
+        const primarySelection = selectionOf(params.primaryModel)
+        if (primarySelection !== undefined) attempts.push({ selection: primarySelection, label: '主代理模型', fatal: false })
+        if (configuredSelection !== '') attempts.push({ selection: configuredSelection, label: '配置页模型', fatal: true })
+        for (const attempt of attempts) {
+          if (deps.resolveDshModel === undefined) break
+          let endpoint: DshModelEndpoint
+          try {
+            endpoint = await deps.resolveDshModel(attempt.selection)
+          } catch (error) {
+            const message = error instanceof Error ? error.message : String(error)
+            if (attempt.fatal) {
+              deps.registry.setPhase(task, 'failed', message)
+              throw error
+            }
+            note(`主代理模型 ${attempt.selection} 不可用（${message}），直接使用${fallbackLabel}`)
+            continue
+          }
+          const problem = protocolProblem(decision.cli, endpoint)
+          if (problem === undefined) {
+            dshEndpoint = endpoint
+            if (attempt.label === '主代理模型') note(`CLI 模型沿用主代理：${attempt.selection}`)
+            break
+          }
+          if (attempt.fatal) {
+            deps.registry.setPhase(task, 'failed', problem)
+            throw new DispatchError(problem)
+          }
+          note(`主代理模型 ${attempt.selection} 的协议不受 ${decision.cli} 支持（${problem}），直接使用${fallbackLabel}`)
         }
       }
       const effectiveModel = params.model ?? (dshEndpoint !== undefined ? dshEndpoint.model : model)
+      // The board shows the model the child really received, not the pre-route blank.
+      deps.registry.setModel(task, effectiveModel)
 
       // MCP bridge: the same servers dsh itself runs, handed to the CLI run.
       const mcpServers = config.bridgeMcp === true ? deps.listMcpServers?.() ?? [] : []
@@ -263,8 +354,9 @@ export async function runDispatch(deps: DispatchDeps, params: DispatchParams, si
 
         const durationMs = Date.now() - startedAt
         if (raced.ok) {
+          const finalText = cleanLogText(raced.finalText)
           task.exitCode = raced.exitCode ?? 0
-          task.finalText = raced.finalText
+          task.finalText = finalText
           task.stats = raced.stats
           deps.registry.setPhase(task, 'done', '执行完成')
           const sessionRef = 'sessionId' in raced ? raced.sessionId : raced.threadId
@@ -274,11 +366,11 @@ export async function runDispatch(deps: DispatchDeps, params: DispatchParams, si
             ok: true,
             cli: decision.cli,
             model: effectiveModel,
-            cwd: cwd ?? '',
+            cwd,
             durationMs,
             exitCode: raced.exitCode ?? 0,
             sessionRef,
-            finalText: raced.finalText,
+            finalText,
             notes,
           }
         }
@@ -298,5 +390,8 @@ export async function runDispatch(deps: DispatchDeps, params: DispatchParams, si
   } finally {
     deps.controllers.delete(id)
     signal.removeEventListener('abort', onOuterAbort)
+    // Report the settled run (success or failure) to dsh. The projection this
+    // event folds into is how other plugins read CLI spend.
+    reportCliUsage(params.usageSession, task)
   }
 }

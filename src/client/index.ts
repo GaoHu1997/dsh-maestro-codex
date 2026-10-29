@@ -11,6 +11,7 @@
 import type { ClientContext } from './types.js'
 import { MaestroCard } from './MaestroCard.js'
 import { MaestroForm, type SectionValue } from './form.js'
+import { registerBoardTab } from './board/register.js'
 
 /** The host entry id — the cordis.patch.yml row id, and the settings namespace
  * the configForms service projects this plugin's volatile config under. */
@@ -22,15 +23,17 @@ export const PLUGIN_PACKAGE = 'dsh-maestro-codex'
 /** Stable plugin id, matching the cordis.patch.yml row and the bundle id. */
 export const name = PLUGIN_PACKAGE
 
-/** Required services: the slot ledger, the config forms backing the card, and
- * the workspace registry (the dispatch form's cwd auto-fill). */
-export const inject = ['slots', 'configForms', 'workspaces']
+/** Required services: the slot ledger and the config forms backing the card. */
+export const inject = ['slots', 'configForms']
 
 /**
  * Apply the browser half.
  * @param ctx - client root context.
  */
 export function apply(ctx: ClientContext): void {
+  // 右侧栏「任务看板」：与配置卡片独立，配置页没就绪也要有它。
+  registerBoardTab(ctx)
+
   const settingsForm = ctx.configForms.get<SectionValue>(PLUGIN_ENTRY_ID)
   const form = new MaestroForm(settingsForm)
   const store = form.bind()
@@ -43,17 +46,12 @@ export function apply(ctx: ClientContext): void {
     const served = snapshot.status === 'ready'
       && (snapshot.view?.namespaces?.some(entry => entry.ns === PLUGIN_ENTRY_ID) ?? false)
     if (served && configDisposer === undefined) {
-      const workspacePaths = (): string[] => {
-        const items = ctx.workspaces?.list.getSnapshot().items ?? []
-        return items.map(item => item.path ?? '').filter(path => path !== '')
-      }
       const register = (): unknown => ctx.slots.register({
         name: 'plugins.bundle.config',
         key: PLUGIN_PACKAGE,
         inject: () => ({
           maestroStore: store,
           maestro: form.actions(),
-          workspaces: workspacePaths(),
         }),
       }, MaestroCard)
       configDisposer = ctx.slots.inject('plugins.bundle.config', register)
@@ -65,11 +63,10 @@ export function apply(ctx: ClientContext): void {
           name: 'settings.section',
           id: 'maestro-codex',
           order: 90,
-          label: 'CLI 配置',
+          label: 'CLI 子代理',
           inject: () => ({
             maestroStore: store,
             maestro: form.actions(),
-            workspaces: workspacePaths(),
           }),
         }, MaestroCard))
       } catch {

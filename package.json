@@ -1,6 +1,6 @@
 {
   "name": "dsh-maestro-codex",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "dsh 的 CLI 子代理编排：把任务按类型派发给 codex cli 或 claude cli（headless），取回执行结果回填主会话；配置页管理路由表、每个 CLI 的权限与模型，以及 CLI 本身的安装/更新/卸载。",
   "keywords": [
     "dsh",

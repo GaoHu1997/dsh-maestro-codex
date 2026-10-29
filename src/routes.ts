@@ -6,13 +6,13 @@
 
 import { randomUUID } from 'node:crypto'
 import { redactEffective, type EffectiveConfig } from './config.js'
-import { parseDispatchParams, runDispatch, type DispatchDeps } from './dispatch.js'
-import { detectCli, runNpmJob } from './cli-manager.js'
-import { isTerminalPhase } from './task-registry.js'
+import type { DispatchDeps } from './dispatch.js'
+import { detectCli, queryPackageVersions, runNpmJob } from './cli-manager.js'
+import { isTerminalPhase, type MaestroTask } from './task-registry.js'
 import { routingHint } from './routing.js'
 import type { DshModelCatalog } from './dsh-models.js'
 import type { DshMcpServer } from './mcp.js'
-import { CLI_PACKAGES, CLI_LABELS, MAESTRO_CLI_IDS, type MaestroCliId, type MaestroCliStatus, type MaestroOverview, type MaestroRouteError, type MaestroTaskDetail, type MaestroTaskRef, type MaestroTaskSummary } from './wire.js'
+import { CLI_PACKAGES, CLI_LABELS, MAESTRO_CLI_IDS, type MaestroCliId, type MaestroCliStatus, type MaestroCliVersions, type MaestroOverview, type MaestroRouteError, type MaestroTaskDetail, type MaestroTaskRef, type MaestroTaskSummary } from './wire.js'
 
 /** One uniform handler outcome. */
 export interface RouteOutcome {
@@ -58,8 +58,19 @@ export class StatusStore {
 
   constructor(private readonly readConfig: () => EffectiveConfig) {}
 
+  /** A copy — callers never mutate the store's internal snapshot. */
   get(): Record<MaestroCliId, MaestroCliStatus> {
-    return this.snapshot
+    return { ...this.snapshot }
+  }
+
+  /** Replace one CLI's status (the single-CLI refresh path). */
+  set(cli: MaestroCliId, status: MaestroCliStatus): void {
+    this.snapshot = { ...this.snapshot, [cli]: { ...status } }
+  }
+
+  /** Replace the whole snapshot (a full detection pass). */
+  setAll(next: Record<MaestroCliId, MaestroCliStatus>): void {
+    this.snapshot = { ...next }
   }
 
   /** Detect every CLI once, replacing the snapshot wholesale. */
@@ -95,23 +106,54 @@ export function handleOverview(deps: RouteDeps): RouteOutcome {
     clis: deps.statusStore.get(),
     enabled: config.enabled,
     defaultCli: config.defaultCli,
+    minTaskDifficulties: { claude: config.claude.minTaskDifficulty, codex: config.codex.minTaskDifficulty },
     tasks,
   }
   return ok(overview)
 }
 
-/** GET tasks — the full summary list. */
-export function handleTasks(deps: RouteDeps): RouteOutcome {
-  return ok({ tasks: deps.registry.list() })
+/** GET tasks — summaries, scoped to the caller's session tree when asked. */
+export function handleTasks(deps: RouteDeps, query?: URLSearchParams): RouteOutcome {
+  const sessions = parseSessionFilter(query?.get('sessions') ?? null)
+  return ok({ tasks: deps.registry.list(sessions) })
 }
 
-/** GET task?id=&cursor= — one task's detail plus events after the cursor. */
+/**
+ * The session ids a board may show. `sessions=<id,id,…>` on the query string
+ * (`null`/blank = no scoping, the operator's own view).
+ */
+export function parseSessionFilter(raw: string | null): ReadonlySet<string> | undefined {
+  if (raw === null) return undefined
+  const ids = raw.split(',').map(id => id.trim()).filter(id => id !== '')
+  return ids.length === 0 ? undefined : new Set(ids)
+}
+
+/** The body form of the same filter (`{sessions: [id,…]}`). */
+function parseSessionList(raw: unknown): ReadonlySet<string> | undefined {
+  if (!Array.isArray(raw)) return undefined
+  const ids = raw.filter((id): id is string => typeof id === 'string' && id.trim() !== '').map(id => id.trim())
+  return ids.length === 0 ? undefined : new Set(ids)
+}
+
+/**
+ * Whether one task belongs to the caller's session scope. Owner-less tasks
+ * (npm installs started from the config card) stay visible everywhere.
+ */
+function taskVisible(task: MaestroTask, sessions: ReadonlySet<string> | undefined): boolean {
+  if (sessions === undefined || task.sessionId === undefined) return true
+  return sessions.has(task.sessionId)
+}
+
+/** GET task?id=&cursor=&sessions= — one task's detail plus events after the cursor. */
 export function handleTaskDetail(deps: RouteDeps, query: URLSearchParams): RouteOutcome {
   const id = query.get('id') ?? ''
   if (id === '') return fail(400, '"id" 不能为空')
+  const sessions = parseSessionFilter(query.get('sessions'))
   const cursor = Number(query.get('cursor') ?? '0')
   const page = deps.registry.eventsSince(id, cursor)
-  if (page === undefined) return fail(404, `任务不存在：${id}`)
+  // A task from another conversation reads as absent — the board must not leak
+  // that another session's task exists.
+  if (page === undefined || !taskVisible(page.task, sessions)) return fail(404, `任务不存在：${id}`)
   const task = page.task
   const summary: MaestroTaskSummary = deps.registry.summaryOf(task)
   const detail: MaestroTaskDetail = {
@@ -132,28 +174,12 @@ export function handleTaskCancel(deps: RouteDeps, body: unknown): RouteOutcome {
   const id = typeof record['id'] === 'string' ? record['id'] : ''
   if (id === '') return fail(400, '"id" 不能为空')
   const task = deps.registry.get(id)
-  if (task === undefined) return fail(404, `任务不存在：${id}`)
+  if (task === undefined || !taskVisible(task, parseSessionList(record['sessions']))) return fail(404, `任务不存在：${id}`)
   if (isTerminalPhase(task.phase)) return fail(409, `任务已结束（${task.phase}），无需取消`)
   const controller = deps.controllers.get(id)
   if (controller === undefined) return fail(409, '任务尚未挂起执行进程，请稍后重试')
   controller.abort(new Error('用户在配置页取消了任务'))
   return ok({ id, phase: task.phase } satisfies MaestroTaskRef)
-}
-
-/** POST dispatch {cli,task,cwd?,model?,timeout_minutes?} — manual dispatch from the card.
- * Runs as a background task; the answer is the task ref and the card polls. */
-export async function handleDispatch(deps: RouteDeps, body: unknown): Promise<RouteOutcome> {
-  const params = parseDispatchParams(body)
-  if (typeof params === 'string') return fail(400, params)
-  const controller = new AbortController()
-  let failure: string | undefined
-  const ref = await new Promise<MaestroTaskRef | undefined>((resolvePromise) => {
-    void runDispatch(deps, params, controller.signal, { onTaskId: id => resolvePromise({ id, phase: 'queued' }) })
-      .catch((error: unknown) => { failure = error instanceof Error ? error.message : String(error) })
-      .finally(() => { setTimeout(() => resolvePromise(undefined), 0) })
-  })
-  if (ref === undefined) return fail(400, failure ?? '任务未能创建')
-  return ok(ref)
 }
 
 /** POST cli/refresh {cli?} — re-detect (one CLI or both) right now. */
@@ -165,30 +191,58 @@ export async function handleCliRefresh(deps: RouteDeps, body: unknown): Promise<
     const config = deps.readConfig()
     const override = cli === 'claude' ? config.claude.cliPath : config.codex.cliPath
     const detection = await detectCli({ cli: cli as MaestroCliId, override })
-    const next = { ...deps.statusStore.get(), [cli]: {
+    deps.statusStore.set(cli as MaestroCliId, {
       installed: detection.installed,
       version: detection.version,
       path: detection.path,
       ...(detection.error === undefined ? {} : { error: detection.error }),
-    } }
-    // One-CLI refresh writes through the store's snapshot shape.
-    Object.assign(deps.statusStore.get(), next)
+    })
     return ok({ clis: deps.statusStore.get() })
   }
   await deps.statusStore.refresh()
   return ok({ clis: deps.statusStore.get() })
 }
 
+/** A published npm version string (`1.2.3`, `0.166.0-alpha.6`). */
+const VERSION_PATTERN = /^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$/
+
+/** GET cli/versions?cli= — versions published on the npm registry. */
+export async function handleCliVersions(deps: RouteDeps, query: URLSearchParams): Promise<RouteOutcome> {
+  const cli = query.get('cli') ?? ''
+  if (!(MAESTRO_CLI_IDS as readonly string[]).includes(cli)) {
+    return fail(400, `"cli" 必须是 ${MAESTRO_CLI_IDS.join(' | ')}`)
+  }
+  const result = await queryPackageVersions({
+    ...(deps.spawnFn === undefined ? {} : { spawnFn: deps.spawnFn }),
+    cli: cli as MaestroCliId,
+    registry: deps.readConfig().npmRegistry,
+  })
+  if (!result.ok) return fail(502, result.error)
+  return ok({
+    cli: cli as MaestroCliId,
+    latest: result.value.latest,
+    versions: result.value.versions,
+    platform: `${process.platform}-${process.arch}`,
+  } satisfies MaestroCliVersions)
+}
+
 /**
- * POST cli/install|update|uninstall {cli} — start one npm job as a registry
- * task and answer immediately; the card watches it through the task poll.
- * `install` also serves as update (npm -g installs latest).
+ * POST cli/install|update|uninstall {cli,version?} — start one npm job as a
+ * registry task and answer immediately; the card watches it through the task
+ * poll. `install` with a `version` pins `pkg@version`; without one it installs
+ * the registry's latest.
  */
 export function handleCliNpmJob(deps: RouteDeps, action: 'install' | 'uninstall', body: unknown): RouteOutcome {
   const record = typeof body === 'object' && body !== null ? body as Record<string, unknown> : {}
   const cli = record['cli']
   if (typeof cli !== 'string' || !(MAESTRO_CLI_IDS as readonly string[]).includes(cli)) {
     return fail(400, `"cli" 必须是 ${MAESTRO_CLI_IDS.join(' | ')}`)
+  }
+  const rawVersion = record['version']
+  let version: string | undefined
+  if (action === 'install' && typeof rawVersion === 'string' && rawVersion.trim() !== '') {
+    if (!VERSION_PATTERN.test(rawVersion.trim())) return fail(400, `"version" 不是合法版本号：${rawVersion}`)
+    version = rawVersion.trim()
   }
   const config = deps.readConfig()
   const registry = deps.registry
@@ -198,16 +252,18 @@ export function handleCliNpmJob(deps: RouteDeps, action: 'install' | 'uninstall'
   const task = registry.create({
     id,
     cli: cli as MaestroCliId,
-    title: `${action === 'install' ? '安装/更新' : '卸载'} ${CLI_LABELS[cli as MaestroCliId]}（npm -g ${CLI_PACKAGES[cli as MaestroCliId]}）`,
+    title: `${action === 'install' ? (version === undefined ? '安装/更新' : `安装 ${version}`) : '卸载'} ${CLI_LABELS[cli as MaestroCliId]}（npm -g ${CLI_PACKAGES[cli as MaestroCliId]}）`,
     model: '',
   })
   void (async () => {
     try {
-      registry.setPhase(task, 'running', `npm ${action} 开始${config.npmRegistry === '' ? '' : `（registry ${config.npmRegistry}）`}`)
+      registry.setPhase(task, 'running', `npm ${action} 开始${version === undefined ? '' : `（目标版本 ${version}）`}${config.npmRegistry === '' ? '' : `（registry ${config.npmRegistry}）`}`)
       const result = await runNpmJob({
+        ...(deps.spawnFn === undefined ? {} : { spawnFn: deps.spawnFn }),
         action,
         cli: cli as MaestroCliId,
         registry: config.npmRegistry,
+        ...(version === undefined ? {} : { version }),
         signal: controller.signal,
         onLine: line => registry.push(task, 'note', line),
       })

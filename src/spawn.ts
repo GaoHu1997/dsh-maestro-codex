@@ -33,6 +33,14 @@ export interface ChildOutcome {
 
 const STDERR_TAIL_LIMIT = 4000
 
+/**
+ * Hard cap on one unterminated stdout line. A JSONL record cut at a byte
+ * budget is worse than a dropped record: the fragments reach the channel as
+ * garbage notes and the run silently loses its result. Only a pathological
+ * single line (4M chars) is discarded, with a marker in the stderr tail.
+ */
+const MAX_LINE_CHARS = 4_000_000
+
 export const systemSpawn: SpawnFn = (file, args, options) => spawn(file, args as string[], {
   cwd: options.cwd,
   env: options.env === undefined ? undefined : { ...process.env, ...options.env },
@@ -193,14 +201,22 @@ export function runProcess(options: {
         index = buffer.indexOf('\n')
       }
       // A final line without a newline still matters (progress bars, final result).
-      if (buffer.trim() !== '' && buffer.length > 8192) {
-        onLine(buffer.replace(/\r$/, ''))
+      // Wait for the newline however long the line gets — cutting it here would
+      // corrupt a JSONL record. Only a pathological line is dropped.
+      if (buffer.length > MAX_LINE_CHARS) {
+        stderrTail = appendTail(stderrTail, `\n[maestro] dropped an oversized line (${buffer.length} chars, no newline)`)
         buffer = ''
       }
     })
     stream.on('end', () => {
       const rest = buffer.replace(/\r$/, '')
-      if (rest.trim() !== '' && onLine !== undefined) onLine(rest)
+      if (rest.trim() !== '' && onLine !== undefined) {
+        if (rest.length > MAX_LINE_CHARS) {
+          stderrTail = appendTail(stderrTail, `\n[maestro] dropped an oversized final line (${rest.length} chars)`)
+        } else {
+          onLine(rest)
+        }
+      }
     })
   }
   wire(child.stdout, options.onStdoutLine, false)

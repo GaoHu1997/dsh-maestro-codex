@@ -5,9 +5,9 @@
  */
 
 import {
-  ROUTE_CLI_INSTALL, ROUTE_CLI_REFRESH, ROUTE_CLI_UNINSTALL, ROUTE_DISPATCH, ROUTE_HINT, ROUTE_MODELS, ROUTE_OVERVIEW,
+  ROUTE_CLI_INSTALL, ROUTE_CLI_REFRESH, ROUTE_CLI_UNINSTALL, ROUTE_CLI_VERSIONS, ROUTE_HINT, ROUTE_MODELS, ROUTE_OVERVIEW,
   ROUTE_TASK_CANCEL, ROUTE_TASK_DETAIL, ROUTE_TASKS,
-  type DshProviderModels, type MaestroCliId, type MaestroMcpServerRef, type MaestroOverview, type MaestroTaskDetail, type MaestroTaskRef, type MaestroTaskSummary,
+  type DshProviderModels, type MaestroCliId, type MaestroCliVersions, type MaestroMcpServerRef, type MaestroOverview, type MaestroTaskDetail, type MaestroTaskRef, type MaestroTaskSummary,
 } from '../wire.js'
 
 /** One route call outcome: the parsed body, or the error envelope. */
@@ -39,28 +39,36 @@ export async function fetchOverview(): Promise<Call<MaestroOverview>> {
   return send<MaestroOverview>('GET', ROUTE_OVERVIEW)
 }
 
-export async function fetchTasks(): Promise<Call<{ tasks: MaestroTaskSummary[] }>> {
-  return send<{ tasks: MaestroTaskSummary[] }>('GET', ROUTE_TASKS)
+export async function fetchTasks(sessionIds?: readonly string[]): Promise<Call<{ tasks: MaestroTaskSummary[] }>> {
+  const scope = sessionQuery(sessionIds)
+  return send<{ tasks: MaestroTaskSummary[] }>('GET', scope === '' ? ROUTE_TASKS : `${ROUTE_TASKS}?sessions=${scope}`)
 }
 
-export async function fetchTaskDetail(id: string, after: number): Promise<Call<MaestroTaskDetail>> {
-  return send<MaestroTaskDetail>('GET', `${ROUTE_TASK_DETAIL}?id=${encodeURIComponent(id)}&cursor=${String(after)}`)
+export async function fetchTaskDetail(id: string, after: number, sessionIds?: readonly string[]): Promise<Call<MaestroTaskDetail>> {
+  const scope = sessionQuery(sessionIds)
+  return send<MaestroTaskDetail>('GET', `${ROUTE_TASK_DETAIL}?id=${encodeURIComponent(id)}&cursor=${String(after)}${scope === '' ? '' : `&sessions=${scope}`}`)
 }
 
-export async function cancelTask(id: string): Promise<Call<MaestroTaskRef>> {
-  return send<MaestroTaskRef>('POST', ROUTE_TASK_CANCEL, { id })
+export async function cancelTask(id: string, sessionIds?: readonly string[]): Promise<Call<MaestroTaskRef>> {
+  return send<MaestroTaskRef>('POST', ROUTE_TASK_CANCEL, sessionIds === undefined || sessionIds.length === 0 ? { id } : { id, sessions: [...sessionIds] })
 }
 
-export async function dispatchManual(input: { cli: string; task: string; cwd?: string; model?: string; timeout_minutes?: number }): Promise<Call<MaestroTaskRef>> {
-  return send<MaestroTaskRef>('POST', ROUTE_DISPATCH, input)
+/** The board's session-tree scope, encoded for a query string ('' = unscoped). */
+function sessionQuery(sessionIds: readonly string[] | undefined): string {
+  return sessionIds === undefined || sessionIds.length === 0 ? '' : encodeURIComponent(sessionIds.join(','))
 }
 
 export async function refreshCli(cli?: MaestroCliId): Promise<Call<{ clis: MaestroOverview['clis'] }>> {
   return send<{ clis: MaestroOverview['clis'] }>('POST', ROUTE_CLI_REFRESH, cli === undefined ? {} : { cli })
 }
 
-export async function installCli(cli: MaestroCliId): Promise<Call<MaestroTaskRef>> {
-  return send<MaestroTaskRef>('POST', ROUTE_CLI_INSTALL, { cli })
+/** Versions published for one CLI's npm package (SDK card picker). */
+export async function fetchCliVersions(cli: MaestroCliId): Promise<Call<MaestroCliVersions>> {
+  return send<MaestroCliVersions>('GET', `${ROUTE_CLI_VERSIONS}?cli=${encodeURIComponent(cli)}`)
+}
+
+export async function installCli(cli: MaestroCliId, version?: string): Promise<Call<MaestroTaskRef>> {
+  return send<MaestroTaskRef>('POST', ROUTE_CLI_INSTALL, version === undefined ? { cli } : { cli, version })
 }
 
 export async function uninstallCli(cli: MaestroCliId): Promise<Call<MaestroTaskRef>> {

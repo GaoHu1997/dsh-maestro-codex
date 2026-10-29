@@ -30,21 +30,36 @@ export type CodexSandboxMode = (typeof CODEX_SANDBOX_MODES)[number]
 
 export const CLI_CHOICES = ['claude', 'codex'] as const
 
+/** Ordered from least to most difficult; keywords never determine this rank. */
+export const TASK_DIFFICULTIES = ['low', 'medium', 'high', 'extreme'] as const
+export type TaskDifficulty = (typeof TASK_DIFFICULTIES)[number]
+export const TASK_DIFFICULTY_LABELS: Record<TaskDifficulty, string> = {
+  low: '低',
+  medium: '中',
+  high: '高',
+  extreme: '极高',
+}
+
+export function isTaskDifficulty(value: unknown): value is TaskDifficulty {
+  return typeof value === 'string' && (TASK_DIFFICULTIES as readonly string[]).includes(value)
+}
+
 /** Defaults spelled once; `effectiveOf` layers the live config over them. */
 export const CONFIG_DEFAULTS = {
   enabled: true,
   defaultCli: 'claude',
+  minTaskDifficulty: 'medium',
+  claudeMinTaskDifficulty: 'medium',
+  codexMinTaskDifficulty: 'medium',
   claudeEnabled: true,
-  claudeTaskTypes: ['重构', '测试', '文档', '分析', '代码审查'],
-  claudeModel: '',
+  claudeTaskTypes: ['需求分析', '代码审查', '文档写作', '重构'],
   claudePermissionMode: 'inherit',
   claudeBaseUrl: '',
   claudeAuthToken: '',
   claudeCliPath: '',
   claudeTimeoutMinutes: 20,
   codexEnabled: true,
-  codexTaskTypes: ['脚本', '快速修复', '批处理', '原型'],
-  codexModel: '',
+  codexTaskTypes: ['代码生成', '数据处理', '项目测试', '调试修复'],
   codexSandbox: 'workspace-write',
   codexBaseUrl: '',
   codexApiKey: '',
@@ -63,9 +78,12 @@ export const CONFIG_DEFAULTS = {
 export interface Config {
   enabled?: Volatile<boolean> | boolean
   defaultCli?: Volatile<string> | string
+  /** Legacy shared threshold, inherited only when a CLI has no own setting. */
+  minTaskDifficulty?: Volatile<string> | string
+  claudeMinTaskDifficulty?: Volatile<TaskDifficulty> | TaskDifficulty
+  codexMinTaskDifficulty?: Volatile<TaskDifficulty> | TaskDifficulty
   claudeEnabled?: Volatile<boolean> | boolean
   claudeTaskTypes?: Volatile<string[]> | string[]
-  claudeModel?: Volatile<string> | string
   claudePermissionMode?: Volatile<string> | string
   claudeBaseUrl?: Volatile<string> | string
   claudeAuthToken?: Volatile<string> | string
@@ -73,7 +91,6 @@ export interface Config {
   claudeTimeoutMinutes?: Volatile<number> | number
   codexEnabled?: Volatile<boolean> | boolean
   codexTaskTypes?: Volatile<string[]> | string[]
-  codexModel?: Volatile<string> | string
   codexSandbox?: Volatile<string> | string
   codexBaseUrl?: Volatile<string> | string
   codexApiKey?: Volatile<string> | string
@@ -95,9 +112,12 @@ export interface Config {
 export const Config: z = z.object({
   enabled: z.boolean().default(CONFIG_DEFAULTS.enabled).volatile(),
   defaultCli: z.string().default(CONFIG_DEFAULTS.defaultCli).volatile(),
+  minTaskDifficulty: z.union(TASK_DIFFICULTIES.map(value => z.const(value))).default(CONFIG_DEFAULTS.minTaskDifficulty).volatile(),
+  // No default here: a projected medium would hide a legacy high/extreme.
+  claudeMinTaskDifficulty: z.union(TASK_DIFFICULTIES.map(value => z.const(value))).volatile(),
+  codexMinTaskDifficulty: z.union(TASK_DIFFICULTIES.map(value => z.const(value))).volatile(),
   claudeEnabled: z.boolean().default(CONFIG_DEFAULTS.claudeEnabled).volatile(),
   claudeTaskTypes: z.array(z.string()).default([...CONFIG_DEFAULTS.claudeTaskTypes]).volatile(),
-  claudeModel: z.string().default(CONFIG_DEFAULTS.claudeModel).volatile(),
   claudePermissionMode: z.string().default(CONFIG_DEFAULTS.claudePermissionMode).volatile(),
   claudeBaseUrl: z.string().default(CONFIG_DEFAULTS.claudeBaseUrl).volatile(),
   claudeAuthToken: z.string().default(CONFIG_DEFAULTS.claudeAuthToken).volatile(),
@@ -105,7 +125,6 @@ export const Config: z = z.object({
   claudeTimeoutMinutes: z.number().default(CONFIG_DEFAULTS.claudeTimeoutMinutes).volatile(),
   codexEnabled: z.boolean().default(CONFIG_DEFAULTS.codexEnabled).volatile(),
   codexTaskTypes: z.array(z.string()).default([...CONFIG_DEFAULTS.codexTaskTypes]).volatile(),
-  codexModel: z.string().default(CONFIG_DEFAULTS.codexModel).volatile(),
   codexSandbox: z.string().default(CONFIG_DEFAULTS.codexSandbox).volatile(),
   codexBaseUrl: z.string().default(CONFIG_DEFAULTS.codexBaseUrl).volatile(),
   codexApiKey: z.string().default(CONFIG_DEFAULTS.codexApiKey).volatile(),
@@ -132,6 +151,12 @@ export function validateConfig(config: Config): void {
   const defaultCli = readVolatile(config.defaultCli)
   if (defaultCli !== undefined && !(CLI_CHOICES as readonly string[]).includes(defaultCli)) {
     throw new Error(`MaestroConfig: "defaultCli" must be one of ${CLI_CHOICES.join(' | ')}`)
+  }
+  for (const field of ['minTaskDifficulty', 'claudeMinTaskDifficulty', 'codexMinTaskDifficulty'] as const) {
+    const minimum = readVolatile(config[field])
+    if (minimum !== undefined && !isTaskDifficulty(minimum)) {
+      throw new Error(`MaestroConfig: "${field}" must be one of ${TASK_DIFFICULTIES.join(' | ')}`)
+    }
   }
   const permissionMode = readVolatile(config.claudePermissionMode)
   if (permissionMode !== undefined && !(CLAUDE_PERMISSION_MODES as readonly string[]).includes(permissionMode)) {
@@ -188,8 +213,8 @@ export interface EffectiveConfig {
   defaultCli: MaestroCliId
   claude: {
     enabled: boolean
+    minTaskDifficulty: TaskDifficulty
     taskTypes: string[]
-    model: string
     /** `<provider>::<model>` selection from the dsh catalog; '' = not used. */
     dshModel: string
     permissionMode: ClaudePermissionMode
@@ -200,8 +225,8 @@ export interface EffectiveConfig {
   }
   codex: {
     enabled: boolean
+    minTaskDifficulty: TaskDifficulty
     taskTypes: string[]
-    model: string
     dshModel: string
     sandbox: CodexSandboxMode
     baseUrl: string
@@ -222,6 +247,10 @@ export interface EffectiveConfig {
 /** Layer the (possibly volatile) config over the shipped defaults. */
 export function effectiveOf(config: Config): EffectiveConfig {
   const defaultCli = readVolatile(config.defaultCli) ?? CONFIG_DEFAULTS.defaultCli
+  const legacyMinimum = readVolatile(config.minTaskDifficulty)
+  const inheritedMinimum = isTaskDifficulty(legacyMinimum) ? legacyMinimum : CONFIG_DEFAULTS.minTaskDifficulty
+  const claudeMinimum = readVolatile(config.claudeMinTaskDifficulty) ?? inheritedMinimum
+  const codexMinimum = readVolatile(config.codexMinTaskDifficulty) ?? inheritedMinimum
   const permissionMode = readVolatile(config.claudePermissionMode) ?? CONFIG_DEFAULTS.claudePermissionMode
   const sandbox = readVolatile(config.codexSandbox) ?? CONFIG_DEFAULTS.codexSandbox
   return {
@@ -229,8 +258,8 @@ export function effectiveOf(config: Config): EffectiveConfig {
     defaultCli: (CLI_CHOICES as readonly string[]).includes(defaultCli) ? defaultCli as MaestroCliId : CONFIG_DEFAULTS.defaultCli,
     claude: {
       enabled: readVolatile(config.claudeEnabled) ?? CONFIG_DEFAULTS.claudeEnabled,
+      minTaskDifficulty: isTaskDifficulty(claudeMinimum) ? claudeMinimum : CONFIG_DEFAULTS.claudeMinTaskDifficulty,
       taskTypes: readVolatile(config.claudeTaskTypes) ?? [...CONFIG_DEFAULTS.claudeTaskTypes],
-      model: readVolatile(config.claudeModel) ?? '',
       dshModel: readVolatile(config.claudeDshModel) ?? '',
       permissionMode: (CLAUDE_PERMISSION_MODES as readonly string[]).includes(permissionMode)
         ? permissionMode as ClaudePermissionMode
@@ -242,8 +271,8 @@ export function effectiveOf(config: Config): EffectiveConfig {
     },
     codex: {
       enabled: readVolatile(config.codexEnabled) ?? CONFIG_DEFAULTS.codexEnabled,
+      minTaskDifficulty: isTaskDifficulty(codexMinimum) ? codexMinimum : CONFIG_DEFAULTS.codexMinTaskDifficulty,
       taskTypes: readVolatile(config.codexTaskTypes) ?? [...CONFIG_DEFAULTS.codexTaskTypes],
-      model: readVolatile(config.codexModel) ?? '',
       dshModel: readVolatile(config.codexDshModel) ?? '',
       sandbox: (CODEX_SANDBOX_MODES as readonly string[]).includes(sandbox)
         ? sandbox as CodexSandboxMode

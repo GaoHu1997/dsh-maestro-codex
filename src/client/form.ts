@@ -12,9 +12,12 @@ import type { ConfigFormFace } from './types.js'
 export interface SectionValue {
   enabled?: boolean
   defaultCli?: string
+  /** Legacy shared threshold, inherited until a CLI gets its own setting. */
+  minTaskDifficulty?: 'low' | 'medium' | 'high' | 'extreme'
+  claudeMinTaskDifficulty?: 'low' | 'medium' | 'high' | 'extreme'
+  codexMinTaskDifficulty?: 'low' | 'medium' | 'high' | 'extreme'
   claudeEnabled?: boolean
   claudeTaskTypes?: string[]
-  claudeModel?: string
   claudePermissionMode?: string
   claudeBaseUrl?: string
   claudeAuthToken?: string
@@ -22,7 +25,6 @@ export interface SectionValue {
   claudeTimeoutMinutes?: number
   codexEnabled?: boolean
   codexTaskTypes?: string[]
-  codexModel?: string
   codexSandbox?: string
   codexBaseUrl?: string
   codexApiKey?: string
@@ -36,22 +38,29 @@ export interface SectionValue {
   maxConcurrentTasks?: number
 }
 
+/** Mirror host compatibility inheritance without coupling the two CLI settings. */
+export function cliMinTaskDifficulty(values: SectionValue, cli: 'claude' | 'codex'): NonNullable<SectionValue['minTaskDifficulty']> {
+  return (cli === 'claude' ? values.claudeMinTaskDifficulty : values.codexMinTaskDifficulty)
+    ?? values.minTaskDifficulty ?? 'medium'
+}
+
 /** Fields persisted immediately on change. */
 export type ImmediateField =
   | 'enabled' | 'claudeEnabled' | 'codexEnabled'
-  | 'defaultCli' | 'claudePermissionMode' | 'codexSandbox'
+  | 'defaultCli' | 'claudeMinTaskDifficulty' | 'codexMinTaskDifficulty' | 'claudePermissionMode' | 'codexSandbox'
   | 'claudeDshModel' | 'codexDshModel'
+  | 'claudeTaskTypes' | 'codexTaskTypes'
   | 'bridgeMcp'
 
 /** Fields staged as text and committed on save. */
 export type StagedField =
-  | 'claudeTaskTypes' | 'codexTaskTypes' | 'codexConfigOverrides'
-  | 'claudeModel' | 'claudeBaseUrl' | 'claudeAuthToken' | 'claudeCliPath' | 'claudeTimeoutMinutes'
-  | 'codexModel' | 'codexBaseUrl' | 'codexApiKey' | 'codexCliPath' | 'codexTimeoutMinutes'
+  | 'codexConfigOverrides'
+  | 'claudeBaseUrl' | 'claudeAuthToken' | 'claudeCliPath' | 'claudeTimeoutMinutes'
+  | 'codexBaseUrl' | 'codexApiKey' | 'codexCliPath' | 'codexTimeoutMinutes'
   | 'npmRegistry' | 'maxConcurrentTasks'
 
 /** The multi-line list fields (one entry per line). */
-const LIST_FIELDS: readonly StagedField[] = ['claudeTaskTypes', 'codexTaskTypes', 'codexConfigOverrides']
+const LIST_FIELDS: readonly StagedField[] = ['codexConfigOverrides']
 
 /** Numeric fields: the staged text must parse into range before a save runs. */
 const NUMBER_FIELDS: Readonly<Record<string, { min: number; max: number }>> = {
@@ -78,7 +87,7 @@ export interface MaestroFormState {
 export interface MaestroFormActions {
   save: () => Promise<void>
   discard: () => void
-  setImmediate: (field: ImmediateField, value: string | boolean) => void
+  setImmediate: (field: ImmediateField, value: string | boolean | readonly string[]) => void
   editStaged: (field: StagedField, text: string) => void
 }
 
@@ -130,8 +139,9 @@ export class MaestroForm {
     }
   }
 
-  private async setImmediateField(field: ImmediateField, value: string | boolean): Promise<void> {
+  private async setImmediateField(field: ImmediateField, value: string | boolean | readonly string[]): Promise<void> {
     const current = this.scope.getSnapshot().value?.[field]
+    if (Array.isArray(value) && Array.isArray(current) && value.length === current.length && value.every((entry, index) => entry === current[index])) return
     if (value === current) return
     try {
       await this.scope.set(field, value as never)

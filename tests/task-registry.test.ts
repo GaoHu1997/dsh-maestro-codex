@@ -57,6 +57,20 @@ describe('TaskRegistry', () => {
     expect(registry.get('task-0')).toBeUndefined()
     expect(registry.get('task-69')).toBeDefined()
   })
+
+  it('scopes list() by owner session and keeps owner-less tasks', () => {
+    const registry = new TaskRegistry()
+    registry.create({ id: 'own', cli: 'claude', title: 'own', model: '', sessionId: 's1' })
+    registry.create({ id: 'other', cli: 'claude', title: 'other', model: '', sessionId: 's2' })
+    registry.create({ id: 'npm', cli: 'claude', title: 'npm', model: '' })
+    const ids = (sessions?: ReadonlySet<string>): string[] => registry.list(sessions).map(summary => summary.id).sort()
+    expect(ids()).toEqual(['npm', 'other', 'own'])
+    expect(ids(new Set(['s1']))).toEqual(['npm', 'own'])
+    expect(ids(new Set(['s2']))).toEqual(['npm', 'other'])
+    // 不依赖渲染顺序：summary 里带上 owner，前端才能区分来源。
+    expect(registry.list().find(summary => summary.id === 'own')?.sessionId).toBe('s1')
+    expect(registry.list().find(summary => summary.id === 'npm')?.sessionId).toBeUndefined()
+  })
 })
 
 describe('Limiter', () => {

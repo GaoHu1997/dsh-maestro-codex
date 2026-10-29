@@ -6,7 +6,7 @@
  */
 
 import type { MaestroCliId, MaestroPhase, MaestroTaskEvent, MaestroTaskSummary } from './wire.js'
-import { TERMINAL_PHASES } from './wire.js'
+import { cleanLogText, TERMINAL_PHASES } from './wire.js'
 
 /** Event ring cap per task — the agent-facing value needs the summary, the UI needs the tail. */
 const EVENTS_CAP = 800
@@ -19,7 +19,11 @@ export interface MaestroTask {
   readonly cli: MaestroCliId
   readonly title: string
   readonly cwd: string | undefined
-  readonly model: string
+  /** The CLI model actually handed to the child; updated once the route resolves. */
+  model: string
+  /** The session (agent) that owns this task; undefined for owner-less jobs
+   * (npm installs), which stay visible in every session's board. */
+  readonly sessionId: string | undefined
   phase: MaestroPhase
   startedAt: number
   endedAt: number | undefined
@@ -48,13 +52,14 @@ export class TaskRegistry {
   private readonly tasks = new Map<string, MaestroTask>()
 
   /** Create one task; returns the record for the runner to update. */
-  create(input: { id: string; cli: MaestroCliId; title: string; cwd?: string | undefined; model: string }): MaestroTask {
+  create(input: { id: string; cli: MaestroCliId; title: string; cwd?: string | undefined; model: string; sessionId?: string | undefined }): MaestroTask {
     const task: MaestroTask = {
       id: input.id,
       cli: input.cli,
       title: input.title,
       cwd: input.cwd,
       model: input.model,
+      sessionId: input.sessionId,
       phase: 'queued',
       startedAt: Date.now(),
       endedAt: undefined,
@@ -74,7 +79,9 @@ export class TaskRegistry {
 
   /** Append one event; the ring keeps the newest EVENTS_CAP entries. */
   push(task: MaestroTask, kind: MaestroTaskEvent['kind'], text: string): MaestroTaskEvent {
-    const trimmed = text.length > 4000 ? `${text.slice(0, 4000)}…` : text
+    // Terminal escape sequences would render as mojibake in the browser log.
+    const cleaned = cleanLogText(text)
+    const trimmed = cleaned.length > 4000 ? `${cleaned.slice(0, 4000)}…` : cleaned
     task.cursor += 1
     const event: MaestroTaskEvent = { seq: task.cursor, at: Date.now(), kind, text: trimmed }
     task.events.push(event)
@@ -95,13 +102,23 @@ export class TaskRegistry {
     this.push(task, 'phase', note ?? `阶段 → ${phase}`)
   }
 
+  /** The route resolved after create(); record the model the child really got. */
+  setModel(task: MaestroTask, model: string): void {
+    task.model = model
+  }
+
   get(id: string): MaestroTask | undefined {
     return this.tasks.get(id)
   }
 
-  /** Newest first. */
-  list(): MaestroTaskSummary[] {
+  /**
+   * Newest first.
+   * @param sessions - when given, drops tasks owned by sessions outside the
+   * set; owner-less tasks (npm jobs) always stay. Absent = the full list.
+   */
+  list(sessions?: ReadonlySet<string> | undefined): MaestroTaskSummary[] {
     return [...this.tasks.values()]
+      .filter(task => sessions === undefined || task.sessionId === undefined || sessions.has(task.sessionId))
       .sort((a, b) => b.startedAt - a.startedAt)
       .map(task => this.summaryOf(task))
   }
@@ -113,10 +130,12 @@ export class TaskRegistry {
       title: task.title,
       phase: task.phase,
       model: task.model,
+      ...(task.sessionId === undefined ? {} : { sessionId: task.sessionId }),
       startedAt: task.startedAt,
       ...(task.endedAt === undefined ? {} : { endedAt: task.endedAt }),
       ...(task.exitCode === undefined ? {} : { exitCode: task.exitCode }),
       ...(task.endedAt === undefined ? {} : { durationMs: task.endedAt - task.startedAt }),
+      ...(task.truncated ? { truncated: true } : {}),
     }
   }
 

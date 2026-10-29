@@ -204,6 +204,9 @@ export async function runClaudeTask(options: {
     timeoutMs: options.timeoutMs,
     signal: options.signal,
     onStdoutLine: handleLine,
+    // stderr is diagnostics, not protocol — surface it as notes so a hung or
+    // failing run is visible while it runs, not only in the final error string.
+    onStderrLine: (line: string) => { options.onEvent('note', `stderr: ${line.slice(0, 300)}`) },
   })
   const ended = await outcome
 

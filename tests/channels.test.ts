@@ -164,7 +164,78 @@ describe('codex frame parsing', () => {
     // Legacy msg dialect still feeds text events.
     expect(codexFrameEvents({ msg: { type: 'agent_message', message: '旧版消息' } })[0]?.kind).toBe('text')
   })
+  it('labels command starts and emits the final aggregate only once', () => {
+    const item = { type: 'command_execution', command: 'echo hi', aggregated_output: 'hi\n', exit_code: 0, status: 'completed' }
+    expect(codexFrameEvents({ type: 'item.started', item })[0]?.text).toContain('(started)')
+    expect(codexFrameEvents({ type: 'item.updated', item })).toEqual([])
+    const events = codexFrameEvents({ type: 'item.completed', item })
+    expect(events).toHaveLength(1)
+    expect(events[0]?.kind).toBe('note')
+    expect(events[0]?.text).toContain('(completed)')
+    expect(events[0]?.text).toContain('退出码 0')
+    expect(events[0]?.text).toContain('hi\n')
+  })
+
+  it.each([
+    { exit_code: 1, status: 'completed' },
+    { exit_code: 2, status: 'failed' },
+    { exit_code: null, status: 'failed' },
+    { exit_code: null, status: 'declined' },
+  ])('classifies an actual failed/declined command as an error: %j', result => {
+    const event = codexFrameEvents({ type: 'item.completed', item: {
+      type: 'command_execution', command: 'build', aggregated_output: 'build failed: missing input', ...result,
+    } })[0]
+    expect(event?.kind).toBe('error')
+    expect(event?.text).toContain('命令失败')
+    expect(event?.text).toContain('build failed: missing input')
+  })
+
+  it('does not classify successful ACL diagnostics or output keywords as failures', () => {
+    for (const command of ['icacls target\\maven-status\\inputFiles.lst', 'Get-Acl target\\maven-status\\inputFiles.lst', 'Get-Item target\\maven-status\\inputFiles.lst']) {
+      const event = codexFrameEvents({ type: 'item.completed', item: {
+        type: 'command_execution', command, exit_code: 0, status: 'completed', aggregated_output: 'error count: 0\nOwner: test\n',
+      } })[0]
+      expect(event?.kind).toBe('note')
+      expect(event?.text).toContain('Owner: test')
+    }
+    expect(codexFrameEvents({ type: 'item.completed', item: { type: 'command_execution', command: 'diagnose', exit_code: 0, status: 'failed' } })[0]?.kind).toBe('note')
+  })
+
+  it('bounds large command previews while preserving the head and diagnostic tail', () => {
+    const event = codexFrameEvents({ type: 'item.completed', item: {
+      type: 'command_execution', command: 'build', exit_code: 1, aggregated_output: `HEAD\n${'x'.repeat(10_000)}\nROOT CAUSE`,
+    } })[0]
+    expect(event?.text.length).toBeLessThan(6200)
+    expect(event?.text).toContain('HEAD')
+    expect(event?.text).toContain('省略')
+    expect(event?.text).toContain('ROOT CAUSE')
+  })
+
+  it('reads canonical top-level and item errors without truncating their messages', () => {
+    const message = `failure:${'x'.repeat(7000)}:details`
+    expect(codexFrameEvents({ type: 'error', message })).toEqual([{ kind: 'error', text: message }])
+    expect(codexFrameEvents({ type: 'turn.failed', error: { message } })).toEqual([{ kind: 'error', text: message }])
+    expect(codexFrameEvents({ type: 'item.completed', item: { type: 'error', message } })).toEqual([{ kind: 'error', text: message }])
+    expect(codexFrameEvents({ type: 'item.completed', item: { type: 'error', text: 'older item error' } })[0]?.text).toBe('older item error')
+    expect(codexFrameEvents({ type: 'error', error: 'older stream error' })[0]?.text).toBe('older stream error')
+    expect(codexFrameEvents({ type: 'error' })[0]?.text).toBe('codex stream error')
+  })
+
+  it('accepts the canonical file-change changes field', () => {
+    expect(codexFrameEvents({ type: 'item.completed', item: { type: 'file_change', status: 'failed', changes: [{ path: 'a.ts' }] } })[0]).toEqual({ kind: 'error', text: '文件变更 failed a.ts' })
+  })
 })
+
+async function fakeCodexRun(frames: Array<Parameters<typeof codexFrameEvents>[0]>, code = 0, stderr = '') {
+  const events: Array<{ kind: 'text' | 'note' | 'error'; text: string }> = []
+  const { spawnFn } = scriptedSpawn(child => { child.finish(frames.map(frame => JSON.stringify(frame)).join('\n'), code, stderr) })
+  const result = await runCodexTask({
+    spawnFn, codexPath: 'codex', task: '任务', cwd: undefined, model: '', sandbox: 'workspace-write',
+    baseUrl: '', apiKey: '', timeoutMs: 10_000, signal: new AbortController().signal,
+    onEvent: (kind, text) => { events.push({ kind, text }) },
+  })
+  return { result, events }
+}
 
 describe('runCodexTask (fake spawn)', () => {
   it('returns the last agent message as the final text', async () => {
@@ -218,5 +289,136 @@ describe('runCodexTask (fake spawn)', () => {
     })
     expect(result.ok).toBe(false)
     expect(result.error).toContain('额度用尽')
+  })
+
+  it('allows a command failure and non-fatal item error to recover into a successful answer', async () => {
+    const { result, events } = await fakeCodexRun([
+      { type: 'item.started', item: { id: 'cmd1', type: 'command_execution', command: 'build' } },
+      { type: 'item.updated', item: { id: 'cmd1', type: 'command_execution', command: 'build', aggregated_output: 'partial' } },
+      { type: 'item.completed', item: { id: 'cmd1', type: 'command_execution', command: 'build', exit_code: 1, status: 'failed', aggregated_output: 'build failed' } },
+      { type: 'item.completed', item: { type: 'error', message: 'recoverable warning' } },
+      { type: 'item.completed', item: { type: 'agent_message', text: '已修复并完成' } },
+      { type: 'turn.completed' },
+    ])
+    expect(result.ok).toBe(true)
+    expect(result.error).toBeUndefined()
+    expect(events.filter(event => event.text.includes('build failed'))).toHaveLength(1)
+    expect(events.some(event => event.kind === 'error' && event.text.includes('recoverable warning'))).toBe(true)
+    expect(events.some(event => event.text.includes('partial'))).toBe(false)
+  })
+
+  it.each([
+    [],
+    [{ type: 'thread.started', thread_id: 't' }],
+    [{ type: 'turn.completed' }],
+    [{ type: 'item.completed', item: { type: 'agent_message', text: '   ' } }, { type: 'turn.completed' }],
+    [{ type: 'item.completed', item: { type: 'command_execution', command: 'echo hi', exit_code: 0, aggregated_output: 'hi' } }, { type: 'turn.completed' }],
+  ].map(frames => ({ frames })))('does not silently succeed with exit 0 but no final answer: %j', async ({ frames }) => {
+    const { result } = await fakeCodexRun(frames)
+    expect(result.ok).toBe(false)
+    expect(result.error).toContain('未返回最终答复')
+    expect(result.exitCode).toBe(0)
+  })
+
+  it('fails an unresolved top-level stream error even if an earlier answer exists', async () => {
+    const { result, events } = await fakeCodexRun([
+      { type: 'item.completed', item: { type: 'agent_message', text: 'earlier answer' } },
+      { type: 'error', message: 'stream disconnected: exact reason' },
+    ])
+    expect(result.ok).toBe(false)
+    expect(result.error).toBe('stream disconnected: exact reason')
+    expect(events.some(event => event.kind === 'error' && event.text.includes('exact reason'))).toBe(true)
+  })
+
+  it('permits a stream error only when a subsequent completed turn proves recovery', async () => {
+    const { result } = await fakeCodexRun([
+      { type: 'error', message: 'Reconnecting... 1/5' },
+      { type: 'item.completed', item: { type: 'agent_message', text: 'completed after reconnect' } },
+      { type: 'turn.completed' },
+    ])
+    expect(result.ok).toBe(true)
+    expect(result.error).toBeUndefined()
+    const { result: lateFailure } = await fakeCodexRun([
+      { type: 'item.completed', item: { type: 'agent_message', text: 'answer' } },
+      { type: 'turn.completed' },
+      { type: 'error', message: 'late stream failure' },
+    ])
+    expect(lateFailure.ok).toBe(false)
+    expect(lateFailure.error).toContain('late stream failure')
+  })
+
+  it('retains all failure causes, full command output and stderr on a failed run', async () => {
+    const output = `BEGIN\n${'x'.repeat(3000)}\nCAUSE IN OMITTED MIDDLE\n${'y'.repeat(5000)}\nEND`
+    const { result, events } = await fakeCodexRun([
+      { type: 'item.completed', item: { type: 'command_execution', command: 'build', exit_code: 1, aggregated_output: output } },
+      { type: 'item.completed', item: { type: 'error', message: 'tool warning detail' } },
+      { type: 'error', message: 'connection diagnostic' },
+      { type: 'turn.failed', error: { message: 'turn failure detail' } },
+    ], 1, 'line one\nline two\nline three\nline four\nline five')
+    expect(result.ok).toBe(false)
+    expect(result.error).toContain(output)
+    expect(result.error).toContain('tool warning detail')
+    expect(result.error).toContain('connection diagnostic')
+    expect(result.error).toContain('turn failure detail')
+    expect(result.error).toContain('进程退出码 1')
+    expect(result.error).toContain('line one\nline two\nline three\nline four\nline five')
+    expect(events.find(event => event.text.startsWith('命令失败'))?.text).not.toContain('CAUSE IN OMITTED MIDDLE')
+  })
+
+  it('retains exit-0 stderr diagnostics when the CLI gives no answer', async () => {
+    const { result } = await fakeCodexRun([{ type: 'error', error: { message: 'provider unavailable' } }], 0, 'network diagnostic')
+    expect(result.ok).toBe(false)
+    expect(result.error).toContain('provider unavailable')
+    expect(result.error).toContain('未返回最终答复')
+    expect(result.error).toContain('network diagnostic')
+  })
+
+  it('keeps a large agent answer intact rather than applying command preview limits', async () => {
+    const answer = `结论：${'x'.repeat(20_000)}`
+    const { result, events } = await fakeCodexRun([
+      { type: 'item.completed', item: { type: 'agent_message', text: answer } },
+      { type: 'turn.completed' },
+    ])
+    expect(result.ok).toBe(true)
+    expect(result.finalText).toBe(answer)
+    expect(events.find(event => event.kind === 'text')?.text).toBe(answer)
+  })
+
+  it('fails a terminal turn.failed even when an earlier answer and exit 0 exist', async () => {
+    const { result } = await fakeCodexRun([
+      { type: 'item.completed', item: { type: 'agent_message', text: 'intermediate answer' } },
+      { type: 'turn.failed', error: { message: 'terminal turn failure' } },
+    ])
+    expect(result.ok).toBe(false)
+    expect(result.finalText).toBe('intermediate answer')
+    expect(result.error).toBe('terminal turn failure')
+  })
+
+  it('does not report success if cancellation races with a child that already exited 0', async () => {
+    const controller = new AbortController()
+    controller.abort()
+    const { spawnFn } = scriptedSpawn(child => {
+      // The child has already exited, so killTree returns without invoking any
+      // OS process killer. Stdout/close delivery is still queued by the fake.
+      child.exitCode = 0
+      child.finish(JSON.stringify({ type: 'item.completed', item: { type: 'agent_message', text: 'answer' } }))
+    })
+    const result = await runCodexTask({
+      spawnFn, codexPath: 'codex', task: '任务', cwd: undefined, model: '', sandbox: 'workspace-write',
+      baseUrl: '', apiKey: '', timeoutMs: 10_000, signal: controller.signal, onEvent: () => {},
+    })
+    expect(result.ok).toBe(false)
+    expect(result.exitCode).toBe(0)
+    expect(result.error).toContain('任务已取消')
+  })
+
+  it('reports a non-zero process exit even after a completed turn and answer', async () => {
+    const { result } = await fakeCodexRun([
+      { type: 'item.completed', item: { type: 'agent_message', text: 'answer' } },
+      { type: 'turn.completed' },
+    ], 2, 'shutdown failed')
+    expect(result.ok).toBe(false)
+    expect(result.error).toContain('进程退出码 2')
+    expect(result.error).toContain('shutdown failed')
   })
 })
