@@ -50,6 +50,27 @@ describe('CLI settings and header style isolation', () => {
     expect(declarations(cardCss, '.dmc-body')).toMatchObject({ display: 'flex', 'flex-direction': 'column' })
   })
 
+  it('puts the dsh model picker and the thinking level on one row', () => {
+    const pair = declarations(cardCss, '.dmc-pair')
+    expect(pair).toMatchObject({ display: 'grid' })
+    // More than one track, or the level would drop under the model again.
+    expect(pair['grid-template-columns']).toContain('auto-fit')
+    expect(pair['grid-template-columns']).toContain('minmax')
+    // The model field spans the row only if it is `wide` — it must not be.
+    expect(cardSource).toContain('<Field label="dsh 模型">')
+    expect(cardSource).not.toMatch(/dsh 模型"[^>]*\bwide\b/)
+    // Both are children of the same pair grid, so they share the row.
+    expect(cardSource).toMatch(/className="dmc-pair">\s*<DshModelSelect[\s\S]{0,600}?<SelectField\s+label="思考等级"/)
+  })
+
+  it('leaves no explanatory text under the model and thinking-level selects', () => {
+    // Each picker keeps only its label: no per-field hint, and no group hint
+    // under the pair. The docs (README) carry the detail instead.
+    expect(cardSource).not.toContain('从 dsh 已配置的供应商/模型里选')
+    expect(cardSource).not.toContain('仅列出 Anthropic 兼容')
+    expect(cardSource).not.toContain('MAX_THINKING_TOKENS 传给 claude')
+  })
+
   it('keeps the header menu rows and badges independent of the settings card', () => {
     expect(declarations(headerCss, '.dmch-row')).toMatchObject({ display: 'flex', 'align-items': 'flex-start' })
     expect(declarations(headerCss, '.dmch-badge')).toMatchObject({ 'font-size': '9.5px' })

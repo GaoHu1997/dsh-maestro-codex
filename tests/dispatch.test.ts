@@ -120,6 +120,84 @@ describe('runDispatch', () => {
     expect(record?.cli).toBe('claude')
   })
 
+  it('streams running usage onto the task list before the run settles', async () => {
+    const spawn = scriptedSpawn(child => {
+      if (child.spawnArgs[0] === '--version') {
+        child.finish('claude version 9.9.9 (CCL)')
+        return
+      }
+      // Stream the assistant frame first, settle a beat later: the assertion
+      // below inspects the list inside that window, exactly like the board's
+      // 2.5s poll does while a CLI task is still running.
+      setTimeout(() => {
+        child.stdout.emit('data', Buffer.from(`${JSON.stringify({
+          type: 'assistant',
+          message: { content: [{ type: 'text', text: '写' }], usage: { input_tokens: 640, output_tokens: 12 } },
+        })}\n`))
+      }, 5)
+      setTimeout(() => {
+        child.finish(JSON.stringify({
+          type: 'result', subtype: 'success', result: 'claude 完成',
+          usage: { input_tokens: 900, output_tokens: 30, cache_read_input_tokens: 100 },
+        }))
+      }, 800)
+    })
+    const { deps, registry } = makeDeps(fixture(), spawn.spawnFn)
+    const run = runDispatch(deps, { ...assessment, cli: 'claude', task: '做个分析' }, new AbortController().signal)
+    // Poll the list the way the board does, and remember what it showed while
+    // the task was still running.
+    let live: ReturnType<typeof registry.list>[number] | undefined
+    for (let i = 0; i < 200; i += 1) {
+      const row = registry.list()[0]
+      if (row?.usage !== undefined) {
+        live = row
+        break
+      }
+      await new Promise(resolve => setTimeout(resolve, 10))
+    }
+    expect(live?.phase).toBe('running')
+    expect(live?.usage).toMatchObject({ uncachedInputTokens: 640, outputTokens: 12 })
+    const value = await run
+    expect(value.ok).toBe(true)
+    // Settled totals replace the running snapshot.
+    expect(registry.list()[0]?.usage).toMatchObject({ uncachedInputTokens: 900, outputTokens: 30, cacheReadTokens: 100 })
+  })
+
+  it('refuses a candidate the endpoint does not serve before spawning it', async () => {
+    const cli = fakeCliSpawn(true)
+    const config = fixture()
+    config.claude.dshModel = 'tierflow::tierflow_pro'
+    const { deps, registry } = makeDeps(config, cli.spawnFn, async () => ({
+      provider: 'tierflow', model: 'tierflow_pro', api: 'anthropic-messages', baseURL: 'https://tierflow.cn', apiKey: 'k',
+    }))
+    deps.preflightDshModel = () => Promise.resolve({ status: 'mismatch', detail: '模型预检失败：端点不认这个模型 tierflow::tierflow_pro' })
+    await expect(runDispatch(deps, { ...assessment, cli: 'claude', task: '做个分析' }, new AbortController().signal))
+      .rejects.toThrow(/预检失败/)
+    // The failure happens before the CLI child is ever spawned.
+    expect(cli.launches.some(child => child.spawnArgs[0] !== '--version')).toBe(false)
+    expect(registry.list()[0]?.phase).toBe('failed')
+  })
+
+  it('falls back to the configured model when the primary one fails preflight', async () => {
+    const cli = fakeCliSpawn(true)
+    const config = fixture()
+    config.claude.dshModel = 'gw::good-model'
+    const calls: string[] = []
+    const { deps } = makeDeps(config, cli.spawnFn, async selection => {
+      calls.push(selection)
+      return { provider: selection.split('::')[0] ?? '', model: selection.split('::')[1] ?? '', api: 'anthropic-messages', baseURL: 'https://gw.example', apiKey: 'k' }
+    })
+    deps.preflightDshModel = endpoint => Promise.resolve(endpoint.model === 'bad-model'
+      ? { status: 'mismatch', detail: '模型预检失败：端点不认这个模型' }
+      : { status: 'ok', detail: '预检通过' })
+    const value = await runDispatch(deps, {
+      ...assessment, cli: 'claude', task: '做个分析', primaryModel: { provider: 'gw', model: 'bad-model' },
+    }, new AbortController().signal)
+    expect(value.ok).toBe(true)
+    expect(calls).toEqual(['gw::bad-model', 'gw::good-model'])
+    expect(value.notes?.some(note => note.includes('预检未通过'))).toBe(true)
+  })
+
   it('routes codex by keyword with auto', async () => {
     const cli = fakeCliSpawn(true)
     const { deps, registry } = makeDeps(fixture(), cli.spawnFn)

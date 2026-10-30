@@ -17,7 +17,7 @@ import { Limiter, TaskRegistry, type MaestroTask as TaskRegistryTask } from './t
 import type { SpawnFn } from './spawn.js'
 import { writeClaudeMcpConfig, unlinkQuiet, type DshMcpServer } from './mcp.js'
 import { gitContextFor } from './git-context.js'
-import type { JobsFace } from './job-mirror.js'
+import type { DshPreflight } from './preflight.js'
 import type { DshModelEndpoint } from './dsh-models.js'
 import { reportCliUsage, type CliUsageSession } from './usage.js'
 import { cleanLogText, type MaestroCliId, type MaestroPhase } from './wire.js'
@@ -56,6 +56,11 @@ export interface DispatchDeps {
   pathCache: CliPathCache
   /** Resolve a `<provider>::<model>` dsh-catalog selection into a CLI endpoint. */
   resolveDshModel?: ((selection: string) => Promise<DshModelEndpoint>) | undefined
+  /**
+   * Confirm the resolved endpoint actually serves that model before a child is
+   * spawned (declared-model check + one-token probe). Absent = no check.
+   */
+  preflightDshModel?: ((endpoint: DshModelEndpoint) => Promise<DshPreflight>) | undefined
   /** dsh's own MCP servers (the bridge hands them to every dispatched run). */
   listMcpServers?: (() => DshMcpServer[]) | undefined
   /** Injectable spawn seam (tests); absent = the real system spawn. */
@@ -65,8 +70,6 @@ export interface DispatchDeps {
    * once per settled run, after the usage report; best effort by contract.
    */
   persist?: ((task: TaskRegistryTask) => void) | undefined
-  /** The host jobs service (dsh 任务页镜像); absent = the mirror stays off. */
-  jobs?: (() => JobsFace | undefined) | undefined
   logger?: { warn(message: string): void; error?(message: string): void }
 }
 
@@ -352,6 +355,22 @@ export async function runDispatch(deps: DispatchDeps, params: DispatchParams, si
             }
             const problem = protocolProblem(cliLabel, endpoint)
             if (problem === undefined) {
+              // The protocol is speakable; the model name may still be wrong for
+              // this endpoint. Check before spawning so a dead alias fails here
+              // with a sentence instead of mid-run with a 4xx.
+              const preflight = deps.preflightDshModel === undefined
+                ? undefined
+                : await deps.preflightDshModel(endpoint)
+              if (preflight !== undefined && preflight.status === 'mismatch') {
+                if (attempt.fatal) {
+                  setPhaseOf('failed', preflight.detail)
+                  throw new DispatchError(preflight.detail)
+                }
+                rejected.push(`主代理模型 ${attempt.selection} 预检未通过（${preflight.detail}）`)
+                if (configuredSelection !== '') note(`主代理模型 ${attempt.selection} 预检未通过（${preflight.detail}），直接使用配置页模型`)
+                continue
+              }
+              if (preflight?.note !== undefined) note(preflight.note)
               dshEndpoint = endpoint
               if (attempt.label === '主代理模型') note(`CLI 模型沿用主代理：${attempt.selection}`)
               break
@@ -417,6 +436,13 @@ export async function runDispatch(deps: DispatchDeps, params: DispatchParams, si
               mcpConfigPath = await writeClaudeMcpConfig(mcpServers)
             }
 
+            // Live counters: the board polls the task list, so writing the
+            // running snapshot here is what puts tokens on a card before the
+            // task ends. Settled `stats` still wins once the run resolves.
+            const onUsage = (stats: Record<string, string | number | boolean>): void => {
+              deps.registry.setLiveStats(task, stats)
+            }
+
             const run = decision.cli === 'claude'
               ? runClaudeTask({
                   ...(deps.spawnFn === undefined ? {} : { spawnFn: deps.spawnFn }),
@@ -433,6 +459,7 @@ export async function runDispatch(deps: DispatchDeps, params: DispatchParams, si
                   timeoutMs,
                   signal: abort.signal,
                   onEvent,
+                  onUsage,
                 })
               : runCodexTask({
                   ...(deps.spawnFn === undefined ? {} : { spawnFn: deps.spawnFn }),
@@ -457,6 +484,7 @@ export async function runDispatch(deps: DispatchDeps, params: DispatchParams, si
                   timeoutMs,
                   signal: abort.signal,
                   onEvent,
+                  onUsage,
                 })
 
             // Two cancel paths meet here: the outer signal (tool exec / HTTP cancel)

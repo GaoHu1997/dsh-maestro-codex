@@ -4,6 +4,8 @@
 >
 > **更新（2026-10-30）**：文中的**方案 B（镜像成后台 job）与 A2（external 目录行）已实施**——见 `src/job-mirror.ts`（`mirrorAsJob` / `externalCatalogRow`，配置项 `mirrorAsJob`，默认开）与 `src/tool.ts` 的接线。行为与 §3/§5 的设计一致：job 只是旁路镜像，`jobs.start` 失败静默降级为裸 dispatch，工具返回不变。任务看板与 dsh 原生任务页从此共用同一次派发的事实源。
 >
+> **再次更新（2026-10-30 晚）**：**方案 B 已回退**。用户指出 dsh 自己的子代理并不出现在「后台任务」里，CLI 子代理也不该出现在那里。`mirrorAsJob`、`JobsFace`、`DispatchDeps.jobs` 与对应配置项/开关已全部移除，`src/job-mirror.ts` 只剩 A2 的目录行并改名为 `src/subagent-catalog.ts`；CLI 任务的生命周期、日志、用量与取消只由本插件的任务看板（`/plugin/dsh-maestro-codex/task-*`）承载。本文 §3/§5 关于 job 镜像的内容仅作历史记录。
+>
 > 目标：主代理调用 `dispatch_cli_task` 派发 claude/codex 后，右侧「任务管理」tab（截图红框）能显示这个任务——至少要有「正在运行 / 已完成 / 失败」、实时输出、可强制终止。
 
 ## 1. 现状诊断：为什么现在看不到

@@ -4,6 +4,10 @@
  * line, and the final `result` frame carries the answer back to the agent.
  */
 
+import { randomUUID } from 'node:crypto'
+import { unlink, writeFile } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 import { runProcess } from '../spawn.js'
 import { CLAUDE_THINKING_BUDGETS } from '../wire.js'
 import type { ClaudePermissionMode } from '../config.js'
@@ -33,8 +37,15 @@ interface ClaudeFrame {
   duration_api_ms?: number
   total_cost_usd?: number
   usage?: { input_tokens?: number; output_tokens?: number; cache_read_input_tokens?: number; cache_creation_input_tokens?: number }
-  message?: { content?: Array<{ type?: string; text?: string; name?: string; input?: Record<string, unknown>; tool_use_id?: string }> }
+  message?: {
+    content?: Array<{ type?: string; text?: string; name?: string; input?: Record<string, unknown>; tool_use_id?: string }>
+    /** Assistant frames carry their own usage; it is what feeds the live counters. */
+    usage?: { input_tokens?: number; output_tokens?: number; cache_read_input_tokens?: number; cache_creation_input_tokens?: number }
+  }
 }
+
+/** One streamed usage snapshot, as both frame kinds report it. */
+export type ClaudeUsage = NonNullable<ClaudeFrame['usage']>
 
 /** `--permission-mode` value for the configured mode; `inherit` sends none. */
 export function claudePermissionArgs(permissionMode: ClaudePermissionMode): string[] {
@@ -55,8 +66,9 @@ export function claudeMcpArgs(mcpConfigPath: string, serverNames: readonly strin
 }
 
 /** The argv for one headless run (before the resolved path is prepended). */
-export function claudeArgs(model: string, permissionMode: ClaudePermissionMode, mcpConfigPath?: string, mcpServerNames?: readonly string[], resume?: string): string[] {
+export function claudeArgs(model: string, permissionMode: ClaudePermissionMode, mcpConfigPath?: string, mcpServerNames?: readonly string[], resume?: string, settingsPath?: string): string[] {
   const args = ['-p', '--output-format', 'stream-json', '--verbose']
+  if (settingsPath !== undefined && settingsPath !== '') args.push('--settings', settingsPath)
   if (model !== '') args.push('--model', model)
   args.push(...claudePermissionArgs(permissionMode))
   // `--resume <session-id>` continues a previous headless session; the
@@ -64,6 +76,22 @@ export function claudeArgs(model: string, permissionMode: ClaudePermissionMode, 
   if (resume !== undefined && resume !== '') args.push('--resume', resume)
   if (mcpConfigPath !== undefined) args.push(...claudeMcpArgs(mcpConfigPath, mcpServerNames ?? []))
   return args
+}
+
+/**
+ * One-run settings file carrying the provider env. Claude Code applies its own
+ * settings files' `env` block ON TOP of the inherited process environment, so
+ * `claudeEnv()` alone loses whenever the user's `~/.claude/settings.json` pins
+ * a gateway of its own — the run then silently talks to that gateway (a stale
+ * one fails the whole task with its 403). `--settings` outranks the user file,
+ * so the dsh-configured provider actually wins.
+ */
+export async function writeClaudeSettingsFile(env: Record<string, string>): Promise<string> {
+  const file = join(tmpdir(), `dsh-maestro-claude-${randomUUID().slice(0, 8)}.json`)
+  // The file carries the auth token: owner-only where the platform honours the
+  // mode, and unlinked as soon as the run settles.
+  await writeFile(file, JSON.stringify({ env }, null, 2), { encoding: 'utf8', mode: 0o600 })
+  return file
 }
 
 /**
@@ -134,6 +162,34 @@ export function claudeToolResultEvents(frame: ClaudeFrame, toolNamesById: Readon
   return events
 }
 
+/**
+ * Fold one streamed usage snapshot into the running counters the board shows
+ * while the task runs.
+ *
+ * Assistant frames report the context size of that message (`input_tokens`)
+ * and that message's own output, so inputs are replaced while outputs
+ * accumulate. The final `result` frame reports whole-run totals, so it simply
+ * overwrites everything — that is also why the board may see one jump at the
+ * end rather than a perfectly monotonic climb.
+ */
+export function mergeLiveUsage(
+  previous: Readonly<Record<string, string | number | boolean>>,
+  usage: ClaudeUsage,
+  kind: 'assistant' | 'result',
+): Record<string, string | number | boolean> {
+  const next: Record<string, string | number | boolean> = { ...previous }
+  if (typeof usage.input_tokens === 'number') next['inputTokens'] = usage.input_tokens
+  if (typeof usage.cache_read_input_tokens === 'number') next['cachedInputTokens'] = usage.cache_read_input_tokens
+  if (typeof usage.cache_creation_input_tokens === 'number') next['cacheWriteTokens'] = usage.cache_creation_input_tokens
+  if (typeof usage.output_tokens === 'number') {
+    const prior = next['outputTokens']
+    next['outputTokens'] = kind === 'result'
+      ? usage.output_tokens
+      : typeof prior === 'number' ? prior + usage.output_tokens : usage.output_tokens
+  }
+  return next
+}
+
 /** The final answer of a `result` frame, plus the stats worth keeping. */
 export function claudeResultOf(frame: ClaudeFrame): { finalText: string; stats: Record<string, string | number | boolean> } {
   const stats: Record<string, string | number | boolean> = {}
@@ -173,9 +229,13 @@ export async function runClaudeTask(options: {
   timeoutMs: number
   signal: AbortSignal
   onEvent: (kind: 'text' | 'note' | 'error', text: string) => void
+  /** Running usage snapshot, one call per frame that carries counts. */
+  onUsage?: (stats: Record<string, string | number | boolean>) => void
 }): Promise<ClaudeRunResult> {
-  const args = claudeArgs(options.model, options.permissionMode, options.mcpConfigPath, options.mcpServerNames, options.resume)
   const env = claudeEnv(options.baseUrl, options.authToken, options.thinking ?? '')
+  // No provider env to pin: the run rides whatever claude is configured with.
+  const settingsPath = Object.keys(env).length === 0 ? undefined : await writeClaudeSettingsFile(env)
+  const args = claudeArgs(options.model, options.permissionMode, options.mcpConfigPath, options.mcpServerNames, options.resume, settingsPath)
   // The level came from the model's configured reasoningEfforts; a key with no
   // budget mapping (catalog drift) must not fail the run — say so and move on.
   if (options.thinking !== undefined && options.thinking !== '' && !(options.thinking in CLAUDE_THINKING_BUDGETS)) {
@@ -186,6 +246,7 @@ export async function runClaudeTask(options: {
   let sessionId = ''
   let resultError: string | undefined
   let resultStats: Record<string, string | number | boolean> = {}
+  let liveUsage: Record<string, string | number | boolean> = {}
   const toolNamesById = new Map<string, string>()
 
   const handleLine = (line: string): void => {
@@ -213,6 +274,13 @@ export async function runClaudeTask(options: {
       resultStats = parsed.stats
       if (frame.is_error === true && (frame.result ?? '').trim() !== '') resultError = frame.result
     }
+    // Live counters: assistant frames move them as the answer streams, the
+    // result frame lands the authoritative totals.
+    const streamed = frame.type === 'result' ? frame.usage : frame.type === 'assistant' ? frame.message?.usage : undefined
+    if (streamed !== undefined && options.onUsage !== undefined) {
+      liveUsage = mergeLiveUsage(liveUsage, streamed, frame.type === 'result' ? 'result' : 'assistant')
+      options.onUsage({ ...liveUsage })
+    }
   }
 
   const { outcome } = runProcess({
@@ -233,7 +301,15 @@ export async function runClaudeTask(options: {
     // failing run is visible while it runs, not only in the final error string.
     onStderrLine: (line: string) => { options.onEvent('note', `stderr: ${line.slice(0, 300)}`) },
   })
-  const ended = await outcome
+  // The settings file exists only for this run: drop it however the run ends.
+  let ended: Awaited<typeof outcome>
+  try {
+    ended = await outcome
+  } finally {
+    if (settingsPath !== undefined) {
+      try { await unlink(settingsPath) } catch { /* best effort */ }
+    }
+  }
 
   const stats = { ...resultStats }
   if (sessionId !== '') stats['sessionId'] = sessionId

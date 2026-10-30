@@ -9,7 +9,7 @@
 import type { Context } from '@deepseek-ai/cordis'
 import { TASK_DIFFICULTIES } from './config.js'
 import { parseDispatchParams, runDispatch, type DispatchDeps, type DispatchParams, type DispatchValue } from './dispatch.js'
-import { externalCatalogRow, mirrorAsJob } from './job-mirror.js'
+import { externalCatalogRow } from './subagent-catalog.js'
 import { sessionUsageAppendOf, type CliUsageSession } from './usage.js'
 
 export const TOOL_NAME = 'dispatch_cli_task'
@@ -138,8 +138,6 @@ export function registerDispatchTool(ctx: Context, deps: MaestroToolDeps): { rea
     }
     // DispatchError messages are already agent-facing; anything else keeps its
     // own shape (the abort reason included).
-    const jobs = deps.jobs?.()
-    const mirror = deps.readConfig().mirrorAsJob !== false && jobs !== undefined && sessionId !== undefined
     const concise = parsed.task.replace(/\s+/g, ' ').slice(0, 60)
     /* A2：任务一创建就补一行 external 目录，内核会话顶部的「N 个子智能体」
      * 下拉框立刻出现这条 CLI 任务（external 行只作记录，不可打开）。目录投影
@@ -152,17 +150,7 @@ export function registerDispatchTool(ctx: Context, deps: MaestroToolDeps): { rea
         usageSession.append('subagent/catalog', externalCatalogRow(taskId, `cli · ${concise}`, Date.now()))
       } catch { /* catalog rows are observability; a refusal costs nothing */ }
     }
-    const value = mirror
-      ? await mirrorAsJob({
-          jobs,
-          owner: sessionId,
-          label: `CLI(${parsed.cli}) ${concise}`,
-          deps,
-          params,
-          signal: exec.signal,
-          onTaskId: noteCatalog,
-        })
-      : await runDispatch(deps, params, exec.signal, { onTaskId: noteCatalog })
+    const value = await runDispatch(deps, params, exec.signal, { onTaskId: noteCatalog })
     return value
   }
 

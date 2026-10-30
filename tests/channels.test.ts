@@ -1,5 +1,6 @@
+import { readFileSync, statSync, unlinkSync } from 'node:fs'
 import { describe, expect, it } from 'vitest'
-import { claudeArgs, claudeEnv, claudeFrameEvents, claudeMcpArgs, claudePermissionArgs, claudeResultOf, lastLines, runClaudeTask } from '../src/channels/claude.js'
+import { claudeArgs, claudeEnv, claudeFrameEvents, claudeMcpArgs, claudePermissionArgs, claudeResultOf, lastLines, runClaudeTask, writeClaudeSettingsFile } from '../src/channels/claude.js'
 import { codexArgs, codexDshModelArgs, codexEnv, codexFrameEvents, codexSandboxArgs, codexWindowsSandboxArgs, codexUsageStats, runCodexTask, tomlString } from '../src/channels/codex.js'
 import { scriptedSpawn } from './fake-child.js'
 
@@ -48,6 +49,29 @@ describe('claude argv/env', () => {
     // Levels come from the model's configured reasoningEfforts; an unmapped
     // key (catalog drift) is ignored, never guessed.
     expect(claudeEnv('', '', 'mega')).toEqual({})
+  })
+
+  it('puts --settings ahead of --model so the pinned provider env wins', () => {
+    // ~/.claude/settings.json carries its own `env` block, which Claude Code
+    // applies on top of the process environment: without --settings a stale
+    // user gateway silently replaces the dsh-configured one.
+    expect(claudeArgs('m1', 'default', undefined, undefined, undefined, 'C:/tmp/s.json'))
+      .toEqual(['-p', '--output-format', 'stream-json', '--verbose', '--settings', 'C:/tmp/s.json', '--model', 'm1'])
+    // No pinned env → no --settings at all (the run rides claude's own config).
+    expect(claudeArgs('m1', 'default', undefined, undefined, undefined, '')).toEqual(['-p', '--output-format', 'stream-json', '--verbose', '--model', 'm1'])
+  })
+
+  it('writes the one-run settings file with owner-only access', async () => {
+    const file = await writeClaudeSettingsFile({ ANTHROPIC_BASE_URL: 'https://gw.example.com', ANTHROPIC_AUTH_TOKEN: 'sk-1' })
+    try {
+      expect(file).toContain('dsh-maestro-claude-')
+      expect(JSON.parse(readFileSync(file, 'utf8'))).toEqual({
+        env: { ANTHROPIC_BASE_URL: 'https://gw.example.com', ANTHROPIC_AUTH_TOKEN: 'sk-1' },
+      })
+      if (process.platform !== 'win32') expect(statSync(file).mode & 0o777).toBe(0o600)
+    } finally {
+      unlinkSync(file)
+    }
   })
 
   it('grants bridged servers only through --allowedTools, never as bare argv tokens', () => {
@@ -119,6 +143,68 @@ describe('runClaudeTask (fake spawn)', () => {
     expect(result.sessionId).toBe('s9')
     expect(result.stats['turns']).toBe(2)
     expect(events.some(event => event.startsWith('text:思考中'))).toBe(true)
+  })
+
+  it('pins the provider env through --settings and drops the file afterwards', async () => {
+    let settingsPath = ''
+    const { spawnFn } = scriptedSpawn(child => {
+      const index = child.spawnArgs.indexOf('--settings')
+      expect(index).toBeGreaterThan(-1)
+      settingsPath = child.spawnArgs[index + 1] ?? ''
+      // The file must exist while the CLI runs, carrying the pinned env.
+      expect(JSON.parse(readFileSync(settingsPath, 'utf8'))).toEqual({
+        env: { ANTHROPIC_BASE_URL: 'https://gw.example.com', ANTHROPIC_AUTH_TOKEN: 'sk-1' },
+      })
+      child.finish(JSON.stringify({ type: 'result', subtype: 'success', result: 'done' }))
+    })
+    const result = await runClaudeTask({
+      spawnFn,
+      claudePath: 'claude',
+      task: '任务',
+      cwd: undefined,
+      model: '',
+      permissionMode: 'inherit',
+      baseUrl: 'https://gw.example.com',
+      authToken: 'sk-1',
+      timeoutMs: 10_000,
+      signal: new AbortController().signal,
+      onEvent: () => {},
+    })
+    expect(result.ok).toBe(true)
+    // Unlinked once the run settles: the token does not outlive the task.
+    expect(() => statSync(settingsPath)).toThrow()
+  })
+
+  it('streams running usage while the answer is still being generated', async () => {
+    const { spawnFn } = scriptedSpawn(child => {
+      child.finish([
+        JSON.stringify({ type: 'assistant', message: { content: [{ type: 'text', text: '想' }], usage: { input_tokens: 900, cache_read_input_tokens: 100, cache_creation_input_tokens: 0, output_tokens: 5 } } }),
+        JSON.stringify({ type: 'assistant', message: { content: [{ type: 'text', text: '答' }], usage: { input_tokens: 1200, cache_read_input_tokens: 800, cache_creation_input_tokens: 0, output_tokens: 7 } } }),
+        JSON.stringify({ type: 'result', subtype: 'success', result: '完成', usage: { input_tokens: 2100, cache_read_input_tokens: 1800, cache_creation_input_tokens: 0, output_tokens: 42 } }),
+      ].join('\n'))
+    })
+    const usage: Array<Record<string, string | number | boolean>> = []
+    await runClaudeTask({
+      spawnFn,
+      claudePath: 'claude',
+      task: '任务',
+      cwd: undefined,
+      model: '',
+      permissionMode: 'inherit',
+      baseUrl: '',
+      authToken: '',
+      timeoutMs: 10_000,
+      signal: new AbortController().signal,
+      onEvent: () => {},
+      onUsage: stats => usage.push(stats),
+    })
+    // Two assistant frames + the result frame: inputs replace (context size),
+    // outputs accumulate, and the final frame lands the authoritative totals.
+    expect(usage.length).toBe(3)
+    expect(usage[0]?.['inputTokens']).toBe(900)
+    expect(usage[1]?.['inputTokens']).toBe(1200)
+    expect(usage[1]?.['outputTokens']).toBe(12)
+    expect(usage[2]).toMatchObject({ inputTokens: 2100, outputTokens: 42, cachedInputTokens: 1800 })
   })
 
   it('reports a non-zero exit as failure with the stderr tail', async () => {
@@ -364,6 +450,33 @@ describe('runCodexTask (fake spawn)', () => {
     expect(result.finalText).toBe('最终结论')
     expect(result.threadId).toBe('t1')
     expect(result.stats['outputTokens']).toBe(5)
+  })
+
+  it('reports running usage from the turn.completed frame', async () => {
+    const { spawnFn } = scriptedSpawn(child => {
+      child.finish([
+        JSON.stringify({ type: 'item.completed', item: { type: 'agent_message', text: '完成' } }),
+        JSON.stringify({ type: 'turn.completed', usage: { input_tokens: 100, cached_input_tokens: 40, output_tokens: 7 } }),
+      ].join('\n'))
+    })
+    const usage: Array<Record<string, string | number | boolean>> = []
+    await runCodexTask({
+      spawnFn,
+      codexPath: 'codex',
+      task: '任务',
+      cwd: undefined,
+      model: '',
+      sandbox: 'workspace-write',
+      baseUrl: '',
+      apiKey: '',
+      timeoutMs: 10_000,
+      signal: new AbortController().signal,
+      onEvent: () => {},
+      onUsage: stats => usage.push(stats),
+    })
+    // Cached reads are carved out of input, matching the settled stats shape.
+    expect(usage).toHaveLength(1)
+    expect(usage[0]).toMatchObject({ inputTokens: 60, cachedInputTokens: 40, outputTokens: 7 })
   })
 
   it('fails on turn.failed even with exit 0', async () => {

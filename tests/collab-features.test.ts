@@ -1,12 +1,12 @@
 /**
- * 第三/四大点协同功能的回归：job 镜像（方案 B）、external 目录行（A2）、
- * git 上下文注入（接缝①）、会话续接（resume）、失败重试与超时预警。
+ * 协同功能回归：external 目录行（A2）、git 上下文注入（接缝①）、会话续接
+ * （resume）、失败重试与超时预警。
  */
 
 import { describe, expect, it, vi } from 'vitest'
 import { effectiveOf, validateConfig, type EffectiveConfig } from '../src/config.js'
 import { parseDispatchParams, runDispatch, type DispatchParams, type DispatchValue } from '../src/dispatch.js'
-import { externalCatalogRow, jobsFaceOf, mirrorAsJob, type JobHandleFace, type JobsFace } from '../src/job-mirror.js'
+import { externalCatalogRow } from '../src/subagent-catalog.js'
 import { gitContextBlockOf } from '../src/git-context.js'
 import { CliPathCache } from '../src/dispatch.js'
 import { Limiter, TaskRegistry } from '../src/task-registry.js'
@@ -75,86 +75,10 @@ function makeDeps(config: EffectiveConfig, spawnFn: ReturnType<typeof scriptedSp
   }
 }
 
-/** A scripted JobsFace capturing specs and letting the test drive the handle. */
-function fakeJobs(): JobsFace & { specs: Array<{ kind: string; label: string; owner: string }>; appended: string[]; progress: string[]; dones: Promise<JobOutcome>[] } {
-  const specs: Array<{ kind: string; label: string; owner: string }> = []
-  const appended: string[] = []
-  const progress: string[] = []
-  const dones: Promise<JobOutcome>[] = []
-  return {
-    specs,
-    appended,
-    progress,
-    dones,
-    start: (spec) => {
-      specs.push({ kind: spec.kind, label: spec.label, owner: spec.owner })
-      const done = spec.run({
-        append: (text, options) => { if (options?.channel !== 'log') appended.push(text) },
-        updateProgress: line => { progress.push(line) },
-      }).done
-      dones.push(done)
-      return 'job-1'
-    },
-  }
-}
 
-describe('job mirror (方案 B)', () => {
-  it('mirrors one dispatch: same value, job row completes, events stream into the handle', async () => {
-    const cli = collabCliSpawn()
-    const config = fixture()
-    config.injectGitContext = false
-    const { deps } = makeDeps(config, cli.spawnFn)
-    const jobs = fakeJobs()
-    const value = await mirrorAsJob({
-      jobs, owner: 'session-1', label: 'CLI(codex) 数据任务', deps, params: { ...assessment, cli: 'codex', task: '数据任务' }, signal: new AbortController().signal,
-    })
-    expect(value.ok).toBe(true)
-    expect(value.finalText).toBe('第 1 次完成')
-    expect(jobs.specs).toEqual([{ kind: 'cli', label: 'CLI(codex) 数据任务', owner: 'session-1' }])
-    // 事件与最终答案都进了 job 输出环，job 行以 completed 收尾。
-    expect(jobs.appended).toContain('第 1 次完成')
-    expect(jobs.progress.some(line => line.includes('开始执行'))).toBe(true)
-    await expect(jobs.dones[0]).resolves.toMatchObject({ status: 'completed', detail: expect.stringContaining('exit 0'), result: '第 1 次完成' })
-  })
 
-  it('maps a user stop to a killed job while the dispatch itself rejects', async () => {
-    const cli = collabCliSpawn()
-    const config = fixture()
-    config.injectGitContext = false
-    const { deps, controllers } = makeDeps(config, cli.spawnFn)
-    const jobs = fakeJobs()
-    // 让 job 的 cancel 能拿到 controller：onTaskId 在 runDispatch 里登记。
-    const signal = new AbortController().signal
-    const run = mirrorAsJob({ jobs, owner: 's', label: 'l', deps, params: { ...assessment, cli: 'codex', task: '任务' }, signal })
-    // 等控制器登记后从任务页终止；abort 原因就是 rejection 本身。
-    await vi.waitFor(() => { expect(deps.controllers.size).toBe(1) })
-    const taskId = [...deps.controllers.keys()][0] ?? ''
-    deps.controllers.get(taskId)?.abort(new Error('已从任务页终止'))
-    await expect(run).rejects.toThrow(/已从任务页终止/)
-    // job 行以 killed 收尾，registry 记为 cancelled，controller 已清理。
-    await expect(jobs.dones[0]).resolves.toMatchObject({ status: 'killed' })
-    expect(deps.registry.get(taskId)?.phase).toBe('cancelled')
-    expect(controllers.size).toBe(0)
-  })
-
-  it('falls back to a bare dispatch when jobs.start refuses (no double run)', async () => {
-    const cli = collabCliSpawn()
-    const config = fixture()
-    config.injectGitContext = false
-    const { deps } = makeDeps(config, cli.spawnFn)
-    const jobs: JobsFace = { start: () => { throw new Error('job 并发上限') } }
-    const value = await mirrorAsJob({ jobs, owner: 's', label: 'l', deps, params: { ...assessment, cli: 'codex', task: '任务' }, signal: new AbortController().signal })
-    expect(value.ok).toBe(true)
-    expect(deps.logger?.warn).toHaveBeenCalledWith(expect.stringContaining('任务页镜像不可用'))
-  })
-
-  it('jobsFaceOf accepts only structurally valid services', () => {
-    expect(jobsFaceOf(undefined)).toBeUndefined()
-    expect(jobsFaceOf({})).toBeUndefined()
-    expect(jobsFaceOf({ start: () => 'x' })).toBeDefined()
-  })
-
-  it('builds the A2 external catalog row', () => {
+describe('subagent catalog row (A2)', () => {
+  it('builds the external row the session catalog expects', () => {
     const row = externalCatalogRow('task-1', 'cli · 数据任务', 123)
     expect(row).toMatchObject({ version: 2, childId: 'cli-task-1', childCreatedAt: 123, mode: 'external', label: 'cli · 数据任务' })
   })
@@ -278,9 +202,8 @@ describe('timeout warning', () => {
 })
 
 describe('collab config fields', () => {
-  it('defaults mirror/git on and retries off, and validates the retry range', () => {
+  it('defaults git context on and retries off, and validates the retry range', () => {
     const effective = effectiveOf({})
-    expect(effective.mirrorAsJob).toBe(true)
     expect(effective.injectGitContext).toBe(true)
     expect(effective.failureRetries).toBe(0)
     expect(effectiveOf({ failureRetries: 2 }).failureRetries).toBe(2)

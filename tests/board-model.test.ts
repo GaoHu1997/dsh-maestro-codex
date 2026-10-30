@@ -397,6 +397,23 @@ describe('attachRows', () => {
     expect(tokenSummary(node?.tokens)).toBe('入 1.2k · 出 340 · 缓存 5.0k')
   })
 
+  it('shows tokens on a task that is still running', () => {
+    // While a run is in flight the usage comes from the live stats on the task
+    // summary, not from the settled `maestroCliUsage` projection.
+    const root = attachRows(tree(), {
+      tasks: [cliTask({
+        sessionId: 'review',
+        usage: { uncachedInputTokens: 640, outputTokens: 12, cacheReadTokens: 0, cacheWriteTokens: 0 },
+      })],
+    })
+    const node = root.children
+      .find(child => child.id === 'review')
+      ?.children.find(child => child.kind === 'cli')
+    expect(node?.status).toBe('running')
+    expect(node?.tokens).toEqual({ uncachedInputTokens: 640, outputTokens: 12, cacheReadTokens: 0, cacheWriteTokens: 0 })
+    expect(tokenSummary(node?.tokens)).toBe('入 640 · 出 12 · 缓存 0')
+  })
+
   it('leaves token usage unset for a run that has not reported yet', () => {
     const root = attachRows(tree(), { tasks: [cliTask({ sessionId: 'review' })] })
     const node = root.children

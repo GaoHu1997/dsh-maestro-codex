@@ -15,10 +15,10 @@ import { CliPathCache } from './dispatch.js'
 import { Limiter, TaskRegistry } from './task-registry.js'
 import { registerDispatchTool, TOOL_NAME } from './tool.js'
 import { routingHint } from './routing.js'
-import { listDshModels, resolveDshModelEndpoint, type SettingsDescribeFace } from './dsh-models.js'
+import { listDshModels, resolveDshModelEndpoint, type DshModelEndpoint, type SettingsDescribeFace } from './dsh-models.js'
+import { preflightDshModel as runPreflight } from './preflight.js'
 import { discoverMcpServers } from './mcp.js'
 import { installCliUsageProjection } from './usage.js'
-import { jobsFaceOf } from './job-mirror.js'
 import { dshHomeOf, loadPersistedTasks, persistTask } from './persist.js'
 import { StatusStore, crossSitePost, handleCliNpmJob, handleCliRefresh, handleCliVersions, handleHint, handleModels, handleOverview, handleTaskCancel, handleTaskDetail, handleTasks, fail, ok, type RouteDeps, type RouteOutcome } from './routes.js'
 import {
@@ -94,12 +94,6 @@ export function apply(ctx: Context, config: Config = {}): void {
     process.stderr.write(`[dsh-maestro-codex] ${level}: ${message}\n`)
   }
   const logger = { warn: (message: string) => log('warn', message), error: (message: string) => log('error', message) }
-  // The host jobs service (dsh-jobs-local) mirrors dispatched runs into the
-  // native task page; optional — absent, the tool falls back to bare dispatch.
-  let jobsService: unknown
-  ctx.inject(['jobs'], (jobsCtx) => {
-    jobsService = (jobsCtx as unknown as { get(name: string): unknown }).get('jobs')
-  })
   // The settings face arrives with the settings service; the dsh model catalog
   // and the CLI model resolver both read the composed llm-pi-ai providers
   // through it (baseURL / api / apiKeyEnv per provider route).
@@ -114,6 +108,13 @@ export function apply(ctx: Context, config: Config = {}): void {
     toolName: () => toolName,
     listDshModels: () => listDshModels(ctx, settingsFace),
     resolveDshModel: (selection: string) => resolveDshModelEndpoint(ctx, settingsFace, selection),
+    // Second half of the pre-spawn check: the protocol is already known to fit,
+    // so confirm this endpoint actually serves the selected model name.
+    preflightDshModel: async (endpoint: DshModelEndpoint) => {
+      const catalog = await listDshModels(ctx, settingsFace)
+      const declared = catalog.providers.find(provider => provider.id === endpoint.provider)?.models ?? []
+      return runPreflight(endpoint, declared)
+    },
     listMcpServers: () => discoverMcpServers(),
     mcpDiagnosticsEnabled: () => readConfig().mcpDiagnostics,
     describeSettings: () => settingsFace?.describe() ?? [],
@@ -121,7 +122,6 @@ export function apply(ctx: Context, config: Config = {}): void {
       if (readConfig().persistTasks === false) return
       void persistTask(dshHome, task)
     },
-    jobs: () => jobsFaceOf(jobsService),
     logger,
   }
 

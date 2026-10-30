@@ -177,6 +177,9 @@ const CARD_CSS = `
 .dmc-group { display: flex; flex-direction: column; gap: 6px; }
 .dmc-grouptitle { margin: 0; font-size: 13.5px; font-weight: 600; letter-spacing: -.005em; color: var(--dmc-fg); }
 .dmc-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 14px 18px; }
+/* The model + thinking-level pair: one row, model left and level right (each
+ * half the width); they stack only once a column can no longer reach 240px. */
+.dmc-pair { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 14px 18px; }
 .dmc-field { display: flex; flex-direction: column; gap: 3px; min-width: 0; }
 .dmc-fieldwide { grid-column: 1 / -1; }
 .dmc-label { font-size: 12.5px; font-weight: 550; color: var(--dmc-fg2); display: flex; align-items: center; gap: 6px; }
@@ -428,14 +431,11 @@ function DshModelSelect(props: {
     : ['openai-responses', 'openai-completions']
   const providers = props.providers ?? []
   const mappable = providers.filter(provider => provider.mappable && usableApis.includes(provider.api))
-  const unusableCount = providers.filter(provider => provider.mappable && !usableApis.includes(provider.api)).length
-  const hint = [
-    props.cli === 'claude' ? '仅列出 Anthropic 兼容（anthropic-messages）供应商' : '仅列出 OpenAI 兼容（openai-responses / openai-completions）供应商，统一按 responses 方言驱动（codex 0.146+ 已移除 chat 支持）',
-    unusableCount > 0 ? `；另有 ${String(unusableCount)} 个协议不匹配的供应商未列出` : '',
-    providers.length === 0 ? '；当前 dsh 没有可映射的供应商' : '',
-  ].join('')
+  // No `hint` and no `wide`: the label alone, and the thinking level sits to
+  // the right of this picker on the same row (see the 模型 group), so each
+  // takes half the row.
   return (
-    <Field label="dsh 模型" hint={hint} wide>
+    <Field label="dsh 模型">
       <select className="dmc-select" value={props.value} onChange={event => { props.onChange(event.target.value) }}>
         <option value="">沿用主代理模型（主代理协议不兼容时任务直接报错）</option>
         {mappable.map(provider => (
@@ -890,7 +890,7 @@ export function MaestroCard(props: MaestroCardProps): ReactNode {
 
             <div className="dmc-group">
               <p className="dmc-grouptitle">模型</p>
-              <div className="dmc-grid">
+              <div className="dmc-pair">
                 <DshModelSelect
                   cli={cli}
                   value={selection}
@@ -903,12 +903,8 @@ export function MaestroCard(props: MaestroCardProps): ReactNode {
                   options={thinkingOptions}
                   disabled={levels.length === 0 && thinkingValue === ''}
                   onChange={value => { actions.setImmediate(cli === 'claude' ? 'claudeThinking' : 'codexThinking', value) }}
-                  hint={cli === 'claude'
-                    ? '档位来自所选模型配置的思考档位（reasoningEfforts）；经 MAX_THINKING_TOKENS 传给 claude，off/none 关闭思考，低/中/高映射 4k/10k/32k。'
-                    : '档位来自所选模型配置的思考档位（reasoningEfforts）；经 -c model_reasoning_effort 传给 codex，与「-c 覆盖项」同时设置时覆盖项优先。'}
                 />
               </div>
-              <span className="dmc-hint">从 dsh 已配置的供应商/模型里选；不选则由 CLI 使用它自己的默认模型，思考等级也只能保持默认。</span>
             </div>
 
             <CliDifficultySelect
@@ -1220,14 +1216,6 @@ export function MaestroCard(props: MaestroCardProps): ReactNode {
                     onChange={value => { actions.setImmediate('persistTasks', value) }}
                   />
                   <span className="dmc-hint">每次派发结算后把摘要与最终文本写入 $DSH_HOME/maestro/tasks（最多 200 条）；重启后「任务监视」仍能翻看历史。</span>
-                </div>
-                <div className="dmc-field">
-                  <Toggle
-                    checked={values.mirrorAsJob !== false}
-                    label="镜像到 dsh 任务页"
-                    onChange={value => { actions.setImmediate('mirrorAsJob', value) }}
-                  />
-                  <span className="dmc-hint">派发的 CLI 任务同步登记进 dsh 后台任务：右侧任务管理页可看运行状态、流式输出与终止，拓扑树里多一个 ✓ 子代理节点。关闭后仅本插件的任务看板可见。</span>
                 </div>
                 <div className="dmc-field">
                   <Toggle

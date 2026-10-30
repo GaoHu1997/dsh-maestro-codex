@@ -26,6 +26,18 @@ describe('TaskRegistry', () => {
     expect(registry.eventsSince('missing', 0)).toBeUndefined()
   })
 
+  it('shows running usage from the live snapshot, then settles on the real stats', () => {
+    const registry = new TaskRegistry()
+    const task = newTask(registry)
+    expect(registry.list()[0]?.usage).toBeUndefined()
+    // The CLI streams counts while it runs: the board polls list() and must see them.
+    registry.setLiveStats(task, { inputTokens: 120, cachedInputTokens: 40, outputTokens: 9 })
+    expect(registry.list()[0]?.usage).toEqual({ uncachedInputTokens: 120, cacheReadTokens: 40, cacheWriteTokens: 0, outputTokens: 9 })
+    // Settled stats win — and the live snapshot is not summed into them.
+    task.stats = { inputTokens: 300, cachedInputTokens: 250, cacheWriteTokens: 0, outputTokens: 30 }
+    expect(registry.list()[0]?.usage).toEqual({ uncachedInputTokens: 300, cacheReadTokens: 250, cacheWriteTokens: 0, outputTokens: 30 })
+  })
+
   it('caps the event ring without renumbering', () => {
     const registry = new TaskRegistry()
     const task = newTask(registry)

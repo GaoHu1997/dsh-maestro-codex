@@ -382,6 +382,37 @@ describe('usage reporting seam', () => {
     expect(appended[1]?.data).toMatchObject({ cli: 'claude', phase: 'done', sessionId: 'session-1' })
   })
 
+  it('never registers the dispatch as a background job', async () => {
+    // dsh 自己的子代理不出现在「后台任务」里，CLI 子代理也照此处理：任务只存在于
+    // 本插件的看板与顶部子智能体目录，不再往宿主的 jobs 服务登记第二条记录。
+    const readConfig = () => effectiveOf({ claudeCliPath: process.execPath })
+    const child = scriptedSpawn(process => {
+      if (process.spawnArgs[0] === '--version') process.finish('claude version 9.9.9')
+      else process.finish(JSON.stringify({ type: 'result', subtype: 'success', result: '完成', is_error: false, num_turns: 1 }))
+    })
+    const toolDeps = deps({ readConfig, spawnFn: child.spawnFn, pathCache: new CliPathCache(readConfig, child.spawnFn) })
+    const starts: unknown[] = []
+    const services: string[] = []
+    const definitions: RegisteredTool[] = []
+    const ctx = {
+      tools: { register: (definition: unknown) => { definitions.push(definition as RegisteredTool); return () => {} } },
+      get: (name: string) => {
+        services.push(name)
+        return { start: (spec: unknown) => { starts.push(spec); return 'job-1' } }
+      },
+    } as unknown as Context
+    registerDispatchTool(ctx, toolDeps)
+    const tool = definitions[0]
+    if (tool === undefined) throw new Error('tool was not registered')
+    const value = await tool.execute(
+      { task: '多步任务', cli: 'claude', task_difficulty: 'medium', difficulty_reason: '需要实现、测试与回归验证' },
+      { signal: new AbortController().signal, agent: { id: 'session-1', session: { append: () => {} } } },
+    )
+    expect(value.ok).toBe(true)
+    expect(starts).toEqual([])
+    expect(services).not.toContain('jobs')
+  })
+
   it('writes the catalog row even when the dispatch later fails', async () => {
     const readConfig = () => effectiveOf({ claudeCliPath: process.execPath })
     const child = scriptedSpawn(process => {

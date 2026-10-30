@@ -279,6 +279,8 @@ export async function runCodexTask(options: {
   timeoutMs: number
   signal: AbortSignal
   onEvent: (kind: 'text' | 'note' | 'error', text: string) => void
+  /** Running usage snapshot, one call per frame that carries counts. */
+  onUsage?: (stats: Record<string, string | number | boolean>) => void
 }): Promise<CodexRunResult> {
   const args = codexArgs(options.model, options.sandbox, options.configOverrides ?? [], options.dshModel === undefined ? undefined : { model: options.dshModel.model, baseUrl: options.dshModel.baseUrl }, options.mcpServers, options.thinking, options.resume)
   // Same skip rule as codexArgs; surface it so a silently dropped level is visible.
@@ -320,7 +322,13 @@ export async function runCodexTask(options: {
     }
     if (frame.msg?.type === 'agent_message' && (frame.msg.message ?? '').trim() !== '') finalText = frame.msg.message ?? ''
     // Keep real usage even if this frame/run fails; never infer it from logs.
-    stats = { ...stats, ...codexUsageStats(frame) }
+    const usageDelta = codexUsageStats(frame)
+    if (Object.keys(usageDelta).length > 0) {
+      stats = { ...stats, ...usageDelta }
+      // Codex reports usage once per turn, so the board updates when a turn
+      // completes rather than token by token (unlike claude's per-message frames).
+      options.onUsage?.({ ...stats })
+    }
     if (frame.type === 'turn.completed') {
       turnStatus = 'completed'
       // Some builds emit top-level errors during reconnects. A subsequent

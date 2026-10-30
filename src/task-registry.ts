@@ -36,6 +36,15 @@ export interface MaestroTask {
   error: string | undefined
   finalText: string | undefined
   stats: Record<string, string | number | boolean> | undefined
+  /**
+   * Running usage snapshot, replaced frame by frame while the CLI streams.
+   *
+   * Deliberately separate from `stats`: `stats` is the settled record (and
+   * `accumulateAttemptStats` sums retries into it), so writing live numbers
+   * there would double-count them the moment the run settles. The summary
+   * falls back to this only while `stats` is still undefined.
+   */
+  liveStats: Record<string, string | number | boolean> | undefined
   readonly events: MaestroTaskEvent[]
   /** Next event sequence (events are 1-based). */
   cursor: number
@@ -72,6 +81,7 @@ export class TaskRegistry {
       error: undefined,
       finalText: undefined,
       stats: undefined,
+      liveStats: undefined,
       events: [],
       cursor: 0,
       truncated: false,
@@ -128,6 +138,15 @@ export class TaskRegistry {
   }
 
   /**
+   * Replace the running usage snapshot (called on every CLI frame that carries
+   * counts). The object is copied so a channel reusing its own accumulator
+   * cannot mutate what the board already rendered.
+   */
+  setLiveStats(task: MaestroTask, stats: Record<string, string | number | boolean>): void {
+    task.liveStats = { ...stats }
+  }
+
+  /**
    * Seed one finished task from a persisted record (boot-time history, see
    * `persist.ts`). Skips live phases, duplicate ids and empty records; restored
    * tasks age out through the normal prune once live dispatches fill the cap.
@@ -165,6 +184,7 @@ export class TaskRegistry {
       error: record.error,
       finalText: record.finalText,
       stats: record.stats,
+      liveStats: undefined,
       events: [],
       cursor: 0,
       truncated: record.truncated === true,
@@ -203,7 +223,8 @@ export class TaskRegistry {
   }
 
   summaryOf(task: MaestroTask): MaestroTaskSummary {
-    const usage = tokenUsageOfStats(task.stats)
+    // Settled numbers win; the live snapshot is only a stand-in while running.
+    const usage = tokenUsageOfStats(task.stats ?? task.liveStats)
     return {
       id: task.id,
       cli: task.cli,

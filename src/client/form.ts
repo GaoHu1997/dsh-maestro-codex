@@ -39,8 +39,6 @@ export interface SectionValue {
   bridgeMcp?: boolean
   /** Persist settled dispatch results under $DSH_HOME/maestro/tasks. */
   persistTasks?: boolean
-  /** Mirror dispatched runs into the host jobs service (dsh 任务页). */
-  mirrorAsJob?: boolean
   /** Prepend a read-only git branch/status snapshot to the child's task text. */
   injectGitContext?: boolean
   /** Automatic re-runs after a plain failure (0–2). */
@@ -64,7 +62,6 @@ export type ImmediateField =
   | 'claudeTaskTypes' | 'codexTaskTypes'
   | 'bridgeMcp'
   | 'persistTasks'
-  | 'mirrorAsJob'
   | 'injectGitContext'
 
 /** Fields staged as text and committed on save. */

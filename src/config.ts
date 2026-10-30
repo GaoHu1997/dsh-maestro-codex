@@ -75,7 +75,6 @@ export const CONFIG_DEFAULTS = {
   npmRegistry: '',
   maxConcurrentTasks: 2,
   persistTasks: true,
-  mirrorAsJob: true,
   injectGitContext: true,
   failureRetries: 0,
 } as const
@@ -114,8 +113,6 @@ export interface Config {
   maxConcurrentTasks?: Volatile<number> | number
   /** Persist settled dispatch results under $DSH_HOME/maestro/tasks (default on). */
   persistTasks?: Volatile<boolean> | boolean
-  /** Mirror dispatched runs into the host jobs service (dsh 任务页可见/可终止). */
-  mirrorAsJob?: Volatile<boolean> | boolean
   /** Prepend a read-only git branch/status snapshot to the child's task text. */
   injectGitContext?: Volatile<boolean> | boolean
   /** Automatic re-runs after a plain failure (not timeout/cancel); 0–2, default 0. */
@@ -157,7 +154,6 @@ export const Config: z = z.object({
   npmRegistry: z.string().default(CONFIG_DEFAULTS.npmRegistry).volatile(),
   maxConcurrentTasks: z.number().default(CONFIG_DEFAULTS.maxConcurrentTasks).volatile(),
   persistTasks: z.boolean().default(CONFIG_DEFAULTS.persistTasks).volatile(),
-  mirrorAsJob: z.boolean().default(CONFIG_DEFAULTS.mirrorAsJob).volatile(),
   injectGitContext: z.boolean().default(CONFIG_DEFAULTS.injectGitContext).volatile(),
   failureRetries: z.number().default(CONFIG_DEFAULTS.failureRetries).volatile(),
 })
@@ -281,8 +277,6 @@ export interface EffectiveConfig {
   maxConcurrentTasks: number
   /** Persist settled dispatch results under $DSH_HOME/maestro/tasks. */
   persistTasks: boolean
-  /** Mirror dispatched runs into the host jobs service (dsh 任务页). */
-  mirrorAsJob: boolean
   /** Prepend a read-only git snapshot to the child's task text. */
   injectGitContext: boolean
   /** Automatic re-runs after a plain failure; 0 disables (default). */
@@ -342,7 +336,6 @@ export function effectiveOf(config: Config): EffectiveConfig {
     npmRegistry: readVolatile(config.npmRegistry) ?? '',
     maxConcurrentTasks: readVolatile(config.maxConcurrentTasks) ?? CONFIG_DEFAULTS.maxConcurrentTasks,
     persistTasks: readVolatile(config.persistTasks) ?? CONFIG_DEFAULTS.persistTasks,
-    mirrorAsJob: readVolatile(config.mirrorAsJob) ?? CONFIG_DEFAULTS.mirrorAsJob,
     injectGitContext: readVolatile(config.injectGitContext) ?? CONFIG_DEFAULTS.injectGitContext,
     failureRetries: readVolatile(config.failureRetries) ?? CONFIG_DEFAULTS.failureRetries,
     bridgeMcp: readVolatile(config.bridgeMcp) ?? CONFIG_DEFAULTS.bridgeMcp,
