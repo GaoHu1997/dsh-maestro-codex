@@ -6,6 +6,7 @@ lib/
 pnpm-lock.yaml
 pnpm-workspace.yaml
 dist/
+!src/client/board/upstream/vendor/**/dist/
 src/client/board/upstream/.types/
 upstream-migration/
 scripts/import-task-renderer.mjs
