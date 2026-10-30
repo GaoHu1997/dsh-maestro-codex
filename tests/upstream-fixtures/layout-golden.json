@@ -1,0 +1,553 @@
+{
+  "repository": "https://github.com/omdsh-dev/DSH-better-sidebar",
+  "version": "0.28.2",
+  "layoutSourceSha256": "8722b7ff8f5ee463f4cea9315992a57127d4f1b6d2a028612457bf7c274fa492",
+  "cases": [
+    {
+      "name": "single root, 360px",
+      "width": 360,
+      "nodes": [
+        {
+          "kind": "agent",
+          "id": "root",
+          "label": "root",
+          "state": "running",
+          "activity": "running",
+          "current": true,
+          "depth": 0
+        }
+      ],
+      "expected": {
+        "boxes": [
+          {
+            "id": "root",
+            "x": 16,
+            "y": 16,
+            "w": 190,
+            "h": 87
+          }
+        ],
+        "width": 222,
+        "height": 119
+      }
+    },
+    {
+      "name": "five siblings with live text, 360px",
+      "width": 360,
+      "nodes": [
+        {
+          "kind": "agent",
+          "id": "root",
+          "label": "root",
+          "state": "running",
+          "activity": "running",
+          "current": true,
+          "depth": 0
+        },
+        {
+          "kind": "agent",
+          "id": "worker-0",
+          "label": "worker-0",
+          "state": "running",
+          "activity": "running",
+          "current": false,
+          "depth": 1,
+          "parentId": "root"
+        },
+        {
+          "kind": "agent",
+          "id": "worker-1",
+          "label": "worker-1",
+          "state": "running",
+          "activity": "running",
+          "current": false,
+          "depth": 1,
+          "parentId": "root"
+        },
+        {
+          "kind": "agent",
+          "id": "worker-2",
+          "label": "worker-2",
+          "state": "running",
+          "activity": "running",
+          "current": false,
+          "depth": 1,
+          "parentId": "root",
+          "live": {
+            "text": "?????????????????????????????????"
+          }
+        },
+        {
+          "kind": "agent",
+          "id": "worker-3",
+          "label": "worker-3",
+          "state": "running",
+          "activity": "running",
+          "current": false,
+          "depth": 1,
+          "parentId": "root"
+        },
+        {
+          "kind": "agent",
+          "id": "worker-4",
+          "label": "worker-4",
+          "state": "running",
+          "activity": "running",
+          "current": false,
+          "depth": 1,
+          "parentId": "root"
+        }
+      ],
+      "expected": {
+        "boxes": [
+          {
+            "id": "root",
+            "x": 125,
+            "y": 16,
+            "w": 190,
+            "h": 87
+          },
+          {
+            "id": "worker-0",
+            "x": 16,
+            "y": 171,
+            "w": 190,
+            "h": 87
+          },
+          {
+            "id": "worker-1",
+            "x": 234,
+            "y": 171,
+            "w": 190,
+            "h": 87
+          },
+          {
+            "id": "worker-2",
+            "x": 16,
+            "y": 326,
+            "w": 190,
+            "h": 102
+          },
+          {
+            "id": "worker-3",
+            "x": 234,
+            "y": 326,
+            "w": 190,
+            "h": 87
+          },
+          {
+            "id": "worker-4",
+            "x": 125,
+            "y": 481,
+            "w": 190,
+            "h": 87
+          }
+        ],
+        "width": 440,
+        "height": 584
+      }
+    },
+    {
+      "name": "five siblings with live text, 920px",
+      "width": 920,
+      "nodes": [
+        {
+          "kind": "agent",
+          "id": "root",
+          "label": "root",
+          "state": "running",
+          "activity": "running",
+          "current": true,
+          "depth": 0
+        },
+        {
+          "kind": "agent",
+          "id": "worker-0",
+          "label": "worker-0",
+          "state": "running",
+          "activity": "running",
+          "current": false,
+          "depth": 1,
+          "parentId": "root"
+        },
+        {
+          "kind": "agent",
+          "id": "worker-1",
+          "label": "worker-1",
+          "state": "running",
+          "activity": "running",
+          "current": false,
+          "depth": 1,
+          "parentId": "root"
+        },
+        {
+          "kind": "agent",
+          "id": "worker-2",
+          "label": "worker-2",
+          "state": "running",
+          "activity": "running",
+          "current": false,
+          "depth": 1,
+          "parentId": "root",
+          "live": {
+            "text": "?????????????????????????????????"
+          }
+        },
+        {
+          "kind": "agent",
+          "id": "worker-3",
+          "label": "worker-3",
+          "state": "running",
+          "activity": "running",
+          "current": false,
+          "depth": 1,
+          "parentId": "root"
+        },
+        {
+          "kind": "agent",
+          "id": "worker-4",
+          "label": "worker-4",
+          "state": "running",
+          "activity": "running",
+          "current": false,
+          "depth": 1,
+          "parentId": "root"
+        }
+      ],
+      "expected": {
+        "boxes": [
+          {
+            "id": "root",
+            "x": 343,
+            "y": 16,
+            "w": 190,
+            "h": 87
+          },
+          {
+            "id": "worker-0",
+            "x": 16,
+            "y": 171,
+            "w": 190,
+            "h": 87
+          },
+          {
+            "id": "worker-1",
+            "x": 234,
+            "y": 171,
+            "w": 190,
+            "h": 87
+          },
+          {
+            "id": "worker-2",
+            "x": 452,
+            "y": 171,
+            "w": 190,
+            "h": 102
+          },
+          {
+            "id": "worker-3",
+            "x": 670,
+            "y": 171,
+            "w": 190,
+            "h": 87
+          },
+          {
+            "id": "worker-4",
+            "x": 343,
+            "y": 326,
+            "w": 190,
+            "h": 87
+          }
+        ],
+        "width": 876,
+        "height": 429
+      }
+    },
+    {
+      "name": "workflow, task row and idle aggregate, 360px",
+      "width": 360,
+      "nodes": [
+        {
+          "kind": "agent",
+          "id": "root",
+          "label": "root",
+          "state": "running",
+          "activity": "running",
+          "current": true,
+          "depth": 0
+        },
+        {
+          "kind": "workflow",
+          "id": "workflow:1",
+          "parentId": "root",
+          "depth": 1,
+          "run": {
+            "runId": "1",
+            "name": "Review pipeline",
+            "originSessionId": "root",
+            "status": "running",
+            "phases": [
+              {
+                "title": "Review",
+                "members": [
+                  {
+                    "seq": 2,
+                    "label": "Review",
+                    "childId": "review",
+                    "outcome": "completed"
+                  }
+                ]
+              }
+            ],
+            "startedSeq": 1,
+            "startedAt": 1
+          }
+        },
+        {
+          "kind": "agent",
+          "id": "review",
+          "label": "review",
+          "state": "done",
+          "activity": "inactive",
+          "current": false,
+          "depth": 2,
+          "parentId": "workflow:1",
+          "phase": {
+            "key": "review",
+            "index": 0,
+            "title": "Review"
+          }
+        },
+        {
+          "kind": "agent",
+          "id": "test",
+          "label": "test",
+          "state": "running",
+          "activity": "running",
+          "current": false,
+          "depth": 2,
+          "parentId": "workflow:1",
+          "tasks": [
+            {
+              "id": "T1",
+              "subject": "Regression checks",
+              "status": "in_progress",
+              "ready": true
+            }
+          ],
+          "team": {
+            "role": "teammate",
+            "name": "test",
+            "phase": "active",
+            "status": "running",
+            "diagnostics": []
+          }
+        },
+        {
+          "kind": "fold",
+          "foldKind": "idle",
+          "id": "fold:root:idle",
+          "parentId": "root",
+          "depth": 1,
+          "count": 3,
+          "doneCount": 0,
+          "idleCount": 3,
+          "errorCount": 0,
+          "memberIds": [
+            "idle-1",
+            "idle-2",
+            "idle-3"
+          ],
+          "previews": [
+            "idle-1",
+            "idle-2"
+          ]
+        }
+      ],
+      "expected": {
+        "boxes": [
+          {
+            "id": "root",
+            "x": 16,
+            "y": 16,
+            "w": 190,
+            "h": 87
+          },
+          {
+            "id": "workflow:1",
+            "x": 16,
+            "y": 174,
+            "w": 190,
+            "h": 103
+          },
+          {
+            "id": "review",
+            "x": 16,
+            "y": 332,
+            "w": 190,
+            "h": 87
+          },
+          {
+            "id": "test",
+            "x": 16,
+            "y": 490,
+            "w": 190,
+            "h": 105
+          },
+          {
+            "id": "fold:root:idle",
+            "x": 16,
+            "y": 648,
+            "w": 190,
+            "h": 103
+          }
+        ],
+        "width": 222,
+        "height": 767
+      }
+    },
+    {
+      "name": "workflow, task row and idle aggregate, 920px",
+      "width": 920,
+      "nodes": [
+        {
+          "kind": "agent",
+          "id": "root",
+          "label": "root",
+          "state": "running",
+          "activity": "running",
+          "current": true,
+          "depth": 0
+        },
+        {
+          "kind": "workflow",
+          "id": "workflow:1",
+          "parentId": "root",
+          "depth": 1,
+          "run": {
+            "runId": "1",
+            "name": "Review pipeline",
+            "originSessionId": "root",
+            "status": "running",
+            "phases": [
+              {
+                "title": "Review",
+                "members": [
+                  {
+                    "seq": 2,
+                    "label": "Review",
+                    "childId": "review",
+                    "outcome": "completed"
+                  }
+                ]
+              }
+            ],
+            "startedSeq": 1,
+            "startedAt": 1
+          }
+        },
+        {
+          "kind": "agent",
+          "id": "review",
+          "label": "review",
+          "state": "done",
+          "activity": "inactive",
+          "current": false,
+          "depth": 2,
+          "parentId": "workflow:1",
+          "phase": {
+            "key": "review",
+            "index": 0,
+            "title": "Review"
+          }
+        },
+        {
+          "kind": "agent",
+          "id": "test",
+          "label": "test",
+          "state": "running",
+          "activity": "running",
+          "current": false,
+          "depth": 2,
+          "parentId": "workflow:1",
+          "tasks": [
+            {
+              "id": "T1",
+              "subject": "Regression checks",
+              "status": "in_progress",
+              "ready": true
+            }
+          ],
+          "team": {
+            "role": "teammate",
+            "name": "test",
+            "phase": "active",
+            "status": "running",
+            "diagnostics": []
+          }
+        },
+        {
+          "kind": "fold",
+          "foldKind": "idle",
+          "id": "fold:root:idle",
+          "parentId": "root",
+          "depth": 1,
+          "count": 3,
+          "doneCount": 0,
+          "idleCount": 3,
+          "errorCount": 0,
+          "memberIds": [
+            "idle-1",
+            "idle-2",
+            "idle-3"
+          ],
+          "previews": [
+            "idle-1",
+            "idle-2"
+          ]
+        }
+      ],
+      "expected": {
+        "boxes": [
+          {
+            "id": "root",
+            "x": 234,
+            "y": 16,
+            "w": 190,
+            "h": 87
+          },
+          {
+            "id": "workflow:1",
+            "x": 125,
+            "y": 174,
+            "w": 190,
+            "h": 103
+          },
+          {
+            "id": "review",
+            "x": 16,
+            "y": 332,
+            "w": 190,
+            "h": 87
+          },
+          {
+            "id": "test",
+            "x": 234,
+            "y": 332,
+            "w": 190,
+            "h": 105
+          },
+          {
+            "id": "fold:root:idle",
+            "x": 452,
+            "y": 174,
+            "w": 190,
+            "h": 103
+          }
+        ],
+        "width": 658,
+        "height": 453
+      }
+    }
+  ]
+}

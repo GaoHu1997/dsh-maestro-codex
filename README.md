@@ -16,12 +16,12 @@ dsh 的 CLI 子代理编排插件：把会话中的任务按类型派发给 **co
 - **思考等级**：档位**来自所选 dsh 模型自身配置的 `reasoningEfforts`**（llm-pi-ai 模型条目），不写死——选了模型，思考等级下拉就列该模型声明的档位（如 off / low / medium / high）；未选模型或模型未声明时只能保持默认。claude 经 `MAX_THINKING_TOKENS` 传参（off/none→0，low/medium/high→4k/10k/32k，未映射的档位忽略）；codex 经 `-c model_reasoning_effort` 原样传参（codex 不认的档位如 off 自动跳过），与「-c 覆盖项」同时设置时覆盖项优先。
 - **CLI 管理**：配置页检测版本、按版本安装/卸载（npm -g：`@anthropic-ai/claude-code`、`@openai/codex`），版本列表只列正式版并标注当前平台，支持自定义 registry。
 - **任务监视**：只记录 `dispatch_cli_task` 派发的子代理任务（带 CLI 徽标，与主会话自己执行的工作区分开）；进度事件流、取消、超时（每 CLI 可配）、并发上限。
-- **任务看板**：装了 [dsh-better-sidebar](https://github.com/GaoHu1997/dsh-better-sidebar) 时，右侧栏多一个「任务看板」tab，把 **DSH 主任务 / 子代理 / CLI 子代理 / 后台任务** 折成**一棵树**：会话树是骨架，CLI 子代理与后台作业按归属会话挂成子节点。默认「图」视图——父在上、子横排、带间连线，像 better-sidebar 的 Tasks 树；底栏可切「树」缩进视图。点节点开「节点详情」（状态 / 模式 / Token / 耗时 + 打开会话 / 查看转录 / 取消 / 终止），浮层贴着被点的那个节点。已结束的兄弟节点自动收成一行「已完成 N」（chip 里点名成员，失败的不收），点「展开」放回去。顶部「全部 / 运行中 / 已结束 / 失败」筛选带计数。CLI 任务与会话树隔离——只显示当前会话及其子会话派发的任务（配置页安装 CLI 的 npm 任务不属于任何会话，始终可见）。数据全部来自客户端已有 feed（`ctx.sessions.list`、`ctx.jobs`、本插件的 `/tasks` 路由），不额外增加 host 侧接口。
+- **任务看板**：装了 [dsh-better-sidebar](https://github.com/omdsh-dev/DSH-better-sidebar) 时，右侧栏多一个「任务看板」tab。直接移植该项目 **0.28.2 原版任务管理**：真实分层图、SVG 曲线、点阵背景、缩放/拖动/适配、图/树切换、两段式卡片、自动折叠、原版详情浮层与后台任务抽屉，源码与 CSS 有逐字节/等价测试。仅在数据桥接层加入 CLI 子代理：按所属会话挂接、外部目录去重、阶段/耗时/Token/转录/取消，继续使用既有路由；不再使用旧的纵向缩进图与额外筛选栏。页头 CLI chip、`maestroCliUsage` 用量投影、会话隔离和后台作业输出游标语义保持不变。详见 [任务板说明](docs/task-board.md)。
 - **用量与请求记录**：每次 CLI 调用结束（成功、失败都算）向所属会话追加一条 `maestro/cli-usage` 事件，并注册同名 session projection（`maestroCliUsage`）。dsh 与其他插件可从 `projectionsBySession[sessionId].values.maestroCliUsage` 读到累计请求数、输入/输出/缓存 token、总耗时与最近 20 次调用的明细（CLI、模型、阶段、退出码、token、错误）。配置页「任务监视」顶部有按此折出的**近 7 天用量统计**（调用/成功/失败、四类 token、总耗时、按 CLI 分布、最近调用）。不伪造 `assistant/message`，所以不会污染对话 surface，也不会改写主模型的用量账本。
 - **任务结果落盘**：每次派发结算后，把任务摘要、最终文本与事件尾（最近 200 条）写入 `$DSH_HOME/maestro/tasks/<taskId>.json`（最多保留 200 条，可在「调度设置」关闭）。插件启动时把最近 40 条读回来种进任务表——重启后「任务监视」仍能翻看历史结果与转录。
 - **会话续接（resume）**：工具支持 `resume` 参数，传上次结果里的 sessionRef（claude 的 session id / codex 的 thread id），同一次协作可以在原会话上多轮往返（claude `--resume`、codex `exec resume`）；原会话对话不会自动带入，需要的结论要写进 task。
-- **任务镜像与拓扑可见**：派发的 CLI 任务同步登记进 dsh 的后台任务（`mirrorAsJob`，默认开）——右侧「任务管理」页有运行状态、流式输出、抽屉终止与新任务自动切页；成功结束后还会往父会话补一行 `mode: external` 的子代理目录，拓扑树里多一个 ✓ 节点。服务缺席或超限时静默降级为普通派发，工具返回不变。
-- **派发上下文与韧性**：派发前可自动把 cwd 的 git 工作区快照（分支/未提交改动，只读）拼进任务开头（`injectGitContext`，默认开）；剩余约 1/5 时长（至多 2 分钟）时在事件流里预警超时；普通失败可配置自动重试（`failureRetries`，0–2，默认 0——会改文件的任务建议保持 0，超时与手动取消永不重试）。
+- **任务镜像与拓扑可见**：派发的 CLI 任务同步登记进 dsh 的后台任务（`mirrorAsJob`，默认开）——右侧「任务管理」页有运行状态、流式输出、抽屉终止与新任务自动切页；派发开始时就会往父会话补一行 `mode: external` 的子代理目录（不等结束），拓扑树与页头计数里立刻多一个节点。服务缺席或超限时静默降级为普通派发，工具返回不变。
+- **派发上下文与韧性**：派发前可自动把 cwd 的 git 工作区快照（分支/未提交改动，只读）拼进任务开头（`injectGitContext`，默认开）；CLI 超时指连续无 stdout/stderr 非空输出分片的时长（`timeout_minutes`，1–240 分钟，不是总运行时长），每个真实输出分片重置计时；这是无输出保护，不判断任务语义进展。无输出窗口剩余约 1/5（至多 2 分钟）时在事件流预警，恢复输出也重置预警；版本检测、npm 等一般进程仍按总时长超时；普通失败可配置自动重试（`failureRetries`，0–2，默认 0——会改文件的任务建议保持 0，超时与手动取消永不重试）。
 
 ## 执行方式
 

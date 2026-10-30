@@ -1,0 +1,20 @@
+{
+  "extends": "./tsconfig.client.json",
+  "compilerOptions": {
+    "exactOptionalPropertyTypes": false,
+    "noEmit": false,
+    "declaration": true,
+    "emitDeclarationOnly": true,
+    "rootDir": "src/client/board/upstream",
+    "outDir": "src/client/board/upstream/.types"
+  },
+  "include": [
+    "src/client/board/upstream/client/**/*.ts",
+    "src/client/board/upstream/client/**/*.tsx",
+    "src/client/board/upstream/context-types.ts",
+    "src/client/board/upstream/workflow-runs.ts",
+    "src/client/board/upstream/process-activity.ts",
+    "src/client/board/upstream/host-ui-primitives.d.ts"
+  ],
+  "exclude": ["src/client/board/upstream/.types/**"]
+}

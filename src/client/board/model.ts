@@ -89,7 +89,15 @@ export type BoardNodeKind = 'agent' | 'cli' | 'job' | 'fold'
 export interface BoardNode {
   readonly kind: BoardNodeKind
   readonly id: string
+  /** 一行标题：子代理的任务描述 / 会话标题 / CLI 任务名 / 作业名。 */
   readonly title: string
+  /**
+   * 标题的补充说明（卡片第二行）。
+   *
+   * 子代理的目录 label 是「这个子代理去做什么」，displayTitle 往往是被截断的
+   * 对话首句；两者都有时把 label 当标题、displayTitle 降到这里当描述。
+   */
+  readonly subtitle?: string
   /** 根会话还是子代理。 */
   readonly depth: number
   readonly running: boolean
@@ -210,10 +218,20 @@ export function buildSessionTree(input: TreeInput): BoardNode {
       return build(ref.id, depth + 1, child, ref.mode)
     })
     visiting.delete(id)
+    /* 子代理节点优先用目录 label：那是宿主在创建时拿到的“任务描述”
+     * （工具参数 description），比被截断的对话首句更像一个任务名。根会话
+     * 没有目录行，继续用 displayTitle。两者都有时 displayTitle 退成描述。 */
+    const label = labelById.get(id)
+    const title = label ?? session?.displayTitle ?? id
+    // 目录里的 label 是任务描述，displayTitle 只是对话开头；两者相同就别重复。
+    const subtitle = label !== undefined && session !== undefined && session.displayTitle !== label
+      ? session.displayTitle
+      : undefined
     return {
       kind: 'agent',
       id,
-      title: session?.displayTitle ?? labelOf(id, session, labelById),
+      title,
+      ...(subtitle === undefined || subtitle === '' ? {} : { subtitle }),
       depth,
       running: session?.running === true,
       hasSession: session !== undefined,
@@ -229,12 +247,6 @@ export function buildSessionTree(input: TreeInput): BoardNode {
   if (rootSession !== undefined) return root
   // 根会话还没出现在 feed 里（刚打开/正在加载）：仍然给出一张可渲染的根。
   return { ...root, title: '当前会话', status: 'idle' }
-}
-
-/** 幽灵节点取名：会话标题优先，否则用目录里那条 label（已建好的索引）。 */
-function labelOf(id: string, session: BoardSession | undefined, labelById: ReadonlyMap<string, string>): string {
-  if (session !== undefined) return session.displayTitle
-  return labelById.get(id) ?? id
 }
 
 /** 把树按先序摊平成带缩进的行（`depth` 按实际位置重算：挂上来的行原本没有深度）。 */
@@ -304,10 +316,19 @@ function quiet(node: BoardNode): boolean {
 
 /** 一个折叠组（把同层已结束的兄弟收成一行）。 */
 function foldNode(id: string, parentId: string, members: readonly BoardNode[]): BoardNode {
+  const first = members[0]
+  const rest = members.length - 1
   return {
     kind: 'fold',
     id,
-    title: `已完成 ${String(members.length)}`,
+    /* 折叠组不是一个“任务”，标题用组内第一件事，数量放进副标题/徽标：
+     * 截图里的折叠卡就是「✓ 1 已完成 / 复核同步配置的保存边界」。 */
+    title: first?.title ?? `已完成 ${String(members.length)}`,
+    ...(rest > 0
+      ? { subtitle: `还有 ${String(rest)} 个已完成节点` }
+      : first?.subtitle === undefined || first.subtitle === ''
+        ? {}
+        : { subtitle: first.subtitle }),
     depth: 0,
     running: false,
     hasSession: false,
@@ -397,6 +418,14 @@ export const JOB_NODE_PREFIX = 'job:'
 /** 挂载到树上的外部行（CLI 任务）。 */
 export interface AttachInput {
   readonly tasks?: readonly MaestroTaskSummary[]
+  /**
+   * 任务 id → 已结算的 token 用量。
+   *
+   * CLI 不是本地会话，宿主的 `tokenUsage` 投影里没有它；这些数字来自本插件
+   * 自己的 `maestroCliUsage` 投影（`src/usage.ts`），由看板按 taskId 挂上来。
+   * 只覆盖已经结束并上报过用量的任务，运行中的行没有这一项。
+   */
+  readonly usage?: Readonly<Record<string, BoardTokenUsage | undefined>>
 }
 
 /**
@@ -423,14 +452,24 @@ export function attachRows(root: BoardNode, input: AttachInput): BoardNode {
     const owner = task.sessionId === undefined || task.sessionId === '' ? root.id : task.sessionId
     if (!known.has(owner)) continue
     const bucket = taskNodes.get(owner) ?? []
-    bucket.push(cliNode(task))
+    bucket.push(cliNode(task, input.usage?.[task.id]))
     taskNodes.set(owner, bucket)
   }
   if (taskNodes.size === 0) return root
 
   const walk = (node: BoardNode): BoardNode => {
     const extra = taskNodes.get(node.id)
-    const children = node.children.map(walk)
+    // Native catalog mirrors use cli-${taskId}; older rows used taskId itself.
+    // Match only this owner's direct, session-less external rows, never sessions.
+    const mirroredIds = new Set<string>()
+    for (const row of extra ?? []) {
+      if (row.task === undefined) continue
+      mirroredIds.add(row.task.id)
+      mirroredIds.add(`cli-${row.task.id}`)
+    }
+    const children = node.children.filter(child =>
+      child.mode !== 'external' || child.hasSession || !mirroredIds.has(child.id),
+    ).map(walk)
     if (extra === undefined && children.every((child, index) => child === node.children[index])) return node
     return { ...node, children: [...children, ...(extra ?? [])] }
   }
@@ -438,7 +477,8 @@ export function attachRows(root: BoardNode, input: AttachInput): BoardNode {
 }
 
 /** 一个 CLI 子代理任务节点（叶子：它的日志在行内展开）。 */
-export function cliNode(task: MaestroTaskSummary): BoardNode {
+export function cliNode(task: MaestroTaskSummary, tokens?: BoardTokenUsage): BoardNode {
+  tokens = task.usage ?? tokens
   return {
     kind: 'cli',
     id: `${CLI_NODE_PREFIX}${task.id}`,
@@ -447,6 +487,7 @@ export function cliNode(task: MaestroTaskSummary): BoardNode {
     running: task.phase === 'running' || task.phase === 'queued',
     hasSession: false,
     status: cliStatusOf(task.phase),
+    ...(tokens === undefined ? {} : { tokens }),
     task,
     children: [],
   }

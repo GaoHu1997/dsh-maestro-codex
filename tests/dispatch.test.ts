@@ -509,6 +509,82 @@ describe('model resolution order', () => {
 })
 
 describe('usage reporting', () => {
+  it.each([
+    ['codex', 'failed'], ['codex', 'timeout'], ['codex', 'cancelled'],
+    ['claude', 'failed'], ['claude', 'timeout'], ['claude', 'cancelled'],
+  ] as const)('preserves received %s usage and recovery ref after %s', async (channel, ending) => {
+    vi.useFakeTimers()
+    try {
+      const cli = scriptedSpawn(child => {
+        child.pid = undefined as unknown as number
+        if (child.spawnArgs[0] === '--version') { child.finish('version 1.0'); return }
+        child.onStdin = () => {
+          const frames = channel === 'codex'
+            ? [
+                { type: 'thread.started', thread_id: 'recover-1' },
+                { type: 'turn.failed', error: { message: 'real failure' }, usage: { input_tokens: 18, cached_input_tokens: 7, output_tokens: 5 } },
+              ]
+            : [
+                { type: 'system', subtype: 'init', session_id: 'recover-1' },
+                { type: 'result', is_error: true, result: 'real failure', usage: { input_tokens: 11, cache_read_input_tokens: 7, output_tokens: 5, cache_creation_input_tokens: 3 } },
+              ]
+          const output = frames.map(frame => JSON.stringify(frame)).join('\n') + '\n'
+          if (ending === 'failed') child.finish(output, 1)
+          else queueMicrotask(() => child.stdout.emit('data', Buffer.from(output)))
+        }
+      })
+      const { deps, registry } = makeDeps(fixture({ injectGitContext: false }), cli.spawnFn)
+      const append = vi.fn()
+      const persist = vi.fn()
+      deps.persist = persist
+      const controller = new AbortController()
+      const run = runDispatch(deps, {
+        ...assessment, cli: channel, task: 'x', timeoutMinutes: 1, usageSession: { append },
+      }, controller.signal)
+      // Attach rejection handling before advancing the fake clock.
+      const settled = run.then(value => value, error => error)
+      await vi.advanceTimersByTimeAsync(0)
+      if (ending === 'timeout') await vi.advanceTimersByTimeAsync(60_000)
+      if (ending === 'cancelled') { controller.abort(); await vi.advanceTimersByTimeAsync(0) }
+      expect(await settled).toBeInstanceOf(Error)
+      const phase = ending === 'cancelled' ? 'cancelled' : ending === 'timeout' ? 'timeout' : 'failed'
+      const stats = { inputTokens: 11, cachedInputTokens: 7, outputTokens: 5, sessionRef: 'recover-1' }
+      expect(registry.get(registry.list()[0]!.id)).toMatchObject({ phase, stats })
+      if (ending === 'timeout') expect(registry.get(registry.list()[0]!.id)?.stats?.['timedOut']).toBe(true)
+      expect(append).toHaveBeenCalledTimes(1)
+      expect(append).toHaveBeenCalledWith(CLI_USAGE_EVENT, expect.objectContaining({ phase, inputTokens: 11, cachedInputTokens: 7, outputTokens: 5 }))
+      expect(persist).toHaveBeenCalledTimes(1)
+      expect(persist).toHaveBeenCalledWith(expect.objectContaining({ phase, stats: expect.objectContaining(stats) }))
+      expect(vi.getTimerCount()).toBe(0)
+    } finally { vi.useRealTimers() }
+  })
+
+  it.each([true, false])('accumulates failed-attempt costs when the final retry succeeds=%s', async succeeds => {
+    let attempt = 0
+    const cli = scriptedSpawn(child => {
+      if (child.spawnArgs[0] === '--version') { child.finish('version 1.0'); return }
+      attempt += 1
+      const ok = succeeds && attempt === 2
+      child.finish(JSON.stringify({
+        type: 'result', is_error: !ok, session_id: `s${attempt}`, num_turns: attempt,
+        result: ok ? 'done' : 'failed', duration_ms: attempt * 10, total_cost_usd: attempt / 10,
+        usage: { input_tokens: attempt * 11, output_tokens: attempt * 5, cache_read_input_tokens: attempt * 7, cache_creation_input_tokens: attempt * 3 },
+      }), ok ? 0 : 1)
+    })
+    const { deps, registry } = makeDeps(fixture({ failureRetries: 1, injectGitContext: false }), cli.spawnFn)
+    const append = vi.fn()
+    const run = runDispatch(deps, { ...assessment, cli: 'claude', task: 'x', usageSession: { append } }, new AbortController().signal)
+    if (succeeds) expect((await run).ok).toBe(true)
+    else await expect(run).rejects.toThrow()
+    expect(attempt).toBe(2)
+    expect(registry.get(registry.list()[0]!.id)?.stats).toMatchObject({
+      inputTokens: 33, outputTokens: 15, cachedInputTokens: 21, cacheWriteTokens: 9,
+      sessionId: 's2', sessionRef: 's2', turns: 2, cliDurationMs: 20,
+    })
+    expect(registry.get(registry.list()[0]!.id)?.stats?.['costUsd']).toBeCloseTo(0.3)
+    expect(append).toHaveBeenCalledWith(CLI_USAGE_EVENT, expect.objectContaining({ inputTokens: 33, outputTokens: 15, cachedInputTokens: 21, cacheWriteTokens: 9 }))
+  })
+
   it('appends one usage event with the settled stats', async () => {
     const cli = fakeCliSpawn(true)
     const { deps } = makeDeps(fixture(), cli.spawnFn)

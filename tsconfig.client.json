@@ -12,7 +12,20 @@
     "forceConsistentCasingInFileNames": true,
     "skipLibCheck": true,
     "noEmit": true,
-    "types": ["node"]
+    "types": ["node"],
+    "allowImportingTsExtensions": true,
+    "paths": {
+      "clsx": ["./src/client/board/upstream/vendor/clsx/clsx.d.mts"],
+      "@formkit/auto-animate": ["./src/client/board/upstream/vendor/auto-animate/index.d.ts"]
+    }
   },
-  "include": ["src/client/**/*.ts", "src/client/**/*.tsx", "src/wire.ts"]
+  "include": ["src/client/**/*.ts", "src/client/**/*.tsx", "src/wire.ts"],
+  "exclude": [
+    "src/client/board/upstream/client/**",
+    "src/client/board/upstream/vendor/**",
+    "src/client/board/upstream/context-types.ts",
+    "src/client/board/upstream/workflow-runs.ts",
+    "src/client/board/upstream/process-activity.ts",
+    "src/client/board/upstream/sidechat-core.ts"
+  ]
 }

@@ -114,6 +114,15 @@ describe('tool schemas', () => {
     expect(() => assertSupportedJsonSchema(TOOL_PARAMETER_SCHEMA, 'schema')).not.toThrow()
   })
 
+  it('describes CLI timeout as an output-idle guard, not a total runtime limit', () => {
+    const description = TOOL_PARAMETER_SCHEMA.properties.timeout_minutes.description
+    expect(description).toContain('连续无 stdout/stderr 输出')
+    expect(description).toContain('不是总运行时长')
+    expect(description).toContain('非空输出分片重置')
+    expect(description).toContain('不代表任务语义进展')
+    expect(description).toContain('1–240')
+  })
+
   it('rejects the legacy per-property `required: true` form', () => {
     const legacy = { type: 'object', properties: { ok: { type: 'boolean', required: true } } }
     expect(() => assertSupportedJsonSchema(legacy, 'schema'))
@@ -365,12 +374,30 @@ describe('usage reporting seam', () => {
       { signal: new AbortController().signal, agent: { id: 'session-1', session } },
     )
     expect(value.ok).toBe(true)
-    // 一次成功派发结算两条会话事件：用量记录 + A2 的 external 目录行。
+    // 派发一创建就写 external 目录行，结算时再写用量记录。
     expect(appended).toHaveLength(2)
-    expect(appended[0]?.type).toBe(CLI_USAGE_EVENT)
-    expect(appended[0]?.data).toMatchObject({ cli: 'claude', phase: 'done', sessionId: 'session-1' })
-    expect(appended[1]?.type).toBe('subagent/catalog')
-    expect(appended[1]?.data).toMatchObject({ version: 2, mode: 'external' })
+    expect(appended[0]?.type).toBe('subagent/catalog')
+    expect(appended[0]?.data).toMatchObject({ version: 2, mode: 'external' })
+    expect(appended[1]?.type).toBe(CLI_USAGE_EVENT)
+    expect(appended[1]?.data).toMatchObject({ cli: 'claude', phase: 'done', sessionId: 'session-1' })
+  })
+
+  it('writes the catalog row even when the dispatch later fails', async () => {
+    const readConfig = () => effectiveOf({ claudeCliPath: process.execPath })
+    const child = scriptedSpawn(process => {
+      if (process.spawnArgs[0] === '--version') process.finish('claude version 9.9.9')
+      else process.finish(JSON.stringify({ type: 'result', subtype: 'error', result: '炸了', is_error: true, num_turns: 1 }))
+    })
+    const toolDeps = deps({ readConfig, spawnFn: child.spawnFn, pathCache: new CliPathCache(readConfig, child.spawnFn) })
+    const appended: Array<{ type: string; data: unknown }> = []
+    const session = { append: (type: string, data: unknown) => { appended.push({ type, data }) } }
+    const tool = registeredTool(toolDeps)
+    await expect(tool.execute(
+      { task: '会失败的任务', cli: 'claude', task_difficulty: 'medium', difficulty_reason: '需要实现、测试与回归验证' },
+      { signal: new AbortController().signal, agent: { id: 'session-1', session } },
+    )).rejects.toThrow()
+    // 任务确实跑过：会话顶部的子智能体下拉框要留下这条记录，即便结果是失败。
+    expect(appended.filter(entry => entry.type === 'subagent/catalog')).toHaveLength(1)
   })
 })
 

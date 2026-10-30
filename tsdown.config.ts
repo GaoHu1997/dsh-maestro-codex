@@ -1,5 +1,6 @@
 import { createRequire } from 'node:module'
 import { defineConfig } from 'tsdown'
+import { upstreamCssPlugin } from './scripts/build-upstream-css.mjs'
 
 /**
  * Plugin id stamped into the loader handoff. Derived from package.json so the
@@ -34,6 +35,7 @@ export default defineConfig({
   dts: false,
   clean: false,
   sourcemap: true,
+  plugins: [upstreamCssPlugin()],
   external: [...CLIENT_EXTERNALS],
   noExternal: (id: string) => (CLIENT_EXTERNALS.includes(id) ? undefined : true),
   outputOptions: {

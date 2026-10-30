@@ -140,7 +140,9 @@ export function launchPlan(file: string, args: readonly string[]): LaunchPlan {
  *
  * Abort semantics: `signal` kills the tree immediately (taskkill /T /F on
  * Windows after a short grace kill), `timeoutMs` does the same and reports
- * `timedOut`.
+ * `timedOut`. By default this is a wall-clock deadline (npm/version checks).
+ * CLI channels opt into idle mode: only actual nonempty stdout/stderr chunks
+ * reset the watchdog; this protects against silence, not semantic stagnation.
  */
 export function runProcess(options: {
   spawnFn?: SpawnFn
@@ -150,6 +152,11 @@ export function runProcess(options: {
   env?: Record<string, string> | undefined
   stdin?: string | undefined
   timeoutMs: number
+  /** Defaults to wall-clock; CLI channels explicitly select idle. */
+  timeoutMode?: 'idle' | 'wall-clock'
+  /** Observational only: never counts as child output or resets the watchdog. */
+  onTimeoutWarning?: (remainingMs: number) => void
+  timeoutWarningLeadMs?: number
   signal: AbortSignal
   onStdoutLine?: ((line: string) => void) | undefined
   onStderrLine?: ((line: string) => void) | undefined
@@ -165,12 +172,48 @@ export function runProcess(options: {
   let timedOut = false
   let settled = false
   let stderrTail = ''
-  const timer = setTimeout(() => {
-    timedOut = true
-    void killTree(child)
-  }, options.timeoutMs)
+  let stopping = false
+  let timeoutTimer: ReturnType<typeof setTimeout> | undefined
+  let warningTimer: ReturnType<typeof setTimeout> | undefined
+  const clearTimers = (): void => {
+    if (timeoutTimer !== undefined) clearTimeout(timeoutTimer)
+    if (warningTimer !== undefined) clearTimeout(warningTimer)
+    timeoutTimer = undefined
+    warningTimer = undefined
+  }
+  const armTimeout = (): void => {
+    if (settled || stopping) return
+    clearTimers()
+    timeoutTimer = setTimeout(() => {
+      stopping = true
+      timedOut = true
+      clearTimers()
+      void killTree(child)
+    }, options.timeoutMs)
+    const leadMs = Math.min(options.timeoutMs, Math.max(0,
+      options.timeoutWarningLeadMs ?? Math.min(2 * 60_000, Math.round(options.timeoutMs / 5))))
+    if (options.onTimeoutWarning !== undefined && leadMs > 0 && leadMs < options.timeoutMs) {
+      warningTimer = setTimeout(() => {
+        if (settled || stopping) return
+        // A warning is observability, not progress; the deadline stays armed.
+        try { options.onTimeoutWarning?.(leadMs) } catch { /* best effort */ }
+      }, options.timeoutMs - leadMs)
+    }
+  }
+  const activity = (chunk: Buffer): void => {
+    // Count bytes, not parsed lines: stderr, whitespace and partial JSONL all
+    // prove the child wrote output; empty chunks and our own notes do not.
+    if (options.timeoutMode === 'idle' && chunk.length > 0) armTimeout()
+  }
+  child.stdout?.on('data', activity)
+  child.stderr?.on('data', activity)
+  armTimeout()
 
-  const abort = (): void => { void killTree(child) }
+  const abort = (): void => {
+    stopping = true
+    clearTimers()
+    void killTree(child)
+  }
   if (options.signal.aborted) abort()
   else options.signal.addEventListener('abort', abort, { once: true })
 
@@ -232,7 +275,9 @@ export function runProcess(options: {
     const settle = (code: number | null, signal: NodeJS.Signals | null): void => {
       if (settled) return
       settled = true
-      clearTimeout(timer)
+      clearTimers()
+      child.stdout?.removeListener('data', activity)
+      child.stderr?.removeListener('data', activity)
       options.signal.removeEventListener('abort', abort)
       resolvePromise({ code, signal, timedOut, stderrTail })
     }

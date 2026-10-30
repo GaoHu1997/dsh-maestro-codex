@@ -6,7 +6,7 @@
  */
 
 import type { MaestroCliId, MaestroPhase, MaestroTaskEvent, MaestroTaskSummary } from './wire.js'
-import { cleanLogText, MAESTRO_EVENT_KINDS, TERMINAL_PHASES } from './wire.js'
+import { cleanLogText, MAESTRO_EVENT_KINDS, TERMINAL_PHASES, tokenUsageOfStats } from './wire.js'
 
 /** Event ring cap per task — the agent-facing value needs the summary, the UI needs the tail. */
 const EVENTS_CAP = 800
@@ -203,6 +203,7 @@ export class TaskRegistry {
   }
 
   summaryOf(task: MaestroTask): MaestroTaskSummary {
+    const usage = tokenUsageOfStats(task.stats)
     return {
       id: task.id,
       cli: task.cli,
@@ -214,6 +215,7 @@ export class TaskRegistry {
       ...(task.endedAt === undefined ? {} : { endedAt: task.endedAt }),
       ...(task.exitCode === undefined ? {} : { exitCode: task.exitCode }),
       ...(task.endedAt === undefined ? {} : { durationMs: task.endedAt - task.startedAt }),
+      ...(usage === undefined ? {} : { usage }),
       ...(task.truncated ? { truncated: true } : {}),
     }
   }

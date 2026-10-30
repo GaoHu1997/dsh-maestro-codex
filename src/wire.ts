@@ -173,6 +173,29 @@ export interface MaestroCliStatus {
   readonly error?: string
 }
 
+/** Measured CLI usage in four disjoint buckets (never raw inclusive input). */
+export interface MaestroTokenUsage {
+  readonly uncachedInputTokens: number
+  readonly outputTokens: number
+  readonly cacheReadTokens: number
+  readonly cacheWriteTokens: number
+}
+
+/** Unknown statistics stay unknown; no token fields is not a measured zero. */
+export function tokenUsageOfStats(stats: Readonly<Record<string, string | number | boolean>> | undefined): MaestroTokenUsage | undefined {
+  const keys = ['inputTokens', 'outputTokens', 'cachedInputTokens', 'cacheWriteTokens'] as const
+  if (!keys.some(key => {
+    const value = stats?.[key]
+    return typeof value === 'number' && Number.isFinite(value) && value >= 0
+  })) return undefined
+  const count = (key: typeof keys[number]): number => {
+    const value = stats?.[key]
+    return typeof value === 'number' && Number.isFinite(value) ? Math.max(0, Math.round(value)) : 0
+  }
+  return { uncachedInputTokens: count('inputTokens'), outputTokens: count('outputTokens'),
+    cacheReadTokens: count('cachedInputTokens'), cacheWriteTokens: count('cacheWriteTokens') }
+}
+
 /** Task summary as listed in the monitor. */
 export interface MaestroTaskSummary {
   readonly id: string
@@ -186,6 +209,7 @@ export interface MaestroTaskSummary {
   readonly endedAt?: number
   readonly exitCode?: number
   readonly durationMs?: number
+  readonly usage?: MaestroTokenUsage
   /** The event ring dropped older entries: a client must not trust gaps as idle time. */
   readonly truncated?: boolean
 }

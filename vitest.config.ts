@@ -1,9 +1,14 @@
 import { defineConfig } from 'vitest/config'
+import { fileURLToPath } from 'node:url'
+import { upstreamCssPlugin } from './scripts/build-upstream-css.mjs'
 
 export default defineConfig({
-  // 客户端组件按 tsconfig.client.json 的 `jsx: react-jsx` 编译，但根 tsconfig
-  // 不带 jsx 字段，esbuild 会退回 classic 转换并去找 React 全局。单测里显式
-  // 指定 automatic，和真实打包行为保持一致。
+  plugins: [upstreamCssPlugin({ injectIntoEntry: false })],
+  resolve: {
+    alias: {
+      '@deepseek-ai/dsh-client-ui-primitives': fileURLToPath(new URL('./tests/upstream-fixtures/host-ui-primitives.tsx', import.meta.url)),
+    },
+  },
   esbuild: { jsx: 'automatic', jsxImportSource: 'react' },
   test: {
     environment: 'node',

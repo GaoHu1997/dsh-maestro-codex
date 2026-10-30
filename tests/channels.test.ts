@@ -1,7 +1,22 @@
 import { describe, expect, it } from 'vitest'
 import { claudeArgs, claudeEnv, claudeFrameEvents, claudeMcpArgs, claudePermissionArgs, claudeResultOf, lastLines, runClaudeTask } from '../src/channels/claude.js'
-import { codexArgs, codexDshModelArgs, codexEnv, codexFrameEvents, codexSandboxArgs, codexWindowsSandboxArgs, runCodexTask, tomlString } from '../src/channels/codex.js'
+import { codexArgs, codexDshModelArgs, codexEnv, codexFrameEvents, codexSandboxArgs, codexWindowsSandboxArgs, codexUsageStats, runCodexTask, tomlString } from '../src/channels/codex.js'
 import { scriptedSpawn } from './fake-child.js'
+
+describe('channel usage normalization', () => {
+  it('keeps Codex inclusive input and cache reads mutually exclusive', () => {
+    expect(codexUsageStats({ usage: { input_tokens: 100, cached_input_tokens: 70, output_tokens: 9 } }))
+      .toEqual({ inputTokens: 30, cachedInputTokens: 70, outputTokens: 9 })
+    expect(codexUsageStats({ usage: { output_tokens: 9 } })).toEqual({ outputTokens: 9 })
+    expect(codexUsageStats({})).toEqual({})
+  })
+
+  it('keeps real Claude usage even on an error result', () => {
+    expect(claudeResultOf({ type: 'result', is_error: true, usage: {
+      input_tokens: 11, output_tokens: 7, cache_read_input_tokens: 5, cache_creation_input_tokens: 3,
+    } }).stats).toEqual({ inputTokens: 11, outputTokens: 7, cachedInputTokens: 5, cacheWriteTokens: 3 })
+  })
+})
 
 describe('claude argv/env', () => {
   it('builds the headless stream-json argv', () => {

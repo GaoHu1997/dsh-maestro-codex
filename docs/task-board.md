@@ -1,117 +1,85 @@
 # 任务看板（右侧栏 tab）
 
-一个 tab 里同时看三类「正在进行的事」：DSH 会话树（主任务 + 各级子代理）、CLI 子代理（`dispatch_cli_task` 派发）、DSH 后台任务（jobs）。前两者**折成一棵树**——会话树是骨架，CLI 子代理按「归属会话」挂成它的子节点；后台任务**不进树**，单独画在底部的固定高度列表里（占面板总高度的 1/5）。
+## 原版移植
 
-## 座位
+任务界面直接移植自 [DSH-better-sidebar](https://github.com/omdsh-dev/DSH-better-sidebar) **0.28.2**，不再使用旧版 `dmb-*` 纵向缩进卡片。图布局、SVG 贝塞尔连线、点阵背景、卡片两段结构、深度配色、树视图、折叠控件、详情浮层、后台任务抽屉均复用原版实现。
 
-不是 DSH 内核的右侧栏 tab，而是第三方插件 `dsh-better-sidebar` 的扩展点：它在 `client/index.tsx` 里 `ctx.provide('betterSidebar', service)`，我们对它 `ctx.inject(['betterSidebar'], …)` 再 `registerTab({ id: 'maestro-board', title: '任务看板', order: 45, single: true, component })`。
+- 图视图是真正的分层绝对定位画布；按容器宽度排布，滚轮围绕鼠标缩放，只允许从背景拖动画布。
+- 保留原版缩放范围 `0.4–2`、适配可读下限 `0.78`、适配上限 `1.3`、`220ms` 布局与视口动画。
+- 标题栏使用原版 36px 高度、字体、间距、分隔线和宿主 ghost 刷新按钮。
+- 图/树切换、自动折叠、缩放与适配按钮保留原版位置。取消旧的独立筛选工具栏，不往原版 UI 增加设计元素。
+- 使用宿主的 React 和 UI primitives，原版 `--dsw-*` 主题变量直接继承亮/暗主题。
+- 核心源码与 CSS 按原始字节保存；只有 4 个渲染文件加入隔离的 CLI `executor` 字段/右对齐标识，测试移除这些精确插入后验证原始 SHA-256。源文件哈希见 [source-manifest.json](../src/client/board/upstream/source-manifest.json)，MIT 许可见 [THIRD_PARTY_NOTICES](../THIRD_PARTY_NOTICES)。CSS Modules 编译后内联进客户端包，不依赖宿主额外加载样式文件。
 
-- `betterSidebar` 是**可选**服务：没装那个插件时注入回调永远不触发，看板不存在，其余功能不受影响；所以它不在插件的 `inject` 声明里（那会让整个客户端 half 加载失败）。
-- `single: true` = 全局一个实例（多点几次不会开第二个）。
-- 重复 `registerTab` 会抛错（热重载两次 `apply` 时可能遇到），`register.ts` 捕获后只打一条 `console.warn`。
+## 座位与数据
 
-## 数据从哪来
+通过可选的 `betterSidebar.registerTab` 注册 `maestro-board`，标题「任务看板」、`order: 45`、`single: true`。没有安装 better-sidebar 时不显示看板，其余 CLI 功能不受影响。
 
-| 区块 | 数据源 | 备注 |
+| 数据 | 来源 | 行为 |
 | --- | --- | --- |
-| DSH 会话树 | `ctx.sessions.list` 的 `byId[scope.sessionId]`（根）+ `byId[*].parentId` + `projectionsBySession[*].values.subagentCatalog` | 两边取并集：目录只记直系，血缘补充漏网的子级 |
-| CLI 任务 | 本插件的 `GET /plugin/dsh-maestro-codex/tasks?sessions=<id,…>`、`.../task-detail?id&cursor&sessions=…`、`POST .../task-cancel`（body `{id, sessions}`） | 2.5s 轮询列表、900ms 轮询展开项日志；`sessions` 传当前会话树的 id 集合 |
-| 后台任务 | `ctx.jobs`（`state.getSnapshot/subscribe`、`watchRows`、`observe`、`kill`） | 按树上的会话 id 逐个 `watchRows`，客户端去重合并 |
+| 会话树 | `sessions.list.byId`、血缘与 `subagentCatalog` 投影 | 向祖先找到根，合并目录与血缘，保留子代理任务描述 |
+| CLI 子代理 | `/plugin/dsh-maestro-codex/tasks`、`task-detail`、`task-cancel` | 列表 2.5s、展开详情 900ms 轮询；仅读取当前会话树归属任务 |
+| 用量与耗时 | `tokenUsage`、`subagentTiming`、`maestroCliUsage` | 映射进原版卡片元信息和详情 |
+| 原生子代理状态 | `sidebar/api/subagents.live` | 沿用原版 3s 刷新，实时 activity / done / error 不由 CLI 状态覆盖 |
+| 工作流 | `sidebar/api/workflows.list` | 沿用原版 5s 刷新、工作流卡片、成员节点与详情/导航 |
+| Agent Team | `agentTeam` 投影与原生 live | 原版 TeamBoard / TaskWindow，创建与 CAS 更新复用已有 teams API |
+| 后台任务 | 宿主 `jobs.state`、`watchRows`、`observe`、`kill` | 独立原版 JobsDrawer，不再使用固定占比的自绘面板 |
 
-全部是**客户端已有 feed**，不新增 host 路由，也不改 `src/wire.ts` 的契约。
+不新增 host 路由，不修改模型路由、难度门槛、权限或续接契约。CLI 超时保护的修正见下文。隐藏看板时停止列表/日志轮询及作业观察。看板读取原版 SidebarStore 的图/树、自动折叠和作业自动收起偏好；保留原版 `<768px` 窄屏默认树视图。
 
-## 一棵树：`attachRows`
+团队任务的正文、编辑控件与窗口使用原版组件。Markdown 的宿主文件导航是显式兼容适配：只有宿主提供 `openMarkdownFile` 时才打开本地 Markdown 链接，不伪造 explorer 路由或完整跨文件锚点能力。
 
-`model.ts` 的 `buildSessionTree` 只产出**骨架**（`kind: 'agent'` 的会话节点）。`attachRows(root, { tasks })` 再把 CLI 任务挂上去：
+## CLI 接入边界
 
-- 节点 id 带前缀，避免和会话 id 撞：CLI 节点是 `cli:<taskId>`（`CLI_NODE_PREFIX`）。
-- 挂载点就是「归属会话」：CLI 任务用 `MaestroTaskSummary.sessionId`（`dispatch_cli_task` 派发时写的是 `exec.agent.id`）。没有归属（`sessionId` 为空）的 CLI 任务挂到根。
-- 挂载点不在树上 → **丢弃**（树外的会话不属于这个 tab 的视野）。
-- 同一层的顺序：血缘子级 → CLI 任务。没挂任何东西的分支**保持原对象引用**（`useMemo` 才不会每轮全量重建）。
-- `collectTreeIds` 只收 `kind === 'agent'` 的 id。混进 `cli:` 前缀的 id 会让 CLI 任务的 `sessions` 过滤查错会话。
+[model.ts](../src/client/board/model.ts) 的 `buildSessionTree` 构建骨架，`attachRows` 按 `MaestroTaskSummary.sessionId` 挂接 CLI 节点：
 
-## 底部后台任务面板
+- id 为 `cli:<taskId>`，避免与原生会话 id 冲突。
+- 树外归属任务丢弃；无归属安装任务保持既有可见语义。
+- 对应 CLI 目录幽灵节点去重，不伪造可打开的本地会话。
+- CLI 仍使用原版代理卡片，身份栏/树标题右侧明确标识 `codex`、`claude` 或其他 executor；仅补充实时阶段、耗时、Token、输出和取消动作。
+- CLI 日志读取与取消始终传会话树范围，不泄漏其他会话任务。
+- 原生子代理通过宿主会话导航打开，外部任务不尝试打开不存在的会话。
+- 后台作业按 `job.owner` 过滤，观察保留输出不消费模型自己的输出游标。
 
-后台任务**单独显示**在树下方的一块固定高度列表里（`flex-basis: 20%`，正好占面板总高度的 1/5，内部滚动）——树只讲「会话 + CLI 子代理」的层级故事，作业一行一个平铺，不再混进树的层级里：
+已结束/空闲聚合与树折叠沿用原版行为；聚合预览保留任务名称，运行中的后代不能被折叠隐藏。
 
-- 数据还是 `useBoardJobs` 的 `BoardJobRow[]`，用 `model.ts` 的 `jobNode()` 折成同一套 `BoardNode` 模型——状态点、图标、元信息、详情浮层全部复用。
-- 行尾直接给「终止」（还在跑的作业），点行开同一个「节点详情」浮层（看保留输出、跳所属会话）。
-- 面板跟着顶部筛选走（「失败」只列失败的作业）；被筛掉时头部计数显示 `N / M`。
-- 作业树外归属的过滤在 `collectJobRows`（data 层）：按 `job.owner` 判断，无主作业任何名册都可见。
-- 宿主没有 `jobs` 服务时**整块面板不渲染**，树占满剩余高度。
+## CLI 无输出保护
 
-## 两种视图
+`timeout_minutes` 和配置页的 CLI 超时现在表示连续无 stdout/stderr 输出的分钟数（1–240），不是总运行时限。非空输出分片会重置计时，包含无换行的 JSON/文本片段与 stderr；这只是可观测的无输出保护，不能判断任务是否具有语义进展。持续输出的任务不会仅因总运行时长达到 30 分钟而被杀。
 
-同一个树结构，两套画法，底栏切换（默认「图」）：
+预警跟随同一个 watchdog 重新排程，预警本身不刷新计时。手动取消仍立即终止进程树；探测、npm、git 等一般 `runProcess` 调用保留原来的总时限保护。没有偷偷提高默认超时或增加默认总时限。
 
-- **图**（`GraphView` + `collectBands`）：按层级折成「带」——第一层是根，第二层是它的子级，依此类推；每带一行、卡片横排居中，带与带之间画一条竖线、每张卡上方一小段引线。这是 `dsh-better-sidebar` Tasks 页那种「父在上、子横排」的观感。**不做**绝对定位的力导向布局：面板只有两三百像素宽，斜线会把节点压成一团。
-- **树**（`TreeNode`）：缩进列表，`.dmb-kids` 用 `margin-left` + 左边框画层级线，行尾三角收子树。
+## 用量对账与页头入口
 
-收起的节点不再往下展开（`collectBands` / `TreeNode` 都读同一个 `folded` 集合）。点卡片/行开「节点详情」浮层，浮层贴着被点的那个节点（`DetailAnchor`：`left` 夹在面板内，下方空间不够就翻到节点上方），浮层里是状态、模式、Token 用量、耗时，加动作按钮（打开会话 / 查看转录 / 取消 / 终止）。底部面板里的作业行开的是同一个浮层。
+CLI 请求不属于 DSH 主模型账本。每次派发结算后 `reportCliUsage` 在所属会话追加 `maestro/cli-usage` 事件，`maestroCliUsage` projection 累积四类 Token、耗时与最近 20 条调用记录。任务树和顶部子智能体列表优先读取任务摘要的已测量 `usage`，投影记录仅作为兼容回退，不再被最近 20 条记录的上限截断。运行中的调用尚未收到用量时显示“尚未收到用量”，已结束且没有测量值时明确显示“未采集”，不把未知当成真实零消耗。
 
-## 折叠已结束的兄弟
+失败、超时、取消也保存通道已经收到的 stats；重试的各次请求用量相加，非用量元数据保留最近一次。Codex 的 inclusive input 先扣除缓存读，再进入统一的非缓存输入桶，不能把缓存读重复加回。未从 stdout 收到的用量不能凭空还原；历史任务不会自动补账，也不会自动读取原生会话日志或续接。
 
-一层里节点一多（一次跑十几个子代理），已完成的会淹没还在跑的那几个。`model.ts` 的 `foldFinished(node, { minMembers })` 把**同一层里已结束的兄弟**收成一个 `kind: 'fold'` 节点：
+不用 `assistant/message` 或 `assistant/attempt` 替代事件，避免污染主会话 surface 或覆盖主模型用量。配置页「任务监视」与近 7 天统计继续使用同一投影。
 
-- 标题是「已完成 N」，`members` 存着被收起来的原节点，`children` 默认空（收起）。
-- chip 里点名：`members.slice(0, 2)` 的标题用 ` / ` 连起来，超过两个补 ` +N`。**这条是硬要求**——CLI 子代理必须始终在树里可见，折叠不能把它们彻底藏掉。
-- 少于 `minMembers`（默认 2）个已结束兄弟就不收：只剩一个时收起来反而多点一次。
-- **失败的不收**：出错要一眼看见。
-- 收与不收看的是整棵子树（`quiet(node)` = 自己结束且所有子孙也都结束）。一个会话可能自己已结束、底下还挂着在跑的子代理或 CLI 任务，收起来会把活的东西藏了。
-- 展开是另一趟：`expandFolds(node, expanded)` 按 `expanded` 集合把 `members` 塞回 `children`。分组只算一次，点开不重算全树。
-- 统计走折叠**之前**的树（`allRows`），折叠组的成员不该从计数里消失。
-
-## 用量对账
-
-CLI 子代理的 token 与请求记录不在 dsh 的 token 账本里（那本账只记 dsh 自己发出的模型调用），所以插件在 `src/usage.ts` 里补一条独立的记录面：
-
-- 每次 `runDispatch` 结束，`reportCliUsage` 向**所属会话**（`exec.agent.session`）追加 `maestro/cli-usage` 事件，payload 是该次调用的 `CliUsageRecord`（CLI、模型、阶段、退出码、起止时间、四类 token）。
-- 插件同时向 `ctx.sessionProjections` 注册 `maestroCliUsage` projection（`stateVersion: 1`），把事件累加成 `{ totals, recent }`（最近 20 条）。
-- dsh 与其他插件读 `projectionsBySession[sessionId].values.maestroCliUsage`；插件自身也可以 `ctx.sessionProjections.stateOf(session, 'maestroCliUsage')` 直读。
-- 之所以不用 `assistant/message` / `assistant/attempt`：前者会进对话 surface，后者会被 dsh 的 `addReplacing` 当成同一 turn/step 的样本**替换**主模型用量，且会让客户端 turn-tail 的 attempt 聚合状态机变成 invalid。自定义事件两条路都不碰，宿主升级也不会冲突。
+会话页头的 `maestro-cli-catalog` chip 保持原有逻辑：有 CLI 任务时合并本地子代理与 CLI 计数，并显示 CLI 阶段、耗时和用量；没有 CLI 时仍使用内核入口。外部目录行仅在派发开始时记录一次，任务状态来自本插件实时列表，不伪造本地子会话。
 
 ## 降级
 
-- 没有 `sessions` 服务 → 树退化成「当前会话」一个节点，其余照常。
-- 没有 `jobs` 服务 → 底部后台任务面板整个不出现（不占那 1/5 高度），树照常；计数与筛选只算树上的行。
-- `subagentCatalog` 里 `mode: 'external'` 的行（CLI 子代理没有本地 Session）画成**幽灵节点**（斜体），因为它点进去没有会话可开；真正派发的 CLI 任务有 `cli:` 节点，带实时阶段与转录。
-- 树节点默认全展开；折叠只收子树，点节点开详情（详情里「打开会话」走 `ctx.get('workspace').openSession`，退化到 `sessions.open`）。
-- 血缘数据理论上可能有环，`buildSessionTree` 用 `visiting` 祖先链剪枝，重复 id 不会再展开。
+- 缺少 sessions：保留当前会话根节点。
+- 缺少 jobs：不渲染后台任务抽屉，画布占剩余空间。
+- 缺少原生会话打开能力：不提供无效跳转。
+- 血缘环由模型的祖先访问集合剪枝。
+- 已有 CLI 续接仍通过 `dispatch_cli_task` 的 `resume=sessionRef`，不另造 GUI 续接接口。
 
-## 代码结构
-
-| 文件 | 职责 |
-| --- | --- |
-| `src/client/board/model.ts` | 纯函数：建骨架树、挂 CLI 任务（`attachRows`）、后台作业节点（`jobNode`，给底部面板用）、折叠已结束兄弟（`foldFinished`/`expandFolds`）、摊平、按筛选剪枝（`filterTree`）、状态映射、格式化。**不 import React**，单测直接跑 |
-| `src/client/board/data.ts` | hooks：会话 feed、作业名册 + 观察、CLI 列表/详情轮询、每秒 tick |
-| `src/client/board/Board.tsx` | 组件 + CSS（token 走 `--dsh-*`，注入一份 `<style>`，幂等）；`GraphView`/`GraphCard` 画图视图，`TreeNode` 画缩进树，`JobsPanel` 画底部后台任务列表（`flex-basis: 20%`），`NodeDetail` 是浮层 |
-| `src/client/board/register.ts` | `registerTab` 接线 + tab 图标 |
-| `src/client/index.ts` | `apply()` 第一行调用 `registerBoardTab(ctx)` |
-
-## 验证
+## 验证与部署
 
 ```bash
-pnpm typecheck
-pnpm test        # tests/board-model.test.ts 模型（含 attachRows、foldFinished/expandFolds）、
-                 # tests/board-register.test.ts 接线、
-                 # tests/board-render.test.ts 用 react-dom/server 把组件渲一遍（含 collectBands、折叠行）
-pnpm build       # 产物是 lib/client.js
+node scripts/build-upstream.mjs
+node node_modules/typescript/bin/tsc -p tsconfig.json --noEmit
+node node_modules/typescript/bin/tsc -p tsconfig.client.json --noEmit
+node node_modules/vitest/vitest.mjs run
+node node_modules/typescript/bin/tsc -p tsconfig.json
+node node_modules/tsdown/dist/run.mjs
 ```
 
-> 本机 `pnpm install` / `pnpm typecheck` 会因 `ERR_PNPM_IGNORED_BUILDS ... esbuild` 直接失败，改用二进制：
-> `./node_modules/.bin/tsc -p tsconfig.json --noEmit`、`./node_modules/.bin/tsc -p tsconfig.client.json --noEmit`、
-> `./node_modules/.bin/vitest run`、`./node_modules/.bin/tsdown`。
+也可使用包内 `typecheck`、`test`、`build` 和 `test:upstream` 脚本；本机 pnpm 的自动依赖核验可能触发 `ERR_PNPM_IGNORED_BUILDS`，可直接使用上述已安装二进制，不更改全局包管理设置。
 
-改动后要把 `lib/client.js` 复制到 `~/.dsh/profiles/desktop/node_modules/dsh-maestro-codex/lib/`，并刷新 dsh 页面（客户端插件包只在 `pnpm run dev:web` 同时运行时才热更新）。
+保真测试覆盖原始 SHA-256、CSS 每条声明/选择器/主题变量等价、360px/920px 图坐标、动画、宿主 factory 与共享 React。渲染回归覆盖真实图、树、会话血缘、CLI 去重、Token 和原版后台任务抽屉。
 
-### 本地视觉检查
-
-`.tmp/visual/` 有一个不发货的 harness：`board.tsx` 用假宿主（sessions 投影 + jobs 名册 + mock 掉 `/tasks`、`/task` 路由）挂 `BoardTab`，`tsdown.board.ts` 打成 IIFE：
-
-```bash
-./node_modules/.bin/tsdown -c .tmp/visual/tsdown.board.ts
-# 然后用浏览器打开 .tmp/visual/board-light.html
-# #view=tree 切缩进视图，#node=<id> 打开详情，#log=1 展开转录
-```
-
-比在 dsh 里试快得多：不用重启宿主、不用等真实任务。
+构建完成后更新当前 profile 实际安装的客户端包，再刷新现有 DSH 页面。只有同 checkout 的 `pnpm run dev:web` watcher 在运行时才有客户端插件 HMR；普通构建不会自动刷新当前 GUI。仅客户端变更无需重启宿主，也不启动替代服务器。超时、stats 保存与任务摘要属于宿主代码：更新实际安装的 host `lib` 后，必须完整退出并重新启动桌面宿主才生效；市场插件禁用/启用不会清除旧的模块缓存，不能替代宿主重启。

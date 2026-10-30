@@ -74,6 +74,17 @@ describe('buildSessionTree', () => {
     })
   })
 
+  it('prefers the catalog task description over the truncated chat title', () => {
+    const root = buildSessionTree({
+      rootId: 'root',
+      sessions,
+      catalogs: { root: [{ id: 'docs', createdAt: 1, mode: 'one-shot', label: '复核同步配置的保存边界' }] },
+    })
+    const docs = root.children.find(child => child.id === 'docs')
+    // 标题是目录里的任务描述，被截断的对话标题退成副标题。
+    expect(docs).toMatchObject({ title: '复核同步配置的保存边界', subtitle: '文档' })
+  })
+
   it('gives the root idle status when it exists but is not running', () => {
     const idle = buildSessionTree({
       rootId: 'root',
@@ -283,6 +294,55 @@ function jobRow(ownerSessionId: string, overrides: Partial<BoardJob> = {}): Boar
 }
 
 describe('attachRows', () => {
+  it.each(['task-1', 'cli-task-1'])('replaces owner-local external mirror %s with one CLI row', mirrorId => {
+    const base = buildSessionTree({
+      rootId: 'root', sessions,
+      catalogs: { review: [{ id: mirrorId, createdAt: 1, mode: 'external', label: 'CLI mirror' }] },
+    })
+    const root = attachRows(base, { tasks: [cliTask({ sessionId: 'review' })] })
+    const review = root.children.find(child => child.id === 'review')
+    expect(review?.children.map(child => child.id)).toEqual(['deep', `${CLI_NODE_PREFIX}task-1`])
+    expect(base.children.find(child => child.id === 'review')?.children.some(child => child.id === mirrorId)).toBe(true)
+  })
+
+  it('preserves local sessions and non-external rows even if their ids match a task', () => {
+    const base = tree()
+    const prototype = base.children.find(child => child.id === 'docs')
+    if (prototype === undefined) throw new Error('Missing local session fixture')
+    const local = { ...prototype, id: 'cli-task-1', mode: 'external' as const, hasSession: true }
+    const otherMode = { ...prototype, id: 'task-1', mode: 'one-shot' as const, hasSession: false }
+    const root = attachRows({ ...base, children: [local, otherMode] }, { tasks: [cliTask({ sessionId: 'root' })] })
+    expect(root.children.map(child => child.id)).toEqual(['cli-task-1', 'task-1', `${CLI_NODE_PREFIX}task-1`])
+    expect(root.children[0]).toBe(local)
+    expect(root.children[1]).toBe(otherMode)
+  })
+
+  it('preserves other plugins external rows and matching mirrors under another owner', () => {
+    const base = buildSessionTree({
+      rootId: 'root', sessions,
+      catalogs: {
+        root: [{ id: 'task-1', createdAt: 1, mode: 'external', label: 'Another owner mirror' }],
+        review: [
+          { id: 'cli-task-1', createdAt: 1, mode: 'external', label: 'Owner mirror' },
+          { id: 'other-plugin', createdAt: 2, mode: 'external', label: 'Other external' },
+        ],
+      },
+    })
+    const foreignMirror = base.children.find(child => child.id === 'task-1')
+    const root = attachRows(base, { tasks: [cliTask({ sessionId: 'review' })] })
+    expect(root.children.find(child => child.id === 'task-1')).toBe(foreignMirror)
+    const review = root.children.find(child => child.id === 'review')
+    expect(review?.children.map(child => child.id)).toEqual(['other-plugin', 'deep', `${CLI_NODE_PREFIX}task-1`])
+  })
+
+  it('does not remove catalog mirrors for tree-external tasks', () => {
+    const base = buildSessionTree({
+      rootId: 'root', sessions,
+      catalogs: { root: [{ id: 'cli-task-1', createdAt: 1, mode: 'external', label: 'Unattached mirror' }] },
+    })
+    expect(attachRows(base, { tasks: [cliTask({ sessionId: 'outside' })] })).toBe(base)
+  })
+
   it('returns the same tree when there is nothing to attach', () => {
     const root = tree()
     expect(attachRows(root, {})).toBe(root)
@@ -319,6 +379,30 @@ describe('attachRows', () => {
     })
     expect(node.jobRow?.ownerSessionId).toBe('root')
     expect(node.children).toEqual([])
+  })
+
+  it('attaches reported CLI token usage to the task node', () => {
+    const root = attachRows(tree(), {
+      tasks: [cliTask({ sessionId: 'review' })],
+      usage: {
+        'task-1': { uncachedInputTokens: 1200, outputTokens: 340, cacheReadTokens: 5000, cacheWriteTokens: 0 },
+      },
+    })
+    const node = root.children
+      .find(child => child.id === 'review')
+      ?.children.find(child => child.kind === 'cli')
+    expect(node?.tokens).toEqual({
+      uncachedInputTokens: 1200, outputTokens: 340, cacheReadTokens: 5000, cacheWriteTokens: 0,
+    })
+    expect(tokenSummary(node?.tokens)).toBe('入 1.2k · 出 340 · 缓存 5.0k')
+  })
+
+  it('leaves token usage unset for a run that has not reported yet', () => {
+    const root = attachRows(tree(), { tasks: [cliTask({ sessionId: 'review' })] })
+    const node = root.children
+      .find(child => child.id === 'review')
+      ?.children.find(child => child.kind === 'cli')
+    expect(node?.tokens).toBeUndefined()
   })
 
   it('keeps node identity for untouched branches', () => {
@@ -362,10 +446,11 @@ describe('foldFinished / expandFolds', () => {
   it('collects settled siblings into one row and leaves live ones alone', () => {
     const folded = foldFinished(settledSiblings())
     const root = folded.children
-    // 运行中的留在明面上，三个已结束的收成一行。
-    expect(root.map(child => child.title)).toEqual(['还在跑', '已完成 3'])
+    // 运行中的留在明面上，三个已结束的收成一行；折叠行用组内第一件事命名。
+    expect(root.map(child => child.title)).toEqual(['还在跑', '丙'])
     const group = root[1]
     expect(group?.kind).toBe('fold')
+    expect(group?.subtitle).toBe('还有 2 个已完成节点')
     expect(group?.id).toBe(`${FOLD_NODE_PREFIX}root`)
     // 默认收起：children 是空的，但 members 留着原节点（顺序即树里的顺序）。
     expect(group?.children).toEqual([])

@@ -272,7 +272,8 @@ describe('timeout warning', () => {
     const task = registry.list()[0]
     expect(task?.phase).toBe('timeout')
     const events = deps.registry.eventsSince(task?.id ?? '', 0)?.events ?? []
-    expect(events.some(event => event.text.includes('超时并被终止'))).toBe(true)
+    expect(events.some(event => event.kind === 'note' && event.text.includes('若仍无输出'))).toBe(true)
+    expect(events.some(event => event.text.includes('无输出保护，不代表任务语义进展'))).toBe(true)
   })
 })
 

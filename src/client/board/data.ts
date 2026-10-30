@@ -22,6 +22,7 @@ import {
   type MaestroTaskSummary,
 } from '../../wire.js'
 import type { CliUsageState } from '../../usage.js'
+import type { SidebarTeamProjection } from './upstream/index.js'
 import type {
   BoardCatalogEntry, BoardJob, BoardJobRow, BoardSession, BoardTiming, BoardTokenUsage,
 } from './model.js'
@@ -43,7 +44,10 @@ export interface BoardSessionList {
 
 /** 一个会话的投影快照（只声明看板/用量面板读的那几个 key）。 */
 export interface BoardProjectionSnapshot {
+  readonly state?: 'idle' | 'loading' | 'ready' | 'error'
+  readonly error?: { readonly code?: string; readonly message?: string } | null
   readonly values: {
+    readonly agentTeam?: SidebarTeamProjection
     readonly subagentCatalog?: readonly BoardCatalogEntry[]
     readonly tokenUsage?: BoardTokenUsage
     readonly subagentTiming?: BoardTiming
@@ -83,6 +87,8 @@ export interface BoardJobsFace {
 
 /** 一个客户端上下文里看板要用到的服务（都可缺省）。 */
 export interface BoardHost {
+  readonly sessions?: BoardSessionsFace
+  readonly jobs?: BoardJobsFace
   get(name: string): unknown
 }
 
@@ -108,18 +114,30 @@ export function useSessionList(ctx: BoardHost): BoardSessionList {
   return useSyncExternalStore(subscribe, read, read)
 }
 
-/** 结构探测：`ctx.get('sessions')` 是宿主客户端会话服务。 */
+/**
+ * Cordis services are virtual properties guarded by inject; even an optional
+ * `ctx.jobs` read can throw before `??` reaches its fallback. Match upstream's
+ * optional-service lookup via ctx.get, while retaining real own data-properties
+ * on legacy/test hosts without invoking any service accessor or Proxy get trap.
+ */
+function boardServiceOf(ctx: BoardHost, name: 'sessions' | 'jobs'): unknown {
+  const own = Object.getOwnPropertyDescriptor(ctx, name)
+  if (own !== undefined && 'value' in own && own.value != null) return own.value
+  return ctx.get(name)
+}
+
+/** 结构探测：通过可选服务查询读取会话 feed，不触发 Cordis 注入属性守卫。 */
 export function sessionsFaceOf(ctx: BoardHost): BoardSessionsFace | undefined {
-  const service = ctx.get('sessions') as Partial<BoardSessionsFace> | undefined
+  const service = boardServiceOf(ctx, 'sessions') as Partial<BoardSessionsFace> | undefined
   if (service === undefined || service === null) return undefined
   const list = service.list
   if (list === undefined || typeof list.getSnapshot !== 'function' || typeof list.subscribe !== 'function') return undefined
   return service as BoardSessionsFace
 }
 
-/** 结构探测：`ctx.get('jobs')` 是宿主的客户端作业服务。 */
+/** 结构探测：与原版一样查询可选 jobs 服务，缺席时不阻止看板渲染。 */
 export function jobsFaceOf(ctx: BoardHost): BoardJobsFace | undefined {
-  const service = ctx.get('jobs') as Partial<BoardJobsFace> | undefined
+  const service = boardServiceOf(ctx, 'jobs') as Partial<BoardJobsFace> | undefined
   if (service === undefined || service === null) return undefined
   if (typeof service.watchRows !== 'function' || typeof service.observe !== 'function') return undefined
   if (typeof service.kill !== 'function' || service.state === undefined) return undefined
@@ -302,9 +320,26 @@ export interface BoardCliDetailState {
   readonly error: string | undefined
   /** 任务自身的失败原因（宿主写进 detail 的 `error` 字段）。 */
   readonly failure: string | undefined
+  readonly finalText?: string
+  readonly cwd?: string
+  readonly stats?: Readonly<Record<string, string | number | boolean>>
 }
 
 const EMPTY_DETAIL: BoardCliDetailState = { summary: undefined, events: [], error: undefined, failure: undefined }
+
+/** Keep genuine outcome fields across cursor pages that omit unchanged metadata. */
+export function cliDetailSnapshot(
+  detail: MaestroTaskDetail,
+  events: readonly MaestroTaskEvent[],
+  previous: BoardCliDetailState = EMPTY_DETAIL,
+): BoardCliDetailState {
+  return {
+    ...previous, summary: detail.summary, events, error: undefined, failure: detail.error,
+    ...(detail.finalText === undefined ? {} : { finalText: detail.finalText }),
+    ...(detail.cwd === undefined ? {} : { cwd: detail.cwd }),
+    ...(detail.stats === undefined ? {} : { stats: detail.stats }),
+  }
+}
 
 /** 连续失败多少次后放弃轮询（瞬时抖动要扛住，真被删除/剪掉的任务要停下）。 */
 const DETAIL_MAX_FAILURES = 5
@@ -326,6 +361,7 @@ export function useCliDetail(id: string | null, active: boolean, sessionIds?: re
     let cancelled = false
     let cursor = 0
     let events: MaestroTaskEvent[] = []
+    let snapshot: BoardCliDetailState = EMPTY_DETAIL
     let failures = 0
     let timer: number | undefined
     const load = async (): Promise<void> => {
@@ -334,7 +370,8 @@ export function useCliDetail(id: string | null, active: boolean, sessionIds?: re
       if (!result.ok) {
         // 一次抖动不该冻结整个转录：有界重试，连续失败才停下。
         failures += 1
-        setState({ summary: undefined, events, error: result.error, failure: undefined })
+        snapshot = { ...snapshot, summary: undefined, events, error: result.error, failure: undefined }
+        setState(snapshot)
         if (failures < DETAIL_MAX_FAILURES) {
           timer = window.setTimeout(() => { void load() }, DETAIL_POLL_MS)
         }
@@ -344,7 +381,8 @@ export function useCliDetail(id: string | null, active: boolean, sessionIds?: re
       const detail: MaestroTaskDetail = result
       cursor = detail.nextCursor
       events = [...events, ...detail.events].slice(-LOG_CAP)
-      setState({ summary: detail.summary, events, error: undefined, failure: detail.error })
+      snapshot = cliDetailSnapshot(detail, events, snapshot)
+      setState(snapshot)
       if (!TERMINAL_PHASES.includes(detail.summary.phase)) {
         timer = window.setTimeout(() => { void load() }, DETAIL_POLL_MS)
       }

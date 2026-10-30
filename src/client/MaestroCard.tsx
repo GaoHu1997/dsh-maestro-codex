@@ -26,7 +26,7 @@ import { useUsageSummary } from './usage-panel.js'
 import {
   cleanLogText, CLI_LABELS, CLI_PACKAGES, MAESTRO_CLI_IDS, TASK_TYPE_CATALOG, TERMINAL_PHASES,
   type DshProviderModels, type MaestroCliId, type MaestroCliVersions, type MaestroOverview, type MaestroPhase,
-  type MaestroTaskDetail,
+  type MaestroTaskDetail, type MaestroTaskSummary,
 } from '../wire.js'
 
 /** The props the slot entry injects (see client/index.ts). */
@@ -156,7 +156,9 @@ const CARD_CSS = `
 .dmc-rowbtn:focus-visible { outline: 2px solid var(--dmc-accent); outline-offset: -2px; }
 
 /* --- rows --- */
-.dmc-row { border: 1px solid var(--dmc-border); border-radius: 12px; background: var(--dmc-panel); overflow: hidden; }
+/* Accordion headers and details stack vertically. Header chip styles use
+ * a separate dmch-* namespace so their horizontal rows cannot leak here. */
+.dmc-row { display: flex; flex-direction: column; align-items: stretch; min-width: 0; border: 1px solid var(--dmc-border); border-radius: 12px; background: var(--dmc-panel); overflow: hidden; }
 .dmc-stack { display: flex; flex-direction: column; gap: 10px; }
 .dmc-rowbtn { display: flex; align-items: center; gap: 12px; width: 100%; padding: 11px 14px; background: none; border: none; color: inherit; cursor: pointer; text-align: left; transition: background .15s; }
 .dmc-rowbtn:hover { background: var(--dmc-hover); }
@@ -519,6 +521,95 @@ export function mergeTaskDetail(previous: MaestroTaskDetail | undefined, rest: M
   return { ...rest, events: [...previous.events, ...rest.events].slice(-DETAIL_EVENT_CAP) }
 }
 
+/** The npm action one CLI is running right now; undefined = idle. */
+export type NpmRunning = 'install' | 'uninstall' | undefined
+
+/**
+ * A click the card already fired: `id` is '' until the route answers with the
+ * registry task id, `at` dates the click (a safety net against a job that
+ * leaves the overview's newest-20 window before this card ever sees it end).
+ */
+export interface NpmClick {
+  readonly id: string
+  readonly action: 'install' | 'uninstall'
+  readonly at: number
+}
+
+/** Max npm run time is 10 分钟 (cli-manager), so a click entry older than this is stale. */
+const NPM_CLICK_TTL_MS = 15 * 60_000
+
+/**
+ * One CLI's live npm job, read off the overview: every install/uninstall is an
+ * `npm-*` registry task, so a non-terminal one means `npm -g` still owns that
+ * CLI's global install and the card must not start a second run.
+ */
+export function liveNpmTask(tasks: readonly MaestroTaskSummary[], cli: MaestroCliId): MaestroTaskSummary | undefined {
+  return tasks.find(task => task.cli === cli && task.id.startsWith('npm-') && !TERMINAL_PHASES.includes(task.phase))
+}
+
+/**
+ * Which action one CLI is running. The route titles install jobs 「安装…」 and
+ * uninstall jobs 「卸载…」; a job the user just fired reports the action it was
+ * fired with, because the button has to lock on the click, not on the next poll.
+ */
+export function npmRunningOf(
+  tasks: readonly MaestroTaskSummary[], cli: MaestroCliId, click: NpmClick | undefined,
+): NpmRunning {
+  const live = liveNpmTask(tasks, cli)
+  if (live === undefined) return click?.action
+  if (click !== undefined && click.id === live.id) return click.action
+  return live.title.startsWith('卸载') ? 'uninstall' : 'install'
+}
+
+/** Drop one CLI's entry from a per-CLI record (same object when it was absent). */
+function withoutCli<T>(record: Partial<Record<MaestroCliId, T>>, cli: MaestroCliId): Partial<Record<MaestroCliId, T>> {
+  if (record[cli] === undefined) return record
+  const next = { ...record }
+  delete next[cli]
+  return next
+}
+
+/** Labels and enabled flags of one SDK card's two action buttons. */
+export interface SdkActionButtons {
+  readonly installLabel: string
+  readonly installDisabled: boolean
+  readonly uninstallLabel: string
+  readonly uninstallDisabled: boolean
+  /** An npm job (or a click already fired) holds this CLI: lock the row's pickers too. */
+  readonly locked: boolean
+}
+
+/**
+ * The SDK card's install/uninstall buttons for one CLI. A running npm job or a
+ * click that already fired turns the matching button into 「安装中…」/「卸载中…」
+ * and disables both — that is what makes a second click a no-op instead of a
+ * duplicate `npm -g` run (the route also answers 409 as a second line of
+ * defence, but the button must not ask in the first place).
+ */
+export function sdkActionButtons(input: {
+  running: NpmRunning
+  /** Any card-wide request is in flight (busy !== ''). */
+  busy: boolean
+  installed: boolean
+  current: string
+  selected: string
+}): SdkActionButtons {
+  const locked = input.busy || input.running !== undefined
+  const sameAsCurrent = input.installed && input.selected === input.current
+  const idleInstallLabel = sameAsCurrent
+    ? '当前版本'
+    : input.selected === ''
+      ? '安装最新版'
+      : `安装 v${input.selected}`
+  return {
+    installLabel: input.running === 'install' ? '安装中…' : idleInstallLabel,
+    installDisabled: locked || sameAsCurrent,
+    uninstallLabel: input.running === 'uninstall' ? '卸载中…' : '卸载',
+    uninstallDisabled: locked || !input.installed,
+    locked,
+  }
+}
+
 export function MaestroCard(props: MaestroCardProps): ReactNode {
   useStyles()
   const form = useStore(props.maestroStore)
@@ -533,6 +624,12 @@ export function MaestroCard(props: MaestroCardProps): ReactNode {
   const [dshProviders, setDshProviders] = useState<DshProviderModels[] | undefined>(undefined)
   const [busy, setBusy] = useState('')
   const [notice, setNotice] = useState('')
+
+  // SDK tab: the npm job each card just fired. The overview poll is the source
+  // of truth for a running job, but it lands up to 4s later — this optimistic
+  // entry locks the card on the click itself, so a double click can never start
+  // a second `npm -g` run. `id` is '' until the route answers.
+  const [npmClicks, setNpmClicks] = useState<Partial<Record<MaestroCliId, NpmClick>>>({})
 
   // SDK tab: each CLI's published versions (loaded on demand) and the version
   // each card's picker currently points at.
@@ -640,11 +737,22 @@ export function MaestroCard(props: MaestroCardProps): ReactNode {
   /** npm install one version (empty = registry latest) / uninstall (confirm first). */
   const npmAction = (cli: MaestroCliId, action: 'install' | 'uninstall', version?: string): void => {
     if (action === 'uninstall' && globalThis.confirm(`确认卸载 ${CLI_PACKAGES[cli]}？（npm -g uninstall）`) === false) return
+    // Lock before the request leaves: the overview poll is the long-term source
+    // of truth, but it is up to 4s behind, and that window was exactly where a
+    // second click started a duplicate npm job.
+    setNpmClicks(previous => ({ ...previous, [cli]: { id: '', action, at: Date.now() } }))
     void (async () => {
       const result = await withBusy(`${action}-${cli}`, () => action === 'install'
         ? installCli(cli, version === undefined || version === '' ? undefined : version)
         : uninstallCli(cli))
-      if (!result.ok) return
+      if (!result.ok) {
+        // The route refused (409 = another npm job of this CLI is running):
+        // drop the optimistic lock and let the overview report the real one.
+        setNpmClicks(previous => withoutCli(previous, cli))
+        return
+      }
+      // Keep the lock under the real task id so the poll cannot unlock it early.
+      setNpmClicks(previous => ({ ...previous, [cli]: { id: result.id, action, at: Date.now() } }))
       if (action === 'install') {
         setVersionDraft(previous => {
           const next = { ...previous }
@@ -661,6 +769,39 @@ export function MaestroCard(props: MaestroCardProps): ReactNode {
 
   const tasks = overview?.tasks ?? []
   const activeCount = tasks.filter(task => task.phase === 'running' || task.phase === 'queued').length
+
+  // Retire an optimistic npm click once the overview reports its task settled,
+  // then re-detect that CLI: the install request answers immediately, so the
+  // refresh fired right after it runs while `npm -g` is still writing and sees
+  // the old version. The TTL only catches a job that left the newest-20 window
+  // before we saw it end, so a stuck 「安装中…」 cannot outlive the npm timeout.
+  useEffect(() => {
+    if (Object.keys(npmClicks).length === 0) return
+    const listed = overview?.tasks ?? []
+    const next: Partial<Record<MaestroCliId, NpmClick>> = { ...npmClicks }
+    const settled: MaestroCliId[] = []
+    for (const cli of MAESTRO_CLI_IDS) {
+      const click = next[cli]
+      if (click === undefined || click.id === '') continue
+      const task = listed.find(entry => entry.id === click.id)
+      if (task !== undefined && TERMINAL_PHASES.includes(task.phase)) {
+        delete next[cli]
+        settled.push(cli)
+      } else if (task === undefined && Date.now() - click.at > NPM_CLICK_TTL_MS) {
+        delete next[cli]
+      }
+    }
+    if (settled.length > 0 || Object.keys(next).length !== Object.keys(npmClicks).length) setNpmClicks(next)
+    for (const cli of settled) void withBusy(`refresh-${cli}`, () => refreshCli(cli))
+  }, [overview, npmClicks])
+
+  /** This CLI's optimistic lock, ignoring an entry that already outlived the npm timeout. */
+  const npmClickOf = (cli: MaestroCliId): NpmClick | undefined => {
+    const click = npmClicks[cli]
+    if (click === undefined) return undefined
+    if (click.id !== '' && Date.now() - click.at > NPM_CLICK_TTL_MS) return undefined
+    return click
+  }
 
   /** The dsh model selection of one CLI (`provider::model`, '' = follow the main agent). */
   const dshSelectionOf = (cli: MaestroCliId): string =>
@@ -856,12 +997,12 @@ export function MaestroCard(props: MaestroCardProps): ReactNode {
                   placeholder={`可选，${cli} 可执行文件完整路径`}
                 />
                 <StagedInput
-                  label="超时（分钟）"
+                  label="连续无输出超时（分钟）"
                   field={cli === 'claude' ? 'claudeTimeoutMinutes' : 'codexTimeoutMinutes'}
                   state={form}
                   actions={actions}
                   placeholder="20"
-                  hint="1–240，超时自动终止任务"
+                  hint="1–240，连续无 stdout/stderr 输出达到该时长才终止；不是总运行时限"
                 />
                 {cli === 'codex' && (
                   <StagedArea
@@ -873,7 +1014,7 @@ export function MaestroCard(props: MaestroCardProps): ReactNode {
                   />
                 )}
               </div>
-              <span className="dmc-hint">API 地址 / Token 让 CLI 走自定义兼容端点；CLI 路径留空自动从 PATH 检测；超时到点自动终止任务。</span>
+              <span className="dmc-hint">API 地址 / Token 让 CLI 走自定义兼容端点；CLI 路径留空自动从 PATH 检测；CLI 非空输出会重置无输出超时计时，不因总运行时长到点强制终止。</span>
             </details>
           </div>
         )}
@@ -892,7 +1033,11 @@ export function MaestroCard(props: MaestroCardProps): ReactNode {
     const options = registry?.versions ?? []
     const selected = versionDraft[cli] ?? current
     const hasUpdate = installed && latest !== '' && current !== '' && current !== latest
-    const sameAsCurrent = installed && selected === current
+    // A live `npm-*` job (or the click that just fired one) owns this CLI: the
+    // buttons say 「安装中…」/「卸载中…」 and the whole row is locked until it ends.
+    const running = npmRunningOf(tasks, cli, npmClickOf(cli))
+    const buttons = sdkActionButtons({ running, busy: busy !== '', installed, current, selected })
+    const liveTask = liveNpmTask(tasks, cli)
     return (
       <div key={cli} className="dmc-sdkcard">
         <div className="dmc-sdkhead">
@@ -906,8 +1051,9 @@ export function MaestroCard(props: MaestroCardProps): ReactNode {
               <StateChip tone="accent">有更新</StateChip>
             </>
           )}
+          {running !== undefined && <StateChip tone="accent">{running === 'install' ? '安装中…' : '卸载中…'}</StateChip>}
           <span style={{ flex: 1 }} />
-          <button type="button" className="dmc-btn dmc-btn-sm" disabled={busy !== ''} onClick={() => { void withBusy(`refresh-${cli}`, () => refreshCli(cli)) }}>重新检测</button>
+          <button type="button" className="dmc-btn dmc-btn-sm" disabled={busy !== '' || buttons.locked} onClick={() => { void withBusy(`refresh-${cli}`, () => refreshCli(cli)) }}>重新检测</button>
         </div>
         <p className="dmc-sdkdesc">{SDK_DESCRIPTIONS[cli]}</p>
 
@@ -915,7 +1061,7 @@ export function MaestroCard(props: MaestroCardProps): ReactNode {
           <select
             className="dmc-select"
             value={selected}
-            disabled={loading || options.length === 0}
+            disabled={loading || options.length === 0 || buttons.locked}
             onChange={event => { setVersionDraft(previous => ({ ...previous, [cli]: event.target.value })) }}
           >
             <option value="">{loading ? '加载版本列表…' : (latest === '' ? '最新版' : `最新版（v${latest}）`)}</option>
@@ -929,16 +1075,23 @@ export function MaestroCard(props: MaestroCardProps): ReactNode {
           <button
             type="button"
             className="dmc-btn dmc-btn-primary"
-            disabled={busy !== '' || sameAsCurrent}
+            disabled={buttons.installDisabled}
+            aria-busy={running === 'install'}
             onClick={() => { npmAction(cli, 'install', selected) }}
-          >{sameAsCurrent ? '当前版本' : selected === '' ? '安装最新版' : `安装 v${selected}`}</button>
+          >{buttons.installLabel}</button>
           <button
             type="button"
             className="dmc-btn dmc-btn-danger"
-            disabled={busy !== '' || !installed}
+            disabled={buttons.uninstallDisabled}
+            aria-busy={running === 'uninstall'}
             onClick={() => { npmAction(cli, 'uninstall') }}
-          >卸载</button>
+          >{buttons.uninstallLabel}</button>
           {loading && <span className="dmc-sdkloading">正在读取 npm registry 版本…</span>}
+          {running !== undefined && (
+            <span className="dmc-sdkloading">
+              {`npm ${running} 进行中${liveTask === undefined ? '' : `：${liveTask.id}`}，完成前不能重复执行，结束后自动重新检测版本`}
+            </span>
+          )}
         </div>
 
         <div className="dmc-sdkmeta">

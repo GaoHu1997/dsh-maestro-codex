@@ -246,7 +246,11 @@ export function codexUsageStats(frame: CodexFrame): Record<string, string | numb
   const stats: Record<string, string | number | boolean> = {}
   const usage = frame.usage
   if (usage === undefined) return stats
-  if (typeof usage.input_tokens === 'number') stats['inputTokens'] = usage.input_tokens
+  if (typeof usage.input_tokens === 'number') {
+    // Codex input_tokens includes cached reads; the shared usage projection
+    // expects mutually exclusive uncached input / cache read / cache write.
+    stats['inputTokens'] = Math.max(0, usage.input_tokens - (usage.cached_input_tokens ?? 0))
+  }
   if (typeof usage.cached_input_tokens === 'number') stats['cachedInputTokens'] = usage.cached_input_tokens
   if (typeof usage.output_tokens === 'number') stats['outputTokens'] = usage.output_tokens
   return stats
@@ -315,8 +319,9 @@ export async function runCodexTask(options: {
       finalText = frame.item.text ?? ''
     }
     if (frame.msg?.type === 'agent_message' && (frame.msg.message ?? '').trim() !== '') finalText = frame.msg.message ?? ''
+    // Keep real usage even if this frame/run fails; never infer it from logs.
+    stats = { ...stats, ...codexUsageStats(frame) }
     if (frame.type === 'turn.completed') {
-      stats = { ...stats, ...codexUsageStats(frame) }
       turnStatus = 'completed'
       // Some builds emit top-level errors during reconnects. A subsequent
       // completed turn is positive recovery evidence, not a failed task.
@@ -334,6 +339,10 @@ export async function runCodexTask(options: {
     ...(Object.keys(env).length === 0 ? {} : { env }),
     stdin: options.task,
     timeoutMs: options.timeoutMs,
+    timeoutMode: 'idle',
+    onTimeoutWarning: remainingMs => {
+      options.onEvent('note', `CLI 已连续无 stdout/stderr 输出；若仍无输出，将在约 ${String(Math.round(remainingMs / 1000))} 秒后超时终止（无输出保护，不代表任务语义进展）`)
+    },
     signal: options.signal,
     onStdoutLine: handleLine,
     // stderr is diagnostics, not protocol — surface it as notes so a hung or
@@ -350,7 +359,7 @@ export async function runCodexTask(options: {
   const noAnswer = finalText.trim() === ''
   const ok = !ended.timedOut && !options.signal.aborted && ended.code === 0 && turnStatus !== 'failed' && !pendingStreamError && !noAnswer
   if (!ok) {
-    if (ended.timedOut) failureReasons.push('任务超时，进程已被终止')
+    if (ended.timedOut) failureReasons.push(`连续无 stdout/stderr 输出 ${String(Math.round(options.timeoutMs / 1000))} 秒超时，进程已被终止（无输出保护，不代表任务语义进展）`)
     else if (options.signal.aborted) failureReasons.push('任务已取消，进程已被终止')
     if (ended.code !== 0) failureReasons.push(`进程退出码 ${ended.code ?? 'null'}`)
     if (noAnswer) failureReasons.push('Codex CLI 未返回最终答复（缺少非空 agent_message）')

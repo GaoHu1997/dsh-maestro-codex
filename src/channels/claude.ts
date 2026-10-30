@@ -223,6 +223,10 @@ export async function runClaudeTask(options: {
     ...(Object.keys(env).length === 0 ? {} : { env }),
     stdin: options.task,
     timeoutMs: options.timeoutMs,
+    timeoutMode: 'idle',
+    onTimeoutWarning: remainingMs => {
+      options.onEvent('note', `CLI 已连续无 stdout/stderr 输出；若仍无输出，将在约 ${String(Math.round(remainingMs / 1000))} 秒后超时终止（无输出保护，不代表任务语义进展）`)
+    },
     signal: options.signal,
     onStdoutLine: handleLine,
     // stderr is diagnostics, not protocol — surface it as notes so a hung or
@@ -232,8 +236,9 @@ export async function runClaudeTask(options: {
   const ended = await outcome
 
   const stats = { ...resultStats }
+  if (sessionId !== '') stats['sessionId'] = sessionId
   if (ended.timedOut) stats['timedOut'] = true
-  const ok = !ended.timedOut && ended.code === 0 && finalText.trim() !== '' && resultError === undefined
+  const ok = !ended.timedOut && !options.signal.aborted && ended.code === 0 && finalText.trim() !== '' && resultError === undefined
   return {
     ok,
     finalText,
@@ -241,8 +246,9 @@ export async function runClaudeTask(options: {
     exitCode: ended.code,
     stderrTail: ended.stderrTail,
     stats,
-    error: resultError
-      ?? (ended.timedOut ? '任务超时，进程已被终止' : undefined)
+    error: (options.signal.aborted ? '任务已取消，进程已被终止' : undefined)
+      ?? resultError
+      ?? (ended.timedOut ? `连续无 stdout/stderr 输出 ${String(Math.round(options.timeoutMs / 1000))} 秒超时，进程已被终止（无输出保护，不代表任务语义进展）` : undefined)
       ?? (ended.code === 0 ? undefined : `进程退出码 ${ended.code ?? 'null'}${ended.stderrTail.trim() === '' ? '' : `：${lastLines(ended.stderrTail)}`}`)
       // Exit 0 with no text is a silent CLI (filtered output, crashed renderer):
       // name the reason instead of letting the dispatch report "unknown".

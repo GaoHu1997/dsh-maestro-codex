@@ -13,6 +13,8 @@ import { MaestroCard } from './MaestroCard.js'
 import { MaestroForm, type SectionValue } from './form.js'
 import { registerBoardTab } from './board/register.js'
 import type { BoardHost } from './board/data.js'
+import { attachLocale } from './board/upstream/index.js'
+import { CliCatalogChip } from './header/CliCatalogChip.js'
 
 /** The host entry id — the cordis.patch.yml row id, and the settings namespace
  * the configForms service projects this plugin's volatile config under. */
@@ -32,8 +34,27 @@ export const inject = ['slots', 'configForms']
  * @param ctx - client root context.
  */
 export function apply(ctx: ClientContext): void {
+  const locale = (ctx as unknown as BoardHost).get('locale') as Parameters<typeof attachLocale>[0]
+  if (typeof locale?.getSnapshot === 'function') attachLocale(locale)
+
   // 右侧栏「任务看板」：与配置卡片独立，配置页没就绪也要有它。
   registerBoardTab(ctx)
+
+  // 会话页头的「N 个子智能体」：内核那颗只认本地子会话，CLI 子代理是
+  // external 目录行、没有子会话，状态和用量都取不到。这里注册一颗自己的
+  // chip（本地 + CLI 合并计数），再由组件把内核那颗从 DOM 上让位。
+  const headerHost: BoardHost = {
+    get: name => (ctx as unknown as { get(name: string): unknown }).get(name),
+  }
+  ctx.effect(
+    () => ctx.slots.inject('conversation.session.header.actions', () => ctx.slots.register({
+      name: 'conversation.session.header.actions',
+      id: 'maestro-cli-catalog',
+      order: 11,
+      inject: () => ({ host: headerHost }),
+    }, CliCatalogChip)),
+    'maestro-codex: header subagent catalog chip',
+  )
 
   // 任务监视页的用量统计：读客户端会话 feed 里的 maestroCliUsage 投影。
   // sessions 是壳的核心服务，apply 时已在；缺席时卡片显示空态，不影响其余。

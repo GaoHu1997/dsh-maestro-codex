@@ -1,0 +1,344 @@
+{
+  "repository": "https://github.com/omdsh-dev/DSH-better-sidebar",
+  "version": "0.28.2",
+  "license": "MIT",
+  "files": [
+    {
+      "path": "client/breakpoints.ts",
+      "source": "src/client/breakpoints.ts",
+      "mode": "verbatim",
+      "sha256": "78e99f444da05c305a146070898b8d92c5d16c457fc978cf5d53c09e969be3c5"
+    },
+    {
+      "path": "client/TeamBoard.tsx",
+      "source": "src/client/TeamBoard.tsx",
+      "mode": "verbatim",
+      "sha256": "3bc1baee0dc1a8010515e4f246a2f26f0a5b5055384baa302ae621bebf1469fb"
+    },
+    {
+      "path": "client/TaskWindow.tsx",
+      "source": "src/client/TaskWindow.tsx",
+      "mode": "verbatim",
+      "sha256": "f98e9011c4ba9b13b10e863d0cb5ab39e868ccb28720de8cce5a1767e8fe5563"
+    },
+    {
+      "path": "client/markdown-labels.tsx",
+      "source": "src/client/markdown-labels.tsx",
+      "mode": "verbatim",
+      "sha256": "c7ca48878f8efa459f9be9ed253c6821301314e2bc9ea3cf59e80ec7f2f0028f"
+    },
+    {
+      "path": "client/api.ts",
+      "source": "src/client/api.ts",
+      "mode": "adapted",
+      "sha256": "15d88b1ee857b1bbff25f540e7c104b21cab5a7250fcdcb3c36fb57b9c2b8cdb",
+      "sourceSha256": "f04af9246b2f34bc63af2b42e1e3cb6dd39359adf7f1cb43b1e8102a72b4e98c",
+      "adaptations": ["Only teams.taskCreate/taskUpdate, original payloads, CAS and envelopes; no explorer API. Prefix-safe document.baseURI HTTP resolution; SSR returns unavailable."]
+    },
+    {
+      "path": "client/use-markdown-surface.ts",
+      "source": "src/client/use-markdown-surface.ts",
+      "mode": "adapted",
+      "sha256": "03cead4c36ab0bdfbf95e1eec3572fd3cc65d454ce663c387e585b4f4b892719",
+      "sourceSha256": "27c8bf587132b4e548c96d85605cb3149d5f273368412a4e2bb02377812793c5",
+      "adaptations": ["Explicit Context.openMarkdownFile callback only, no explorer service or routes. Existing DOM id jumps supported; source rewrite is identity; original generated heading slugs and cross-file anchor retention not ported."]
+    },
+    {
+      "path": "client/SubagentView.module.css",
+      "source": "src/client/SubagentView.module.css",
+      "mode": "verbatim",
+      "sha256": "14d4e7dca64a654b8defacac2f95e70c671aa22b6e23430debf8802e4e91c161"
+    },
+    {
+      "path": "client/TasksGraph.tsx",
+      "source": "src/client/TasksGraph.tsx",
+      "mode": "adapted-cli-badge",
+      "sourceSha256": "8bf7cea9e36eb76c7ff1c54f684cef2dd02b570abd0c157754777c5b851b652c",
+      "sha256": "c7bd57929e240a197e71066693620c9205a3cf1539a67675096375d8af9e0a0e"
+    },
+    {
+      "path": "client/TasksTree.tsx",
+      "source": "src/client/TasksTree.tsx",
+      "mode": "adapted-cli-badge",
+      "sourceSha256": "71ea4c8950aa4303ca1779c6b75a102cc1005da4c1b3c199a20a5397225d2271",
+      "sha256": "a561241b52d7a6e601e850d46fd0ec19892753a376c65454c5669203c0e234d6"
+    },
+    {
+      "path": "client/tasks-card.tsx",
+      "source": "src/client/tasks-card.tsx",
+      "mode": "adapted-cli-badge",
+      "sourceSha256": "017391388ab9b083c01341ef21adfff6786fc77de9e2955ba3578c66c153917f",
+      "sha256": "508825685126b13f6c8ec57ebbae240355170998314b2961b5ae0d7b9d2600a9"
+    },
+    {
+      "path": "client/tasks-graph-layout.ts",
+      "source": "src/client/tasks-graph-layout.ts",
+      "mode": "verbatim",
+      "sha256": "8722b7ff8f5ee463f4cea9315992a57127d4f1b6d2a028612457bf7c274fa492"
+    },
+    {
+      "path": "client/tasks-layout-tween.ts",
+      "source": "src/client/tasks-layout-tween.ts",
+      "mode": "verbatim",
+      "sha256": "6790a04f087b4c4a5e6a731c73bccdaa5f1b418586ebf29d5a1241b973e2a8c6"
+    },
+    {
+      "path": "client/tasks-view-glide.ts",
+      "source": "src/client/tasks-view-glide.ts",
+      "mode": "verbatim",
+      "sha256": "c8ff66ca2656d49623a6ed3819c6c33fc21cef339b74ec43a673d4adf75537d6"
+    },
+    {
+      "path": "client/frame-batcher.ts",
+      "source": "src/client/frame-batcher.ts",
+      "mode": "verbatim",
+      "sha256": "12ea39fffa8a08090052f41866506996740b28b4a7e2ee7e5108ae5230b23fab"
+    },
+    {
+      "path": "client/tasks-graph.module.css",
+      "source": "src/client/tasks-graph.module.css",
+      "mode": "verbatim",
+      "sha256": "59f764ca1919bb4b5159462dd631242c236ea08a6102c1091deaa4645ad20431"
+    },
+    {
+      "path": "client/tasks-canvas.module.css",
+      "source": "src/client/tasks-canvas.module.css",
+      "mode": "verbatim",
+      "sha256": "a3a49918d79f95d615a18a5cdeb55733100ff6eca572f46f172f821895052cd1"
+    },
+    {
+      "path": "client/tasks-shared.tsx",
+      "source": "src/client/tasks-shared.tsx",
+      "mode": "verbatim",
+      "sha256": "93211a25d14561cae5c11ce6406c39d173c49569bd34670c61d71c399a8116b0"
+    },
+    {
+      "path": "client/tasks-model.ts",
+      "source": "src/client/tasks-model.ts",
+      "mode": "adapted-cli-badge",
+      "sourceSha256": "2dce027e42e3bfb5ba74c308a8ec953846180b4ba83dadb7c68e01b5f563a453",
+      "sha256": "3cecc44f5e8ace2505c5b3ef265fe38a65ca3bccb6650df3ed350a69eb3566b9"
+    },
+    {
+      "path": "client/locales.ts",
+      "source": "src/client/locales.ts",
+      "mode": "verbatim",
+      "sha256": "6ba20c1b41d03baa1ad0c034402852b6a1c1fe2b9a92893f28d9140bb220c9dd"
+    },
+    {
+      "path": "client/process-labels.ts",
+      "source": "src/client/process-labels.ts",
+      "mode": "verbatim",
+      "sha256": "d95577278b551bbd54cc5de5040312f6ad9b92c069ce2b4e04bbf0d3ef57db8a"
+    },
+    {
+      "path": "client/activity-icons.tsx",
+      "source": "src/client/activity-icons.tsx",
+      "mode": "verbatim",
+      "sha256": "7dd2860b3e9389fc2dac6636e897ba34ac9450b5cbea78dabfcc5216a138c3d6"
+    },
+    {
+      "path": "client/subagent-detect.ts",
+      "source": "src/client/subagent-detect.ts",
+      "mode": "verbatim",
+      "sha256": "0ea9244ab38f2f766fd13543dd4889e0acc9d4239f9356b21ef9a856d9e786c7"
+    },
+    {
+      "path": "client/subagent-lineage.ts",
+      "source": "src/client/subagent-lineage.ts",
+      "mode": "verbatim",
+      "sha256": "e9a574da6aaf5e7e0ca0bbf3c74c63179240ae34a171027a15a0d515a7f35be6"
+    },
+    {
+      "path": "client/subagent-catalog.ts",
+      "source": "src/client/subagent-catalog.ts",
+      "mode": "verbatim",
+      "sha256": "005e4bff4c002a97d48a7591e112ee30e1dc3641905f3b9ac4dd19de95490cbf"
+    },
+    {
+      "path": "client/session-metrics.ts",
+      "source": "src/client/session-metrics.ts",
+      "mode": "verbatim",
+      "sha256": "c174462b0047cf9947a7a2cecabb8ae0e7e32ac53b803e94b75b2435d3945855"
+    },
+    {
+      "path": "client/team-projection.ts",
+      "source": "src/client/team-projection.ts",
+      "mode": "verbatim",
+      "sha256": "85afd965cc3975527bb5b244a765202c186375624d77759b63d70a69cf4a32a3"
+    },
+    {
+      "path": "client/use-auto-animate.ts",
+      "source": "src/client/use-auto-animate.ts",
+      "mode": "verbatim",
+      "sha256": "3b6764c5571ac0d64980217d36ffe43f900f8e1aa30fd7e0e10df15dc32ec0c2"
+    },
+    {
+      "path": "client/AnchoredPopover.tsx",
+      "source": "src/client/AnchoredPopover.tsx",
+      "mode": "verbatim",
+      "sha256": "25126511cf5fefa52cd3b7a84df84319869ba1e95584da4596d0f819eb356a89"
+    },
+    {
+      "path": "client/TasksPopovers.tsx",
+      "source": "src/client/TasksPopovers.tsx",
+      "mode": "verbatim",
+      "sha256": "525cf6857815a536464a50691d4df99c07d7d5e7898fdb299158d9d98a0e2883"
+    },
+    {
+      "path": "client/JobsDrawer.tsx",
+      "source": "src/client/JobsDrawer.tsx",
+      "mode": "verbatim",
+      "sha256": "4bd7f4ebebf1f539a2bb5e850a21e82fbcd8892ca62af7d932dfdf49b94db607"
+    },
+    {
+      "path": "client/FloatingWindow.tsx",
+      "source": "src/client/FloatingWindow.tsx",
+      "mode": "verbatim",
+      "sha256": "40eac97dfbfdbd5da26657eb4adb607b93b06cb7e444509283da057d29d40c85"
+    },
+    {
+      "path": "client/FloatingWindow.module.css",
+      "source": "src/client/FloatingWindow.module.css",
+      "mode": "verbatim",
+      "sha256": "7557ba56b0e89d07573b6632da337ca2b93b190c80bb2a0b9d820c5783a8a03f"
+    },
+    {
+      "path": "client/subagent-jobs.ts",
+      "source": "src/client/subagent-jobs.ts",
+      "mode": "verbatim",
+      "sha256": "2af0fb91f54ae5992228ad4c6697ff7ef429aba834e8b4f694ff79d3eed20151"
+    },
+    {
+      "path": "client/block-labels.ts",
+      "source": "src/client/block-labels.ts",
+      "mode": "verbatim",
+      "sha256": "295ca84baa4ac874a67efd211f75cb24bfbf24bb7c4069ac103673b0a2aa8c20"
+    },
+    {
+      "path": "client/css-modules.d.ts",
+      "source": "src/client/css-modules.d.ts",
+      "mode": "verbatim",
+      "sha256": "ae4a6fc200e9bc81fee07d86e088a2158ede12e8317a0b66d68c6d040dce73b8"
+    },
+    {
+      "path": "workflow-runs.ts",
+      "source": "src/workflow-runs.ts",
+      "mode": "verbatim",
+      "sha256": "fa1854c885b06ce7405025a9ce17e1df40ed5299059f50303bfc34fc82b45710"
+    },
+    {
+      "path": "process-activity.ts",
+      "source": "src/process-activity.ts",
+      "mode": "verbatim",
+      "sha256": "6bc3355d05cbd9764e9d9885560e6b38965375a641eea7de3896d20d7ebf0efd"
+    },
+    {
+      "path": "context-types.ts",
+      "source": "src/context-types.ts",
+      "mode": "selected-declarations",
+      "declarations": [
+        "SidebarChildLiveView",
+        "SidebarClientJobsService",
+        "SidebarJobStatus",
+        "SidebarJobView",
+        "SidebarJobsSnapshot",
+        "SidebarObservedJob",
+        "SidebarProjectionSnapshot",
+        "SidebarSessionEvent",
+        "SidebarSessionList",
+        "SidebarSessionSummary",
+        "SidebarSubagentAddress",
+        "SidebarSubagentCatalogEntry",
+        "SidebarSubagentTiming",
+        "SidebarTeamMemberProjection",
+        "SidebarTeamProjection",
+        "SidebarTeamTaskView",
+        "SidebarTokenUsage"
+      ],
+      "sha256": "f83dc0db04769ad8ec3961ac56ad4b1cdf7bf9513024353693fb6f992f0223c5",
+      "sourceSha256": "93fccd6bd73747a126dba02498d7d4401e98cb8085b9230813ae538c1bb0da99",
+      "adaptations": ["Context is a narrow explicit task-note callback adapter, not the original plugin activation context."]
+    },
+    {
+      "path": "client/sidechat-transcript.ts",
+      "source": "src/client/sidechat-transcript.ts",
+      "mode": "selected-declarations",
+      "declarations": [
+        "formatTokens"
+      ],
+      "sha256": "d79ebd687c3768a8e6e2f6dcae9a5200f23833afe5785d7bdeba1421fcdf4d16",
+      "sourceSha256": "19e57592e568ee1ba56e09c799b80e9002c6589d25a90e1d0bda37cfeffb2ad0"
+    },
+    {
+      "path": "client/context-diagnostics.ts",
+      "source": "src/client/context-diagnostics.ts",
+      "mode": "selected-declarations",
+      "declarations": [
+        "ContextDiagnosticTarget",
+        "ContextDiagnosticError",
+        "ContextDiagnosticsSnapshot",
+        "ContextDiagnostics"
+      ],
+      "sha256": "813fa9b1260b01b05fe8fab9ed8265bd94231ce17d39241ead05f85cb11d3b3d",
+      "sourceSha256": "8eefb0d98d52c8483002d57c9678c4769495ea0bf789352e7479eefb51854b1e"
+    },
+    {
+      "path": "client/context-diagnostics-ui.tsx",
+      "source": "src/client/context-diagnostics-ui.tsx",
+      "mode": "selected-declarations",
+      "declarations": [
+        "DiagnosticsEntryKind",
+        "DIAGNOSTICS_ENTRY_ATTR",
+        "DIAGNOSTICS_ALERT_ATTR",
+        "DiagnosticsStoreContext",
+        "ContextDiagnosticsHost",
+        "useDiagnosticsStore",
+        "useDiagnosticsSnapshot",
+        "NO_SUBSCRIBE",
+        "NO_SNAPSHOT",
+        "ContextDiagnosticsButton",
+        "reasonKey",
+        "ContextDiagnosticsAlert",
+        "diagnosticAddressOf"
+      ],
+      "sha256": "d9485d5284b1cd55c927d03d45575c7fb3923790b6fd1079cbcfb7073df3f83c",
+      "sourceSha256": "ed17b664c83a1b572c7f5751eaadcf27ae32bf4512f36a176faa18c0eb9cddf9",
+      "adaptations": [
+        "useDiagnosticsSnapshot supplies the same getSnapshot as the server snapshot for SSR."
+      ]
+    },
+    {
+      "path": "client/context-diagnostics.module.css",
+      "source": "src/client/context-diagnostics.module.css",
+      "mode": "verbatim",
+      "sha256": "26c7f6a24d12fda277477446b387300ec0cf7e5726331e254031b71a2dd85d7a"
+    },
+    {
+      "path": "sidechat-core.ts",
+      "source": "src/sidechat-core.ts",
+      "mode": "selected-declarations",
+      "declarations": [
+        "SIDE_LABEL_PREFIX"
+      ],
+      "sha256": "b93aac5ac04a79a81275b17daf0d2edde0d7419798c20f83750b49a27769de2d",
+      "sourceSha256": "4e67e96e900bc2df2221d9a7026f58dd47f6f09841b38ac02cb4c917a1ca669e"
+    }
+  ],
+  "dependencies": [
+    {
+      "name": "clsx",
+      "version": "2.1.1",
+      "license": "MIT",
+      "entry": "vendor/clsx/dist/clsx.mjs",
+      "sha256": "d949e5cdbfebc76a6642b1901095e900fc3f2262d8dc0373aa44850a9bc75522"
+    },
+    {
+      "name": "@formkit/auto-animate",
+      "version": "0.10.0",
+      "license": "MIT",
+      "entry": "vendor/auto-animate/index.mjs",
+      "sha256": "cd5fca8eadcf0fb0474ff672de65851a4f58f1b13d76863bc649c2cf189a51d3"
+    }
+  ]
+}

@@ -22,6 +22,30 @@ import type { DshModelEndpoint } from './dsh-models.js'
 import { reportCliUsage, type CliUsageSession } from './usage.js'
 import { cleanLogText, type MaestroCliId, type MaestroPhase } from './wire.js'
 
+/** Channel stats use normalized camelCase buckets; retain native aliases too
+ * if a channel reports them. Missing usage is unknown, never a fabricated zero.
+ * Non-usage metadata describes the last attempt (not a stale failed attempt).
+ */
+function accumulateAttemptStats(
+  previous: TaskRegistryTask['stats'],
+  current: TaskRegistryTask['stats'] | null,
+): TaskRegistryTask['stats'] {
+  const usageKeys = [
+    'inputTokens', 'outputTokens', 'cachedInputTokens', 'cacheWriteTokens', 'costUsd',
+    'input_tokens', 'output_tokens', 'cached_input_tokens',
+    'cache_read_input_tokens', 'cache_creation_input_tokens', 'cache_write_input_tokens',
+  ] as const
+  if (previous === undefined && current == null) return undefined
+  const stats = { ...current }
+  for (const key of usageKeys) {
+    const before = previous?.[key]
+    const now = current?.[key]
+    if (typeof before === 'number' && typeof now === 'number') stats[key] = before + now
+    else if (typeof before === 'number' && now === undefined) stats[key] = before
+  }
+  return stats
+}
+
 /** Faces the dispatcher needs; the host apply builds one stable instance. */
 export interface DispatchDeps {
   readConfig: () => EffectiveConfig
@@ -269,17 +293,15 @@ export async function runDispatch(deps: DispatchDeps, params: DispatchParams, si
         deps.registry.setPhase(task, phase, note)
         hooks?.onPhase?.(phase, note)
       }
-      setPhaseOf('running', `开始执行（${decision.cli}${model === '' ? '' : `, model=${model}`}, cwd=${cwd}，超时 ${timeoutMinutes} 分钟）`)
+      setPhaseOf('running', `开始执行（${decision.cli}${model === '' ? '' : `, model=${model}`}, cwd=${cwd}，连续无输出超时 ${timeoutMinutes} 分钟）`)
       const startedAt = Date.now()
       const onEvent = (kind: 'text' | 'note' | 'error', text: string): void => {
         deps.registry.push(task, kind, text)
         hooks?.onEvent?.(kind, text)
       }
-      // 超时预警：剩最后约 1/5（至多 2 分钟）时提醒一句，让主代理/用户来得及
-      // 反应；到点由通道自己的 timeout 杀进程。预警在每次尝试里各自计时——
-      // 重试后沿用旧钟点会把预警打在错误的时刻。
+      // CLI watchdogs measure consecutive output silence, not total runtime.
+      // Warnings live beside the watchdog so actual chunks reset both clocks.
       const timeoutMs = timeoutMinutes * 60_000
-      const leadMs = Math.min(2 * 60_000, Math.round(timeoutMs / 5))
       {
         // Model resolution order, narrowest first:
         //   1. an explicit tool-arg model (already validated),
@@ -387,15 +409,9 @@ export async function runDispatch(deps: DispatchDeps, params: DispatchParams, si
         // 失败自动重试（默认 0 次）：只重试普通失败——超时重试会翻倍等待、取消
         // 重试违背取消语义；文件改动型任务请保持 0，重试可能叠加改动。
         const maxAttempts = 1 + Math.min(2, Math.max(0, Math.trunc(config.failureRetries)))
+        let lastSessionRef = ''
         for (let attempt = 1; ; attempt += 1) {
           let mcpConfigPath: string | undefined
-          // 每次尝试各自计时的超时预警（见上面的 leadMs 注释）。
-          const warnTimer = timeoutMs > leadMs + 2_000
-            ? setTimeout(() => {
-                if (abort.signal.aborted) return
-                onEvent('note', `任务已运行较久，将在约 ${leadMs >= 60_000 ? `${String(Math.round(leadMs / 60_000))} 分钟` : `${String(Math.round(leadMs / 1000))} 秒`}后超时并被终止`)
-              }, timeoutMs - leadMs)
-            : undefined
           try {
             if (decision.cli === 'claude' && mcpServers.length > 0) {
               mcpConfigPath = await writeClaudeMcpConfig(mcpServers)
@@ -414,7 +430,7 @@ export async function runDispatch(deps: DispatchDeps, params: DispatchParams, si
                   baseUrl: dshEndpoint !== undefined ? dshEndpoint.baseURL : config.claude.baseUrl,
                   authToken: dshEndpoint !== undefined ? dshEndpoint.apiKey : config.claude.authToken,
                   ...(mcpConfigPath === undefined ? {} : { mcpConfigPath, mcpServerNames: mcpServers.map(server => server.name) }),
-                  timeoutMs: timeoutMinutes * 60_000,
+                  timeoutMs,
                   signal: abort.signal,
                   onEvent,
                 })
@@ -438,7 +454,7 @@ export async function runDispatch(deps: DispatchDeps, params: DispatchParams, si
                   ...(mcpServers.length > 0 ? { mcpServers } : {}),
                   baseUrl: config.codex.baseUrl,
                   apiKey: config.codex.apiKey,
-                  timeoutMs: timeoutMinutes * 60_000,
+                  timeoutMs,
                   signal: abort.signal,
                   onEvent,
                 })
@@ -447,17 +463,27 @@ export async function runDispatch(deps: DispatchDeps, params: DispatchParams, si
             // aborts `abort`, the child dies, and the run settles with a failure —
             // no separate race needed.
             const raced = await run
+            task.stats = accumulateAttemptStats(task.stats, raced.stats)
+            task.exitCode = raced.exitCode ?? undefined
+            task.finalText = cleanLogText(raced.finalText)
+            const reportedSessionRef = 'sessionId' in raced ? raced.sessionId : raced.threadId
+            if (reportedSessionRef !== '') lastSessionRef = reportedSessionRef
+            const sessionRef = lastSessionRef
+            if (sessionRef !== '') {
+              // The registry's extensible stats contract already persists these
+              // primitives; do not add fields to the enforced host/tool schema.
+              task.stats = { ...task.stats, sessionRef }
+              onEvent('note', `${decision.cli} session: ${sessionRef}`)
+            }
 
             const durationMs = Date.now() - startedAt
             if (raced.ok) {
               const finalText = cleanLogText(raced.finalText)
               task.exitCode = raced.exitCode ?? 0
               task.finalText = finalText
-              task.stats = raced.stats
               setPhaseOf('done', '执行完成')
-              const sessionRef = 'sessionId' in raced ? raced.sessionId : raced.threadId
               if (sessionRef !== '') notes.push(`${decision.cli} session: ${sessionRef}`)
-              for (const [key, stat] of Object.entries(raced.stats)) notes.push(`${key}: ${String(stat)}`)
+              for (const [key, stat] of Object.entries(task.stats ?? {})) notes.push(`${key}: ${String(stat)}`)
               return {
                 ok: true,
                 cli: decision.cli,
@@ -475,7 +501,7 @@ export async function runDispatch(deps: DispatchDeps, params: DispatchParams, si
               // `??` only catches undefined: a channel that settled with an empty
               // error string (all causes deduped away) still needs a reason.
               : raced.error !== undefined && raced.error.trim() !== '' ? raced.error : '任务失败（原因未知）'
-            const timedOut = raced.stats['timedOut'] === true
+            const timedOut = raced.stats?.['timedOut'] === true
             if (attempt < maxAttempts && !timedOut && !abort.signal.aborted) {
               onEvent('note', `第 ${String(attempt)} 次执行失败，自动重试（${String(attempt)}/${String(maxAttempts - 1)}）：${message.split(/\r?\n/)[0]?.slice(0, 200) ?? ''}`)
               continue
@@ -484,7 +510,6 @@ export async function runDispatch(deps: DispatchDeps, params: DispatchParams, si
             task.exitCode = raced.exitCode ?? undefined
             throw new DispatchError(`${decision.cli} 任务失败：${message}`)
           } finally {
-            if (warnTimer !== undefined) clearTimeout(warnTimer)
             if (mcpConfigPath !== undefined) await unlinkQuiet(mcpConfigPath)
           }
         }

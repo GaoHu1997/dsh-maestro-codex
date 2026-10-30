@@ -11,8 +11,9 @@
  *   且只降级一次（run 尚未被调用才会走裸路径，避免双跑）。
  * - 抽屉「终止」→ abort runDispatch 登记的 controller（取消语义与配置页一致）。
  *
- * 这里同时提供 A2 的一小块：任务成功后往父会话追加一行 `subagent/catalog`
- * （`mode: 'external'`）——拓扑树里多一个诚实标注 ✓ 的叶子节点。
+ * 这里同时提供 A2 的一小块：派发开始时往父会话追加一行 `subagent/catalog`
+ * （`mode: 'external'`）——内核会话顶部的「N 个子智能体」下拉框立刻能看到
+ * 这条 CLI 子代理（external 行不可打开，只作为任务记录）。
  */
 
 import { runDispatch, type DispatchDeps, type DispatchParams, type DispatchValue } from './dispatch.js'
@@ -70,14 +71,16 @@ export async function mirrorAsJob(options: {
   deps: DispatchDeps
   params: DispatchParams
   signal: AbortSignal
+  /** 任务 id 一创建就回调（tool 用它立刻写 external 目录行）。 */
+  onTaskId?: (id: string) => void
 }): Promise<DispatchValue> {
-  const { jobs, owner, label, deps, params, signal } = options
+  const { jobs, owner, label, deps, params, signal, onTaskId } = options
   let taskId: string | undefined
   let handle: JobHandleFace | undefined
   let valuePromise: Promise<DispatchValue> | undefined
   const run = (): Promise<DispatchValue> => {
     valuePromise ??= runDispatch(deps, params, signal, {
-      onTaskId: (id) => { taskId = id },
+      onTaskId: (id) => { taskId = id; onTaskId?.(id) },
       onEvent: (kind, text) => { handle?.append(text, { channel: kind === 'error' ? 'stderr' : 'stdout' }) },
       onPhase: (phase, note) => { handle?.updateProgress(note === undefined || note.trim() === '' ? phase : note) },
     })

@@ -22,6 +22,7 @@ export interface BoardTabInput {
   readonly ctx: BoardTabProps['ctx']
   readonly scope: { readonly sessionId: string; readonly cwd?: string }
   readonly visible?: boolean
+  readonly store?: BoardTabProps['store']
 }
 
 /** `ctx.betterSidebar` 的结构化镜像（宿主包不跨包可 import）。 */
@@ -78,6 +79,7 @@ export function registerBoardTab(ctx: ClientContext): void {
           ctx: input.ctx,
           scope: input.scope,
           visible: input.visible !== false,
+          ...(input.store === undefined ? {} : { store: input.store }),
         }),
       })
     } catch (cause) {

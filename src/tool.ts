@@ -7,7 +7,6 @@
  */
 
 import type { Context } from '@deepseek-ai/cordis'
-import { randomUUID } from 'node:crypto'
 import { TASK_DIFFICULTIES } from './config.js'
 import { parseDispatchParams, runDispatch, type DispatchDeps, type DispatchParams, type DispatchValue } from './dispatch.js'
 import { externalCatalogRow, mirrorAsJob } from './job-mirror.js'
@@ -58,7 +57,7 @@ export const TOOL_PARAMETER_SCHEMA = {
     cwd: { type: 'string', description: '执行目录（绝对路径）。省略时沿用本会话工作区，并在返回的 notes 里标注实际使用的目录。' },
     resume: { type: 'string', description: '续接之前的 CLI 子代理会话：传上次结果里的 sessionRef（claude 的 session id 或 codex 的 thread id），本次任务作为该会话的后续指令执行。原会话对话不会自动带入，需要的结论要写进 task；不带此参数则开全新会话。' },
     model: { type: 'string', description: '临时指定该子代理的模型；不填则默认沿用主代理当前选择的模型（协议不支持该 CLI 时改用配置页的 dsh 模型）。两者都不可用时任务会直接报错并说明原因，不会回落到 CLI 自身配置的模型。' },
-    timeout_minutes: { type: 'number', description: '超时（分钟，1–240），缺省用配置页的每 CLI 超时。' },
+    timeout_minutes: { type: 'number', description: 'CLI 连续无 stdout/stderr 输出超时（分钟，1–240），不是总运行时长；非空输出分片重置计时。这是无输出保护，不代表任务语义进展。缺省用配置页的每 CLI 超时。' },
   },
   required: ['task', 'task_difficulty', 'difficulty_reason'],
 } as const
@@ -141,23 +140,29 @@ export function registerDispatchTool(ctx: Context, deps: MaestroToolDeps): { rea
     // own shape (the abort reason included).
     const jobs = deps.jobs?.()
     const mirror = deps.readConfig().mirrorAsJob !== false && jobs !== undefined && sessionId !== undefined
+    const concise = parsed.task.replace(/\s+/g, ' ').slice(0, 60)
+    /* A2：任务一创建就补一行 external 目录，内核会话顶部的「N 个子智能体」
+     * 下拉框立刻出现这条 CLI 任务（external 行只作记录，不可打开）。目录投影
+     * 没有按 childId 去重，所以只写一次；写失败不影响派发。 */
+    let catalogued = false
+    const noteCatalog = (taskId: string): void => {
+      if (catalogued || usageSession === undefined) return
+      catalogued = true
+      try {
+        usageSession.append('subagent/catalog', externalCatalogRow(taskId, `cli · ${concise}`, Date.now()))
+      } catch { /* catalog rows are observability; a refusal costs nothing */ }
+    }
     const value = mirror
       ? await mirrorAsJob({
           jobs,
           owner: sessionId,
-          label: `CLI(${parsed.cli}) ${parsed.task.replace(/\s+/g, ' ').slice(0, 60)}`,
+          label: `CLI(${parsed.cli}) ${concise}`,
           deps,
           params,
           signal: exec.signal,
+          onTaskId: noteCatalog,
         })
-      : await runDispatch(deps, params, exec.signal)
-    // A2: 一次成功的派发在父会话补一行 external 目录（拓扑树里的 ✓ 叶子）。
-    // 会话事件模型不可见；失败的任务不写——✓ 只代表完成。绝不影响派发结果。
-    if (value.ok && usageSession !== undefined && deps.readConfig().mirrorAsJob !== false) {
-      try {
-        usageSession.append('subagent/catalog', externalCatalogRow(`u-${randomUUID().slice(0, 8)}`, `cli · ${parsed.task.replace(/\s+/g, ' ').slice(0, 60)}`, Date.now()))
-      } catch { /* catalog rows are observability; a refusal costs nothing */ }
-    }
+      : await runDispatch(deps, params, exec.signal, { onTaskId: noteCatalog })
     return value
   }
 
