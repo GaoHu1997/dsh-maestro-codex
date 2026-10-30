@@ -2,6 +2,8 @@
 
 > **已被取代（2026-10）**：用户改选「自建任务看板」——本插件用 `ctx.betterSidebar.registerTab` 注册独立的「任务看板」tab，把 DSH 主任务/子任务、CLI 子代理、后台任务放进同一页，而不是往 `dsh-better-sidebar` 的任务页里塞数据（那个页面对 `external` 子级没有实时态，塞进去也只能显示「已完成」）。实现见 `src/client/board/`，设计说明见 [task-board.md](task-board.md)。本文保留为调研记录。
 >
+> **更新（2026-10-30）**：文中的**方案 B（镜像成后台 job）与 A2（external 目录行）已实施**——见 `src/job-mirror.ts`（`mirrorAsJob` / `externalCatalogRow`，配置项 `mirrorAsJob`，默认开）与 `src/tool.ts` 的接线。行为与 §3/§5 的设计一致：job 只是旁路镜像，`jobs.start` 失败静默降级为裸 dispatch，工具返回不变。任务看板与 dsh 原生任务页从此共用同一次派发的事实源。
+>
 > 目标：主代理调用 `dispatch_cli_task` 派发 claude/codex 后，右侧「任务管理」tab（截图红框）能显示这个任务——至少要有「正在运行 / 已完成 / 失败」、实时输出、可强制终止。
 
 ## 1. 现状诊断：为什么现在看不到

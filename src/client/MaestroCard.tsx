@@ -20,8 +20,11 @@ import {
   installCli, refreshCli, uninstallCli, type Call,
 } from './api.js'
 import { cliMinTaskDifficulty, fieldText, type MaestroFormActions, type MaestroFormState, type MaestroStore, type SectionValue, type StagedField } from './form.js'
+import { formatDuration, formatTokens } from './board/model.js'
+import type { BoardHost } from './board/data.js'
+import { useUsageSummary } from './usage-panel.js'
 import {
-  cleanLogText, CLI_LABELS, CLI_PACKAGES, MAESTRO_CLI_IDS, TASK_TYPE_CATALOG,
+  cleanLogText, CLI_LABELS, CLI_PACKAGES, MAESTRO_CLI_IDS, TASK_TYPE_CATALOG, TERMINAL_PHASES,
   type DshProviderModels, type MaestroCliId, type MaestroCliVersions, type MaestroOverview, type MaestroPhase,
   type MaestroTaskDetail,
 } from '../wire.js'
@@ -30,6 +33,8 @@ import {
 export interface MaestroCardProps {
   maestroStore: MaestroStore
   maestro: MaestroFormActions
+  /** 客户端服务宿主（读会话 feed 里的 CLI 用量投影）；缺席时统计显示空态。 */
+  maestroCtx?: BoardHost | undefined
 }
 
 /** Per-CLI identity colors, reused by the row monograms and the task list. */
@@ -53,7 +58,7 @@ export function CliDifficultySelect(props: { cli: MaestroCliId; values: SectionV
       value={cliMinTaskDifficulty(props.values, props.cli)}
       options={TASK_DIFFICULTY_OPTIONS}
       onChange={props.onChange}
-      hint="仅控制此 CLI；评估达到门槛才启动，未达门槛由主代理直接完成。默认中；未单独设置时沿用旧的统一设置。"
+      hint="仅控制此 CLI；评估达到门槛才启动，未达门槛改用 dsh 子代理或由主代理直接完成。默认中；未单独设置时沿用旧的统一设置。"
     />
   )
 }
@@ -205,14 +210,20 @@ const CARD_CSS = `
 .dmc-btn-danger:hover:not(:disabled) { background: color-mix(in srgb, var(--dmc-danger) 10%, transparent); }
 .dmc-btn-sm { padding: 3px 9px; font-size: 11.5px; border-radius: 7px; }
 
-/* --- toggle switch --- */
-.dmc-toggle { position: relative; display: inline-flex; align-items: center; gap: 8px; cursor: pointer; user-select: none; }
-.dmc-toggle input { position: absolute; opacity: 0; width: 1px; height: 1px; }
+/* --- toggle switch ---
+ * .dmc-switch (the label) is the only click target: as a flex child the outer
+ * wrapper stretches across the field, and a label around everything would make
+ * the whole row flip the switch. */
+.dmc-toggle { position: relative; display: inline-flex; align-items: center; gap: 8px; user-select: none; }
+.dmc-switch { position: relative; display: inline-flex; cursor: pointer; }
+.dmc-switch input { position: absolute; opacity: 0; width: 1px; height: 1px; }
 .dmc-track { width: 32px; height: 18px; border-radius: 999px; background: color-mix(in srgb, var(--dmc-fg3) 45%, transparent); position: relative; transition: background .18s; flex: none; }
-.dmc-toggle input:checked + .dmc-track { background: var(--dmc-accent); }
-.dmc-toggle input:focus-visible + .dmc-track { outline: 2px solid var(--dmc-accent); outline-offset: 2px; }
+.dmc-switch input:checked + .dmc-track { background: var(--dmc-accent); }
+.dmc-switch input:focus-visible + .dmc-track { outline: 2px solid var(--dmc-accent); outline-offset: 2px; }
 .dmc-knob { position: absolute; top: 2px; left: 2px; width: 14px; height: 14px; border-radius: 999px; background: #fff; box-shadow: 0 1px 2px rgba(0,0,0,.3); transition: left .18s; }
-.dmc-toggle input:checked + .dmc-track .dmc-knob { left: 16px; }
+.dmc-switch input:checked + .dmc-track .dmc-knob { left: 16px; }
+.dmc-switch input:disabled + .dmc-track { opacity: .45; cursor: not-allowed; }
+.dmc-togglelabel { font-size: 12.5px; }
 
 /* --- save bar --- */
 .dmc-savebar { position: sticky; bottom: 0; z-index: 2; display: flex; align-items: center; gap: 10px; flex-wrap: wrap; padding: 10px 14px; border-radius: 10px; border: 1px solid color-mix(in srgb, var(--dmc-warn) 40%, transparent); background: color-mix(in srgb, var(--dmc-warn) 8%, var(--dmc-panel)); box-shadow: 0 -4px 14px rgba(0,0,0,.08); }
@@ -280,14 +291,27 @@ function useStore<T>(store: { getSnapshot(): T; subscribe(listener: () => void):
   return useSyncExternalStore(store.subscribe, store.getSnapshot)
 }
 
-/** A toggle switch (the native checkbox stays in the tree for a11y). */
+/**
+ * A toggle switch (the native checkbox stays in the tree for a11y). Only the
+ * switch itself is the click target: the wrapping element stretches to the
+ * field's full width as a flex child, so a `<label>` around the whole thing
+ * made every click in that row flip the switch — the text sits outside it.
+ */
 function Toggle(props: { checked: boolean; onChange: (value: boolean) => void; label?: string | undefined; disabled?: boolean | undefined }): ReactNode {
   return (
-    <label className="dmc-toggle">
-      <input type="checkbox" checked={props.checked} disabled={props.disabled} onChange={event => { props.onChange(event.target.checked) }} />
-      <span className="dmc-track"><span className="dmc-knob" /></span>
-      {props.label === undefined ? undefined : <span style={{ fontSize: 12.5 }}>{props.label}</span>}
-    </label>
+    <span className="dmc-toggle">
+      <label className="dmc-switch">
+        <input
+          type="checkbox"
+          checked={props.checked}
+          disabled={props.disabled}
+          aria-label={props.label}
+          onChange={event => { props.onChange(event.target.checked) }}
+        />
+        <span className="dmc-track"><span className="dmc-knob" /></span>
+      </label>
+      {props.label === undefined ? undefined : <span className="dmc-togglelabel">{props.label}</span>}
+    </span>
   )
 }
 
@@ -344,11 +368,11 @@ function StagedArea(props: {
 /** One select (writes through immediately). */
 function SelectField(props: {
   label: string; value: string; options: ReadonlyArray<{ value: string; label: string }>
-  onChange: (value: string) => void; hint?: string | undefined
+  onChange: (value: string) => void; hint?: string | undefined; disabled?: boolean | undefined
 }): ReactNode {
   return (
     <Field label={props.label} hint={props.hint}>
-      <select className="dmc-select" value={props.value} onChange={event => { props.onChange(event.target.value) }}>
+      <select className="dmc-select" value={props.value} disabled={props.disabled} onChange={event => { props.onChange(event.target.value) }}>
         {props.options.map(option => <option key={option.value} value={option.value}>{option.label}</option>)}
       </select>
     </Field>
@@ -393,23 +417,29 @@ function PhaseChip(props: { phase: MaestroPhase }): ReactNode {
 function DshModelSelect(props: {
   cli: MaestroCliId; value: string; providers: DshProviderModels[] | undefined; onChange: (value: string) => void
 }): ReactNode {
-  const usableApi = props.cli === 'claude' ? 'anthropic-messages' : 'openai-responses'
+  // codex drives every OpenAI-compatible dsh provider over the responses
+  // dialect, no matter whether dsh declared it openai-responses or
+  // openai-completions (verified live: ofox/xm/tokenrhythm all answer
+  // /responses), so both are offered. claude stays anthropic-only.
+  const usableApis: readonly string[] = props.cli === 'claude'
+    ? ['anthropic-messages']
+    : ['openai-responses', 'openai-completions']
   const providers = props.providers ?? []
-  const mappable = providers.filter(provider => provider.mappable && provider.api === usableApi)
-  const unusableCount = providers.filter(provider => provider.mappable && provider.api !== usableApi).length
+  const mappable = providers.filter(provider => provider.mappable && usableApis.includes(provider.api))
+  const unusableCount = providers.filter(provider => provider.mappable && !usableApis.includes(provider.api)).length
   const hint = [
-    props.cli === 'claude' ? '仅列出 Anthropic 兼容（anthropic-messages）供应商' : '仅列出 openai-responses 协议供应商（codex 0.146+ 已移除 chat 支持）',
+    props.cli === 'claude' ? '仅列出 Anthropic 兼容（anthropic-messages）供应商' : '仅列出 OpenAI 兼容（openai-responses / openai-completions）供应商，统一按 responses 方言驱动（codex 0.146+ 已移除 chat 支持）',
     unusableCount > 0 ? `；另有 ${String(unusableCount)} 个协议不匹配的供应商未列出` : '',
     providers.length === 0 ? '；当前 dsh 没有可映射的供应商' : '',
   ].join('')
   return (
     <Field label="dsh 模型" hint={hint} wide>
       <select className="dmc-select" value={props.value} onChange={event => { props.onChange(event.target.value) }}>
-        <option value="">不使用（CLI 自身配置的模型）</option>
+        <option value="">沿用主代理模型（主代理协议不兼容时任务直接报错）</option>
         {mappable.map(provider => (
           <optgroup key={provider.id} label={`${provider.displayName}（${provider.api}${provider.models.length === 0 ? '' : ` · ${String(provider.models.length)} 个模型`}）`}>
             {provider.models.map(model => (
-              <option key={`${provider.id}::${model}`} value={`${provider.id}::${model}`}>{model}</option>
+              <option key={`${provider.id}::${model.id}`} value={`${provider.id}::${model.id}`}>{model.id}</option>
             ))}
           </optgroup>
         ))}
@@ -424,6 +454,69 @@ interface RegistryVersions {
   versions: string[]
   platform: string
   error: string
+}
+
+const NO_HOST: BoardHost = { get: () => undefined }
+
+/**
+ * 任务监视页顶部的「用量统计」：把各会话的 `maestroCliUsage` 投影折成近 7 天
+ * 的汇总。会话 feed 缺席时显示空态，绝不挡住任务记录。
+ */
+export function UsageGroup(props: { ctx: BoardHost | undefined }): ReactNode {
+  const usage = useUsageSummary(props.ctx ?? NO_HOST)
+  return (
+    <div className="dmc-group">
+      <p className="dmc-grouptitle">用量统计（最近 7 天）</p>
+      {usage.requests === 0 ? (
+        <span className="dmc-hint">近 7 天还没有 CLI 调用。每次派发结算后计入所属会话的 maestroCliUsage 投影（每会话保留最近 20 次明细）。</span>
+      ) : (
+        <>
+          <div className="dmc-chips">
+            <StateChip tone="accent">{`调用 ${String(usage.requests)}`}</StateChip>
+            <StateChip tone="ok">{`成功 ${String(usage.ok)}`}</StateChip>
+            {usage.failed > 0 && <StateChip tone="err">{`失败 ${String(usage.failed)}`}</StateChip>}
+            {usage.cancelled > 0 && <StateChip tone="idle">{`取消 ${String(usage.cancelled)}`}</StateChip>}
+            <StateChip tone="idle">{`入 ${formatTokens(usage.inputTokens)} · 出 ${formatTokens(usage.outputTokens)} · 缓存 ${formatTokens(usage.cachedInputTokens)}`}</StateChip>
+            <StateChip tone="idle">{`总耗时 ${formatDuration(usage.durationMs)}`}</StateChip>
+          </div>
+          {MAESTRO_CLI_IDS.map(cli => {
+            const bucket = usage.perCli[cli]
+            if (bucket === undefined || bucket.requests === 0) return undefined
+            return (
+              <div key={cli} className="dmc-sdkmeta">
+                <span style={{ color: CLI_BRAND[cli], fontWeight: 600 }}>{CLI_LABELS[cli]}</span>
+                <span>{`调用 ${String(bucket.requests)}`}</span>
+                <span>{`成功 ${String(bucket.ok)}`}</span>
+                {bucket.failed > 0 && <span style={{ color: 'var(--dmc-danger)' }}>{`失败 ${String(bucket.failed)}`}</span>}
+                <span>{`入 ${formatTokens(bucket.inputTokens)} · 出 ${formatTokens(bucket.outputTokens)}`}</span>
+                <span>{`累计 ${formatDuration(bucket.durationMs)}`}</span>
+              </div>
+            )
+          })}
+          {usage.recent.map(record => (
+            <div key={record.taskId} className="dmc-code">
+              {`${new Date(record.startedAt).toLocaleTimeString()}  ${CLI_LABELS[record.cli]}${record.model === '' ? '' : ` · ${record.model}`} · ${record.phase === 'done' ? '成功' : record.phase === 'cancelled' ? '已取消' : '失败'} · ${formatDuration(record.durationMs)}`}
+            </div>
+          ))}
+        </>
+      )}
+      <span className="dmc-hint">重启后仍可翻看的结果保存在 $DSH_HOME/maestro/tasks（可在「调度设置」关闭）。</span>
+    </div>
+  )
+}
+
+/** The events a task's log view keeps (oldest pages drop first). */
+const DETAIL_EVENT_CAP = 400
+
+/**
+ * Fold one polled detail page into the accumulated view. Events only ever
+ * append (the cursor already dedupes); a phase change re-renders but must NOT
+ * reset the transcript — that used to wipe every earlier log line the moment
+ * the task completed.
+ */
+export function mergeTaskDetail(previous: MaestroTaskDetail | undefined, rest: MaestroTaskDetail): MaestroTaskDetail {
+  if (previous === undefined) return rest
+  return { ...rest, events: [...previous.events, ...rest.events].slice(-DETAIL_EVENT_CAP) }
 }
 
 export function MaestroCard(props: MaestroCardProps): ReactNode {
@@ -507,7 +600,8 @@ export function MaestroCard(props: MaestroCardProps): ReactNode {
     return () => { disposed = true }
   }, [tab, values.minTaskDifficulty, values.claudeMinTaskDifficulty, values.codexMinTaskDifficulty, values.defaultCli, values.claudeTaskTypes, values.codexTaskTypes, values.claudeEnabled, values.codexEnabled])
 
-  // Poll the selected task's detail while it is interesting.
+  // Poll the selected task's detail until it settles: a terminal phase stops
+  // the timer instead of polling a finished task forever.
   useEffect(() => {
     if (selectedId === '') {
       setDetail(undefined)
@@ -515,18 +609,21 @@ export function MaestroCard(props: MaestroCardProps): ReactNode {
     }
     let disposed = false
     let cursor = 0
+    let timer: ReturnType<typeof setInterval> | undefined
     const tick = async (): Promise<void> => {
       const result = await fetchTaskDetail(selectedId, cursor)
       if (disposed || !result.ok) return
       const { ok: _ok, ...rest } = result
       cursor = rest.nextCursor
-      setDetail(previous => previous === undefined || previous.summary.phase !== rest.summary.phase || previous.summary === rest.summary
-        ? rest
-        : { ...rest, events: [...previous.events, ...rest.events].slice(-400) })
+      setDetail(previous => mergeTaskDetail(previous, rest))
+      if (TERMINAL_PHASES.includes(rest.summary.phase) && timer !== undefined) {
+        clearInterval(timer)
+        timer = undefined
+      }
     }
     void tick()
-    const timer = setInterval(() => { void tick() }, 2000)
-    return () => { disposed = true; clearInterval(timer) }
+    timer = setInterval(() => { void tick() }, 2000)
+    return () => { disposed = true; if (timer !== undefined) clearInterval(timer) }
   }, [selectedId])
 
   /** Run one route call under the global busy flag; errors land in `notice`. */
@@ -565,10 +662,28 @@ export function MaestroCard(props: MaestroCardProps): ReactNode {
   const tasks = overview?.tasks ?? []
   const activeCount = tasks.filter(task => task.phase === 'running' || task.phase === 'queued').length
 
+  /** The dsh model selection of one CLI (`provider::model`, '' = follow the main agent). */
+  const dshSelectionOf = (cli: MaestroCliId): string =>
+    String(cli === 'claude' ? values.claudeDshModel ?? '' : values.codexDshModel ?? '')
+
+  /**
+   * The reasoning efforts the selected dsh model declares (the thinking-level
+   * options ride the model's own configuration). '' selection or a model no
+   * longer in the catalog yields nothing — only the CLI default remains.
+   */
+  const reasoningLevelsOf = (selection: string): readonly string[] => {
+    const at = selection.indexOf('::')
+    if (at <= 0) return []
+    const provider = (dshProviders ?? []).find(entry => entry.id === selection.slice(0, at))
+    return provider?.models.find(model => model.id === selection.slice(at + 2))?.reasoningEfforts ?? []
+  }
+
   /** The model summary shown on a collapsed CLI row. */
   const modelSummary = (cli: MaestroCliId): string => {
-    const dsh = cli === 'claude' ? values.claudeDshModel : values.codexDshModel
-    return typeof dsh === 'string' && dsh !== '' ? `dsh 模型 ${dsh}` : 'CLI 默认模型'
+    const dsh = dshSelectionOf(cli)
+    const thinking = String(cli === 'claude' ? values.claudeThinking ?? '' : values.codexThinking ?? '')
+    const thinkingLabel = thinking === '' ? '' : ` · 思考 ${thinking}`
+    return `${dsh === '' ? '沿用主代理模型' : `dsh 模型 ${dsh}`}${thinkingLabel}`
   }
 
   const statusOf = (cli: MaestroCliId) => overview?.clis?.[cli]
@@ -583,6 +698,25 @@ export function MaestroCard(props: MaestroCardProps): ReactNode {
     const toggleTaskType = (type: string): void => {
       const next = taskTypes.includes(type) ? taskTypes.filter(entry => entry !== type) : [...taskTypes, type]
       actions.setImmediate(taskTypeField, next)
+    }
+    const selection = dshSelectionOf(cli)
+    const thinkingValue = String(cli === 'claude' ? values.claudeThinking ?? '' : values.codexThinking ?? '')
+    // The thinking options ARE the selected model's configured reasoningEfforts.
+    const levels = reasoningLevelsOf(selection)
+    const thinkingOptions: Array<{ value: string; label: string }> = [
+      { value: '', label: '默认（CLI 自身行为）' },
+      ...levels.map(level => ({ value: level, label: level })),
+    ]
+    // A value set before the model changed (or in the config file) stays visible.
+    if (thinkingValue !== '' && !levels.includes(thinkingValue)) {
+      thinkingOptions.push({ value: thinkingValue, label: `${thinkingValue}（当前模型未列出）` })
+    }
+    const changeModel = (value: string): void => {
+      actions.setImmediate(cli === 'claude' ? 'claudeDshModel' : 'codexDshModel', value)
+      // A level the new model doesn't declare would ride every later dispatch — reset it.
+      if (thinkingValue !== '' && !reasoningLevelsOf(value).includes(thinkingValue)) {
+        actions.setImmediate(cli === 'claude' ? 'claudeThinking' : 'codexThinking', '')
+      }
     }
     return (
       <div key={cli} className="dmc-row">
@@ -618,12 +752,22 @@ export function MaestroCard(props: MaestroCardProps): ReactNode {
               <div className="dmc-grid">
                 <DshModelSelect
                   cli={cli}
-                  value={String(cli === 'claude' ? values.claudeDshModel ?? '' : values.codexDshModel ?? '')}
+                  value={selection}
                   providers={dshProviders}
-                  onChange={value => { actions.setImmediate(cli === 'claude' ? 'claudeDshModel' : 'codexDshModel', value) }}
+                  onChange={changeModel}
+                />
+                <SelectField
+                  label="思考等级"
+                  value={thinkingValue}
+                  options={thinkingOptions}
+                  disabled={levels.length === 0 && thinkingValue === ''}
+                  onChange={value => { actions.setImmediate(cli === 'claude' ? 'claudeThinking' : 'codexThinking', value) }}
+                  hint={cli === 'claude'
+                    ? '档位来自所选模型配置的思考档位（reasoningEfforts）；经 MAX_THINKING_TOKENS 传给 claude，off/none 关闭思考，低/中/高映射 4k/10k/32k。'
+                    : '档位来自所选模型配置的思考档位（reasoningEfforts）；经 -c model_reasoning_effort 传给 codex，与「-c 覆盖项」同时设置时覆盖项优先。'}
                 />
               </div>
-              <span className="dmc-hint">从 dsh 已配置的供应商/模型里选；不选则由 CLI 使用它自己的默认模型。</span>
+              <span className="dmc-hint">从 dsh 已配置的供应商/模型里选；不选则由 CLI 使用它自己的默认模型，思考等级也只能保持默认。</span>
             </div>
 
             <CliDifficultySelect
@@ -893,9 +1037,17 @@ export function MaestroCard(props: MaestroCardProps): ReactNode {
                     placeholder="2"
                     hint="同时运行的 CLI 任务数（1–8）"
                   />
+                  <StagedInput
+                    label="失败自动重试"
+                    field="failureRetries"
+                    state={form}
+                    actions={actions}
+                    placeholder="0"
+                    hint="普通失败后自动重跑的次数（0–2，默认 0）。会改文件的任务保持 0：重试可能叠加改动；超时与手动取消不重试。"
+                  />
                 </div>
                 <span className="dmc-hint">
-                  最低任务难度在「CLI 管理」的 Claude / Codex 中分别设置。主代理先评估难度并给出理由，再按任务类型选择 CLI，达到该 CLI 的门槛才启动；未达门槛直接完成，不改选门槛更低的 CLI 绕过限制。仅指定 CLI 名称也不能绕过门槛。低：问答、查询、小范围编辑；中：常规多步骤任务；高：跨模块重构、复杂调试；极高：系统级设计或迁移。关键词只用于选 CLI，不用于抬高难度。
+                  最低任务难度在「CLI 管理」的 Claude / Codex 中分别设置。主代理先判断任务是否需要开子代理，不需要就自己完成；需要时再评估难度并给出理由，按任务类型选择 CLI，达到该 CLI 的门槛才启动；未达门槛改用 dsh 子代理，不改选门槛更低的 CLI 绕过限制。仅指定 CLI 名称也不能绕过门槛。低：问答、查询、小范围编辑；中：常规多步骤任务；高：跨模块重构、复杂调试；极高：系统级设计或迁移。关键词只用于选 CLI，不用于抬高难度。
                 </span>
               </div>
               <div className="dmc-group">
@@ -907,6 +1059,30 @@ export function MaestroCard(props: MaestroCardProps): ReactNode {
                     onChange={value => { actions.setImmediate('bridgeMcp', value) }}
                   />
                   <span className="dmc-hint">开启后，派发的子代理能看到 dsh 自身配置的 MCP 服务器（stdio）。</span>
+                </div>
+                <div className="dmc-field">
+                  <Toggle
+                    checked={values.persistTasks !== false}
+                    label="保存任务结果到本地"
+                    onChange={value => { actions.setImmediate('persistTasks', value) }}
+                  />
+                  <span className="dmc-hint">每次派发结算后把摘要与最终文本写入 $DSH_HOME/maestro/tasks（最多 200 条）；重启后「任务监视」仍能翻看历史。</span>
+                </div>
+                <div className="dmc-field">
+                  <Toggle
+                    checked={values.mirrorAsJob !== false}
+                    label="镜像到 dsh 任务页"
+                    onChange={value => { actions.setImmediate('mirrorAsJob', value) }}
+                  />
+                  <span className="dmc-hint">派发的 CLI 任务同步登记进 dsh 后台任务：右侧任务管理页可看运行状态、流式输出与终止，拓扑树里多一个 ✓ 子代理节点。关闭后仅本插件的任务看板可见。</span>
+                </div>
+                <div className="dmc-field">
+                  <Toggle
+                    checked={values.injectGitContext !== false}
+                    label="自动注入 git 工作区快照"
+                    onChange={value => { actions.setImmediate('injectGitContext', value) }}
+                  />
+                  <span className="dmc-hint">派发前把 cwd 的分支与未提交改动（git status 只读快照）拼在任务开头，CLI 子代理少猜一轮工作区状态。</span>
                 </div>
               </div>
             </div>
@@ -927,6 +1103,11 @@ export function MaestroCard(props: MaestroCardProps): ReactNode {
 
       {tab === 'tasks' && (
         <div className="dmc-stack">
+          <div className="dmc-row">
+            <div className="dmc-body">
+              <UsageGroup ctx={props.maestroCtx} />
+            </div>
+          </div>
           <div className="dmc-row">
             <div className="dmc-body">
               <div className="dmc-group">

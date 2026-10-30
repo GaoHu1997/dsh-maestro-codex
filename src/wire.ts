@@ -48,7 +48,14 @@ export interface DshProviderModels {
   readonly displayName: string
   readonly api: string
   readonly mappable: boolean
-  readonly models: readonly string[]
+  readonly models: readonly DshModelChoice[]
+}
+
+/** One model in a provider's catalog, with its configured reasoning efforts. */
+export interface DshModelChoice {
+  readonly id: string
+  /** Effort keys declared under `reasoningEfforts` (settings order kept). */
+  readonly reasoningEfforts: readonly string[]
 }
 
 /** One bridged dsh MCP server (name only over the wire). */
@@ -79,6 +86,9 @@ export interface MaestroTaskEvent {
   readonly text: string
 }
 
+/** The kinds a task event may carry (restore validates persisted rows against it). */
+export const MAESTRO_EVENT_KINDS: readonly MaestroTaskEvent['kind'][] = ['phase', 'text', 'note', 'error', 'result']
+
 /** npm package that provides each CLI (install/update/uninstall target). */
 export const CLI_PACKAGES: Record<MaestroCliId, string> = {
   claude: '@anthropic-ai/claude-code',
@@ -99,6 +109,32 @@ export const CLI_LABELS: Record<MaestroCliId, string> = {
 export const TASK_TYPE_CATALOG: readonly string[] = [
   '需求分析', '代码生成', '代码审查', '文档写作', '数据处理', '项目测试', '重构', '调试修复',
 ]
+
+/**
+ * The thinking levels a CLI accepts are NOT hardcoded: the card derives the
+ * options from the selected dsh model's `reasoningEfforts` (see
+ * `DshModelChoice`). These two tables only translate a chosen level into each
+ * CLI's own knob; a level absent from its table is ignored at run time.
+ */
+
+/**
+ * claude level → `MAX_THINKING_TOKENS` budget. `off`/`none`/`minimal` disable
+ * thinking (0); the rest follow Claude Code's own keyword tiers (think / think
+ * hard / ultrathink).
+ */
+export const CLAUDE_THINKING_BUDGETS: Readonly<Record<string, number>> = {
+  off: 0,
+  none: 0,
+  minimal: 0,
+  low: 4096,
+  medium: 10000,
+  high: 31999,
+  xhigh: 31999,
+  ultra: 31999,
+}
+
+/** `model_reasoning_effort` values codex parses; anything else (e.g. `off`) is skipped. */
+export const CODEX_REASONING_EFFORTS: readonly string[] = ['minimal', 'low', 'medium', 'high', 'xhigh', 'none']
 
 /** One CLI's published versions (npm registry) for the SDK card's picker. */
 export interface MaestroCliVersions {
@@ -172,6 +208,13 @@ export interface MaestroOverview {
   readonly enabled: boolean
   readonly defaultCli: MaestroCliId
   readonly minTaskDifficulties: Readonly<Record<MaestroCliId, 'low' | 'medium' | 'high' | 'extreme'>>
+  /**
+   * The configured page model (`provider::model`) per CLI, verbatim and
+   * possibly empty. Exposed because it is the fallback that decides which vendor
+   * a dispatched task actually talks to — reading it off the running plugin is
+   * how an operator confirms the card value reached the live config.
+   */
+  readonly dshModels: Readonly<Record<MaestroCliId, string>>
   readonly tasks: readonly MaestroTaskSummary[]
 }
 

@@ -18,6 +18,8 @@ describe('validateConfig', () => {
     expect(() => validateConfig({ claudeTimeoutMinutes: 0 })).toThrow(/claudeTimeoutMinutes/)
     expect(() => validateConfig({ maxConcurrentTasks: 9 })).toThrow(/maxConcurrentTasks/)
     expect(() => validateConfig({ npmRegistry: 'ftp://x' })).toThrow(/npmRegistry/)
+    expect(() => validateConfig({ claudeThinking: 'not a token' })).toThrow(/claudeThinking/)
+    expect(() => validateConfig({ codexThinking: 'a"b' })).toThrow(/codexThinking/)
   })
 })
 
@@ -41,6 +43,38 @@ describe('effectiveOf', () => {
   it('falls back to the default on an out-of-enum value', () => {
     const effective = effectiveOf({ defaultCli: 'yolo' })
     expect(effective.defaultCli).toBe(CONFIG_DEFAULTS.defaultCli)
+  })
+})
+
+describe('thinking levels', () => {
+  it('defaults both CLIs to unset', () => {
+    expect(CONFIG_DEFAULTS.claudeThinking).toBe('')
+    expect(CONFIG_DEFAULTS.codexThinking).toBe('')
+    expect(effectiveOf({}).claude.thinking).toBe('')
+    expect(effectiveOf({}).codex.thinking).toBe('')
+  })
+
+  it('passes model-configured level keys through untouched', () => {
+    // Levels come from the dsh model catalog (reasoningEfforts), so any safe
+    // token is accepted here — the channels decide what each CLI understands.
+    const effective = effectiveOf({ claudeThinking: 'high', codexThinking: 'minimal' })
+    expect(effective.claude.thinking).toBe('high')
+    expect(effective.codex.thinking).toBe('minimal')
+    expect(effectiveOf({ claudeThinking: 'ultra' }).claude.thinking).toBe('ultra')
+    expect(effectiveOf({ codexThinking: 'xhigh' }).codex.thinking).toBe('xhigh')
+  })
+
+  it('rejects unsafe level tokens at the config boundary', () => {
+    expect(() => validateConfig({ claudeThinking: 'a b' } as Config)).toThrow(/claudeThinking/)
+    expect(() => validateConfig({ codexThinking: 'x;y' } as Config)).toThrow(/codexThinking/)
+  })
+
+  it('schema parses and projects the fields as volatile', () => {
+    const parsed = Config({ claudeThinking: 'medium', codexThinking: 'high' }) as Config
+    expect(readVolatile(parsed.claudeThinking)).toBe('medium')
+    expect(readVolatile(parsed.codexThinking)).toBe('high')
+    expect(Config.dict.claudeThinking.meta.volatile).toBe(true)
+    expect(Config.dict.codexThinking.meta.volatile).toBe(true)
   })
 })
 
@@ -140,5 +174,16 @@ describe('redactEffective', () => {
     expect(redacted.claude.permissionMode).toBe('acceptEdits')
     // The original keeps the real values.
     expect(effective.claude.authToken).toBe('sk-secret')
+  })
+})
+
+describe('persistTasks', () => {
+  it('defaults to on and passes explicit values through', () => {
+    expect(CONFIG_DEFAULTS.persistTasks).toBe(true)
+    expect(effectiveOf({}).persistTasks).toBe(true)
+    expect(effectiveOf({ persistTasks: false }).persistTasks).toBe(false)
+    const parsed = Config({ persistTasks: false }) as Config
+    expect(readVolatile(parsed.persistTasks)).toBe(false)
+    expect(Config.dict.persistTasks.meta.volatile).toBe(true)
   })
 })

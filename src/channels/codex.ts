@@ -6,6 +6,7 @@
  */
 
 import { runProcess } from '../spawn.js'
+import { CODEX_REASONING_EFFORTS } from '../wire.js'
 import type { CodexSandboxMode } from '../config.js'
 
 /** Parsed outcome of one codex run. */
@@ -54,8 +55,14 @@ export function tomlKey(key: string): string {
  * provider: the model, a `maestro_dsh` provider route (base URL + key via env
  * var) and the wire dialect. The key VALUE travels in the child env under
  * `envKey`, never on the command line.
+ *
+ * The dialect is always `responses`: codex ≥0.146 refuses to even parse a config
+ * with `wire_api = "chat"` (`Error loading config.toml: \`wire_api = "chat"\` is
+ * no longer supported`), and every dsh provider this channel can reach — whether
+ * dsh declares it openai-responses or openai-completions — serves `/responses`
+ * in practice, so there is no second dialect to offer.
  */
-export function codexDshModelArgs(model: string, baseUrl: string, wireApi: 'responses' | 'chat'): { args: string[]; envKey: string } {
+export function codexDshModelArgs(model: string, baseUrl: string): { args: string[]; envKey: string } {
   return {
     args: [
       '-c', `model=${tomlString(model)}`,
@@ -63,21 +70,50 @@ export function codexDshModelArgs(model: string, baseUrl: string, wireApi: 'resp
       '-c', 'model_providers.maestro_dsh.name="dsh-maestro"',
       '-c', `model_providers.maestro_dsh.base_url=${tomlString(baseUrl)}`,
       '-c', 'model_providers.maestro_dsh.env_key="MAESTRO_DSH_PROVIDER_KEY"',
-      '-c', `model_providers.maestro_dsh.wire_api=${tomlString(wireApi)}`,
+      '-c', 'model_providers.maestro_dsh.wire_api="responses"',
     ],
     envKey: 'MAESTRO_DSH_PROVIDER_KEY',
   }
 }
 
 /** The argv for one non-interactive run (before the resolved path is prepended). */
-export function codexArgs(model: string, sandbox: CodexSandboxMode, configOverrides: readonly string[] = [], dshModel?: { model: string; baseUrl: string; wireApi: 'responses' | 'chat' }, mcpServers?: ReadonlyArray<{ name: string; command: string; args: readonly string[]; env: Readonly<Record<string, string>> }>): string[] {
-  const args = ['exec', '--json', '--skip-git-repo-check']
+export function codexArgs(model: string, sandbox: CodexSandboxMode, configOverrides: readonly string[] = [], dshModel?: { model: string; baseUrl: string }, mcpServers?: ReadonlyArray<{ name: string; command: string; args: readonly string[]; env: Readonly<Record<string, string>> }>, thinking?: string, resume?: string): string[] {
+  // `codex exec resume <thread-id>` continues a prior non-interactive thread
+  // and shares every exec flag; the follow-up prompt still rides stdin (`-`).
+  const args = resume !== undefined && resume !== ''
+    ? ['exec', 'resume', resume, '--json', '--skip-git-repo-check']
+    : ['exec', '--json', '--skip-git-repo-check']
   if (dshModel !== undefined) {
     // A dsh-catalog model wins: the synthesized provider overrides pin the
     // model, route, base URL and key source, so no `-m` and no config edit.
-    args.push(...codexDshModelArgs(dshModel.model, dshModel.baseUrl, dshModel.wireApi).args)
+    // A dsh route also never loads the operator's own `$CODEX_HOME/config.toml`:
+    // that file pins a model + provider of its own (say `free/qwen3.8` behind a
+    // private local router), agent hook binaries, plugins and MCP servers — none
+    // of which belong to a dispatched task, and all of which take over the run
+    // whenever this channel has no `-c` override to outrank them (that is how a
+    // dispatch ended up on an unknown model and a 503 from the CLI's own router).
+    // The overrides below plus env carry everything this run needs, so dropping
+    // the user config only keeps the run deterministic.
+    args.push('--ignore-user-config')
+    args.push(...codexDshModelArgs(dshModel.model, dshModel.baseUrl).args)
+    // ...but one key of the user config is load-bearing on Windows: codex runs
+    // model commands through its own Windows sandbox, and with the default
+    // (unelevated) policy every `exec_command` is refused — measured on this
+    // host, the child got `Rejected(... blocked by policy)` for `pwsh`, `cmd`
+    // and `bash` alike, i.e. a subagent that could not read a single file. The
+    // operator's `[windows] sandbox = "elevated"` was doing exactly this job
+    // before `--ignore-user-config` dropped it, so it is re-stated here (an
+    // explicit `codexConfigOverrides` entry still wins, being appended later).
+    args.push(...codexWindowsSandboxArgs())
   } else if (model !== '') {
     args.push('-m', model)
+  }
+  // The thinking level rides a regular `-c` override, ahead of the user's own
+  // override list so an explicit `model_reasoning_effort` line there wins.
+  // codex config-parses the value up front, so an unsupported key (the catalog
+  // may declare `off`) must be skipped rather than passed through.
+  if (thinking !== undefined && (CODEX_REASONING_EFFORTS as readonly string[]).includes(thinking)) {
+    args.push('-c', `model_reasoning_effort=${tomlString(thinking)}`)
   }
   for (const override of configOverrides) {
     const trimmed = override.trim()
@@ -88,6 +124,16 @@ export function codexArgs(model: string, sandbox: CodexSandboxMode, configOverri
   // `-` reads the prompt from stdin — no quoting surface for task text.
   args.push('-')
   return args
+}
+
+/**
+ * `-c windows.sandbox=...` restoring codex's Windows sandbox policy that
+ * `--ignore-user-config` would otherwise drop. Only Windows has this knob; on
+ * other platforms codex does not need it (and an unknown `windows.*` key would
+ * just be noise).
+ */
+export function codexWindowsSandboxArgs(platform: string = process.platform): string[] {
+  return platform === 'win32' ? ['-c', 'windows.sandbox="elevated"'] : []
 }
 
 /**
@@ -109,7 +155,9 @@ export function codexMcpArgs(servers: ReadonlyArray<{ name: string; command: str
     }
     // Names come from user config and may contain `.` or spaces; a bare dotted
     // key would be parsed as a nested path, so quote only when necessary.
-    args.push('-c', `mcp_servers.${tomlKey(server.name)} = { ${parts.join(', ')} }`)
+    // No spaces around the top-level `=`: codex splits `-c key=value` on the
+    // first `=` and an untrimmed key would silently miss the override.
+    args.push('-c', `mcp_servers.${tomlKey(server.name)}={ ${parts.join(', ')} }`)
   }
   return args
 }
@@ -149,7 +197,7 @@ function commandSummary(item: NonNullable<CodexFrame['item']>, preview: boolean)
   const suffix = typeof item.exit_code === 'number' ? `（退出码 ${item.exit_code}）` : ''
   const status = item.status === undefined ? '' : `，状态 ${item.status}`
   const output = item.aggregated_output ?? ''
-  return `${label} (completed) ${item.command ?? '?'}${suffix}${status}${output.trim() === '' ? '' : `\n输出：\n${preview ? commandOutputPreview(output) : output}`}`
+  return `${label} ${item.command ?? '?'}${suffix}${status}${output.trim() === '' ? '' : `\n输出：\n${preview ? commandOutputPreview(output) : output}`}`
 }
 
 /** Extract progress facts out of one JSONL frame. */
@@ -215,8 +263,12 @@ export async function runCodexTask(options: {
   cwd: string | undefined
   model: string
   sandbox: CodexSandboxMode
+  /** Configured thinking level ('' = CLI default); rides model_reasoning_effort. */
+  thinking?: string
+  /** Continue a prior non-interactive thread (its thread_id). */
+  resume?: string
   configOverrides?: readonly string[]
-  dshModel?: { model: string; baseUrl: string; apiKey: string; wireApi: 'responses' | 'chat' }
+  dshModel?: { model: string; baseUrl: string; apiKey: string }
   mcpServers?: ReadonlyArray<{ name: string; command: string; args: readonly string[]; env: Readonly<Record<string, string>> }>
   baseUrl: string
   apiKey: string
@@ -224,7 +276,11 @@ export async function runCodexTask(options: {
   signal: AbortSignal
   onEvent: (kind: 'text' | 'note' | 'error', text: string) => void
 }): Promise<CodexRunResult> {
-  const args = codexArgs(options.model, options.sandbox, options.configOverrides ?? [], options.dshModel === undefined ? undefined : { model: options.dshModel.model, baseUrl: options.dshModel.baseUrl, wireApi: options.dshModel.wireApi }, options.mcpServers)
+  const args = codexArgs(options.model, options.sandbox, options.configOverrides ?? [], options.dshModel === undefined ? undefined : { model: options.dshModel.model, baseUrl: options.dshModel.baseUrl }, options.mcpServers, options.thinking, options.resume)
+  // Same skip rule as codexArgs; surface it so a silently dropped level is visible.
+  if (options.thinking !== undefined && options.thinking !== '' && !(CODEX_REASONING_EFFORTS as readonly string[]).includes(options.thinking)) {
+    options.onEvent('note', `思考档位 "${options.thinking}" 不受 codex model_reasoning_effort 支持，已忽略（沿用 CLI 默认）`)
+  }
   const env = codexEnv(options.baseUrl, options.apiKey)
   if (options.dshModel !== undefined) env['MAESTRO_DSH_PROVIDER_KEY'] = options.dshModel.apiKey
 

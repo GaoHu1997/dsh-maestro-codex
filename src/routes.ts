@@ -28,6 +28,27 @@ export function fail(status: number, error: string): RouteOutcome {
   return { status, body: { error } as MaestroRouteError }
 }
 
+/**
+ * Whether a mutating request carries a cross-site `Origin`: browsers attach it
+ * to every cross-origin POST, and the plugin routes have no auth — without
+ * this check any web page could drive install/uninstall/cancel against the
+ * local host. No Origin (curl, host-internal fetch) cannot be judged and is
+ * allowed through; a malformed Origin is rejected.
+ */
+export function crossSitePost(headers: { origin?: string | undefined; host?: string | undefined }): boolean {
+  const origin = headers.origin?.trim() ?? ''
+  if (origin === '') return false
+  const host = headers.host?.trim() ?? ''
+  if (host === '') return false
+  let originHost: string
+  try {
+    originHost = new URL(origin).host
+  } catch {
+    return true
+  }
+  return originHost !== host
+}
+
 /** Deps the route layer needs; the apply layer builds one stable instance. */
 export interface RouteDeps extends DispatchDeps {
   /** Last-known CLI statuses, refreshed in the background. */
@@ -47,7 +68,7 @@ export interface RouteDeps extends DispatchDeps {
 /**
  * Background-refreshed CLI status store. Detection spawns processes (where +
  * --version), so the overview route answers from the snapshot and a single
- * refresh loop keeps it warm (30s) — client polls stay cheap.
+ * refresh loop keeps it warm (45s) — client polls stay cheap.
  */
 export class StatusStore {
   private snapshot: Record<MaestroCliId, MaestroCliStatus> = {
@@ -107,6 +128,7 @@ export function handleOverview(deps: RouteDeps): RouteOutcome {
     enabled: config.enabled,
     defaultCli: config.defaultCli,
     minTaskDifficulties: { claude: config.claude.minTaskDifficulty, codex: config.codex.minTaskDifficulty },
+    dshModels: { claude: config.claude.dshModel, codex: config.codex.dshModel },
     tasks,
   }
   return ok(overview)
@@ -237,6 +259,13 @@ export function handleCliNpmJob(deps: RouteDeps, action: 'install' | 'uninstall'
   const cli = record['cli']
   if (typeof cli !== 'string' || !(MAESTRO_CLI_IDS as readonly string[]).includes(cli)) {
     return fail(400, `"cli" 必须是 ${MAESTRO_CLI_IDS.join(' | ')}`)
+  }
+  // One npm job per CLI at a time: two concurrent `npm -g` runs fight over the
+  // global install lock and leave the status store guessing which one won.
+  const running = deps.registry.list().find(task =>
+    task.id.startsWith('npm-') && task.cli === cli && !isTerminalPhase(task.phase))
+  if (running !== undefined) {
+    return fail(409, `${CLI_LABELS[cli as MaestroCliId]} 已有 npm 任务进行中（${running.title}），请等它结束`)
   }
   const rawVersion = record['version']
   let version: string | undefined

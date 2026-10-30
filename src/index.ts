@@ -18,7 +18,9 @@ import { routingHint } from './routing.js'
 import { listDshModels, resolveDshModelEndpoint, type SettingsDescribeFace } from './dsh-models.js'
 import { discoverMcpServers } from './mcp.js'
 import { installCliUsageProjection } from './usage.js'
-import { StatusStore, handleCliNpmJob, handleCliRefresh, handleCliVersions, handleHint, handleModels, handleOverview, handleTaskCancel, handleTaskDetail, handleTasks, fail, ok, type RouteDeps, type RouteOutcome } from './routes.js'
+import { jobsFaceOf } from './job-mirror.js'
+import { dshHomeOf, loadPersistedTasks, persistTask } from './persist.js'
+import { StatusStore, crossSitePost, handleCliNpmJob, handleCliRefresh, handleCliVersions, handleHint, handleModels, handleOverview, handleTaskCancel, handleTaskDetail, handleTasks, fail, ok, type RouteDeps, type RouteOutcome } from './routes.js'
 import {
   ROUTE_HINT, ROUTE_MODELS, ROUTE_OVERVIEW, ROUTE_CLI_INSTALL, ROUTE_CLI_REFRESH, ROUTE_CLI_UNINSTALL, ROUTE_CLI_VERSIONS, ROUTE_TASK_CANCEL, ROUTE_TASK_DETAIL, ROUTE_TASKS,
 } from './wire.js'
@@ -53,6 +55,12 @@ export function apply(ctx: Context, config: Config = {}): void {
   const limiter = new Limiter(() => readConfig().maxConcurrentTasks)
   const pathCache = new CliPathCache(readConfig)
   const statusStore = new StatusStore(readConfig)
+  // Settled dispatch results land under $DSH_HOME/maestro/tasks; boot seeds the
+  // newest batch back into the registry so the task board survives a restart.
+  const dshHome = dshHomeOf()
+  void loadPersistedTasks(dshHome)
+    .then(records => { for (const record of records) registry.restore(record) })
+    .catch(() => { /* history is best effort — boot never waits on it */ })
 
   let toolName = TOOL_NAME
   /**
@@ -86,6 +94,12 @@ export function apply(ctx: Context, config: Config = {}): void {
     process.stderr.write(`[dsh-maestro-codex] ${level}: ${message}\n`)
   }
   const logger = { warn: (message: string) => log('warn', message), error: (message: string) => log('error', message) }
+  // The host jobs service (dsh-jobs-local) mirrors dispatched runs into the
+  // native task page; optional — absent, the tool falls back to bare dispatch.
+  let jobsService: unknown
+  ctx.inject(['jobs'], (jobsCtx) => {
+    jobsService = (jobsCtx as unknown as { get(name: string): unknown }).get('jobs')
+  })
   // The settings face arrives with the settings service; the dsh model catalog
   // and the CLI model resolver both read the composed llm-pi-ai providers
   // through it (baseURL / api / apiKeyEnv per provider route).
@@ -103,6 +117,11 @@ export function apply(ctx: Context, config: Config = {}): void {
     listMcpServers: () => discoverMcpServers(),
     mcpDiagnosticsEnabled: () => readConfig().mcpDiagnostics,
     describeSettings: () => settingsFace?.describe() ?? [],
+    persist: (task) => {
+      if (readConfig().persistTasks === false) return
+      void persistTask(dshHome, task)
+    },
+    jobs: () => jobsFaceOf(jobsService),
     logger,
   }
 
@@ -159,6 +178,12 @@ export function apply(ctx: Context, config: Config = {}): void {
     const route = (path: string, label: string, handle: (req: IncomingMessage, body: unknown) => Promise<RouteOutcome> | RouteOutcome): void => {
       webCtx.effect(() => webCtx.webServer.register({ kind: 'exact', path, handler: async (req: IncomingMessage, res: ServerResponse) => {
         try {
+          // The routes have no auth; a cross-site page must not be able to
+          // drive install/uninstall/cancel against the local host.
+          if (req.method !== 'GET' && req.method !== 'HEAD' && crossSitePost({ origin: req.headers.origin, host: req.headers.host })) {
+            send(res, fail(403, 'cross-origin request rejected'))
+            return
+          }
           const body = req.method === 'GET' || req.method === 'HEAD' ? {} : await readJson(req)
           send(res, await handle(req, body))
         } catch (error) {

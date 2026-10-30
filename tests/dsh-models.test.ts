@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { listDshModels, parseDshModelSelection, providerProfiles, resolveDshModelEndpoint, dshModelSelectionError } from '../src/dsh-models.js'
+import { declaredModels, listDshModels, parseDshModelSelection, providerProfiles, resolveDshModelEndpoint, dshModelSelectionError } from '../src/dsh-models.js'
 import type { Context } from '@deepseek-ai/cordis'
 
 describe('parseDshModelSelection', () => {
@@ -52,6 +52,26 @@ describe('listDshModels', () => {
     expect(ofox?.displayName).toBe('中粮网关')
     expect(ofox?.mappable).toBe(true)
     expect(bare?.mappable).toBe(false)
+  })
+
+  it('carries each model’s configured reasoningEfforts as the thinking levels', () => {
+    const models = declaredModels({ models: [
+      'bare/string-model',
+      { id: 'anthropic/claude-fable-5', name: 'Claude Fable 5', reasoningEfforts: { off: null, low: 'low', medium: 'medium', high: 'high' }, reasoning: 'high' },
+      { id: 'openai/gpt-6' },
+      { reasoningEfforts: { low: 'low' } },
+      42,
+    ] })
+    expect(models).toEqual([
+      { id: 'bare/string-model', reasoningEfforts: [] },
+      { id: 'anthropic/claude-fable-5', reasoningEfforts: ['off', 'low', 'medium', 'high'] },
+      { id: 'openai/gpt-6', reasoningEfforts: [] },
+    ])
+  })
+
+  it('returns nothing without a models array', () => {
+    expect(declaredModels({})).toEqual([])
+    expect(declaredModels({ models: 'nope' })).toEqual([])
   })
 })
 

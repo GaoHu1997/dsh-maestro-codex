@@ -306,7 +306,19 @@ describe('runtime difficulty gate', () => {
     config.claude.minTaskDifficulty = 'high'
     config.codex.minTaskDifficulty = 'low'
     if (scenario.disabled !== undefined) config[scenario.disabled].enabled = false
-    const { deps, registry, controllers } = makeDeps(config, cli.spawnFn, vi.fn())
+    // The dispatch no longer falls back to the CLI's own model, so the fixture
+    // has to name a usable dsh route; the spy still must stay untouched on a
+    // gate rejection.
+    config.claude.dshModel = 'claude-cfg::m'
+    config.codex.dshModel = 'codex-cfg::m'
+    const resolveDshModel = vi.fn(async (selection: string) => ({
+      provider: selection.slice(0, selection.indexOf('::')),
+      model: 'm',
+      api: (selection.startsWith('claude') ? 'anthropic-messages' : 'openai-responses') as DshModelEndpoint['api'],
+      baseURL: 'https://example.test',
+      apiKey: 'k',
+    }))
+    const { deps, registry, controllers } = makeDeps(config, cli.spawnFn, resolveDshModel)
     const detect = vi.spyOn(deps.pathCache, 'pathOf')
     const acquire = vi.spyOn(deps.limiter, 'acquire')
     const create = vi.spyOn(registry, 'create')
@@ -335,7 +347,7 @@ describe('runtime difficulty gate', () => {
         expect(setController).not.toHaveBeenCalled()
         expect(addAbortListener).not.toHaveBeenCalled()
         expect(onTaskId).not.toHaveBeenCalled()
-        expect(deps.resolveDshModel).not.toHaveBeenCalled()
+        expect(resolveDshModel).not.toHaveBeenCalled()
         expect(listMcpServers).not.toHaveBeenCalled()
         expect(appendUsage).not.toHaveBeenCalled()
         expect(cli.launches).toEqual([])
@@ -419,6 +431,81 @@ describe('model resolution order', () => {
     const value = await runDispatch(deps, { ...assessment, cli: 'claude', task: 'x', model: 'explicit' }, new AbortController().signal)
     expect(value.model).toBe('explicit')
   })
+
+  it('codex falls back when the agent route speaks anthropic-messages (codex cannot use it)', async () => {
+    const cli = fakeCliSpawn(true)
+    const config = fixture()
+    config.codex.dshModel = 'cfg::configured'
+    const { deps } = makeDeps(config, cli.spawnFn, async selection => (selection === 'agent::main'
+      ? endpoint('anthropic-messages', 'agent-model')
+      : endpoint('openai-responses', 'configured-model')))
+    const value = await runDispatch(deps, {
+      ...assessment,
+      cli: 'codex', task: 'x', primaryModel: { provider: 'agent', model: 'main' },
+    }, new AbortController().signal)
+    expect(value.model).toBe('configured-model')
+    expect(value.notes.some(note => note.includes('协议不受 codex 支持'))).toBe(true)
+    expect(value.notes.some(note => note.includes('openai-responses'))).toBe(true)
+  })
+
+  it('codex inherits an openai-completions agent route over the responses dialect', async () => {
+    // dsh labels a provider openai-completions when *dsh* talks chat to it, but
+    // such an upstream usually serves /responses too (verified against ofox), and
+    // codex relays everything over the responses dialect. So a chat-labelled
+    // route must still be handed down instead of being rejected outright.
+    const cli = fakeCliSpawn(true)
+    const config = fixture()
+    config.codex.dshModel = 'cfg::configured'
+    const { deps } = makeDeps(config, cli.spawnFn, async selection => (selection === 'ofox::gpt-6.1-sol'
+      ? { ...endpoint('openai-completions', 'agent-model'), baseURL: 'https://api.ofox.io/v1' }
+      : endpoint('openai-responses', 'configured-model')))
+    const value = await runDispatch(deps, {
+      ...assessment,
+      cli: 'codex', task: 'x', primaryModel: { provider: 'ofox', model: 'gpt-6.1-sol' },
+    }, new AbortController().signal)
+    expect(value.model).toBe('agent-model')
+    expect(value.notes.some(note => note.includes('沿用主代理'))).toBe(true)
+    const launch = cli.launches.find(child => child.spawnArgs[0] === 'exec')
+    expect(launch?.spawnArgs).toContain('model_providers.maestro_dsh.wire_api="responses"')
+    expect(launch?.spawnArgs).toContain('model_providers.maestro_dsh.base_url="https://api.ofox.io/v1"')
+  })
+
+  it('codex hard-fails a configured dsh model on a non-OpenAI protocol', async () => {
+    const cli = fakeCliSpawn(true)
+    const config = fixture()
+    config.codex.dshModel = 'cfg::configured'
+    const { deps, registry } = makeDeps(config, cli.spawnFn, async () => endpoint('anthropic-messages', 'm'))
+    await expect(runDispatch(deps, { ...assessment, cli: 'codex', task: 'x' }, new AbortController().signal))
+      .rejects.toThrow(/codex 只认 OpenAI 兼容端点/)
+    expect(registry.list()[0]?.phase).toBe('failed')
+  })
+
+  it('fails loudly instead of running codex on its own model', async () => {
+    // Reported failure: the primary route spoke a protocol codex cannot use and
+    // the card named no replacement. Falling through to codex's own config.toml
+    // ran an unrelated private router and 503'd, so the dispatch has to stop and
+    // say which routes it tried rather than spawn the child unequipped.
+    const cli = fakeCliSpawn(true)
+    const { deps, registry } = makeDeps(fixture(), cli.spawnFn, async () => endpoint('anthropic-messages', 'agent-model'))
+    const run = runDispatch(deps, {
+      ...assessment,
+      cli: 'codex',
+      task: 'x',
+      primaryModel: { provider: 'ofox', model: 'gpt-6.1-sol' },
+    }, new AbortController().signal)
+    await expect(run).rejects.toThrow(/配置页未设置 codexDshModel/)
+    await expect(run).rejects.toThrow(/ofox::gpt-6\.1-sol/)
+    await expect(run).rejects.toThrow(/不会回退到 codex 自身的配置文件/)
+    expect(registry.list()[0]?.phase).toBe('failed')
+    expect(cli.launches.some(child => child.spawnArgs[0] === 'exec')).toBe(false)
+  })
+
+  it('names the CLI default only when the host exposes no model resolver', async () => {
+    const cli = fakeCliSpawn(true)
+    const { deps } = makeDeps(fixture(), cli.spawnFn)
+    const value = await runDispatch(deps, { ...assessment, cli: 'codex', task: 'x' }, new AbortController().signal)
+    expect(value.notes.some(note => note.includes('读不到 dsh 模型目录'))).toBe(true)
+  })
 })
 
 describe('usage reporting', () => {
@@ -451,6 +538,31 @@ describe('usage reporting', () => {
   it('runs unchanged without a session', async () => {
     const cli = fakeCliSpawn(true)
     const { deps } = makeDeps(fixture(), cli.spawnFn)
+    const value = await runDispatch(deps, { ...assessment, cli: 'claude', task: 'x' }, new AbortController().signal)
+    expect(value.ok).toBe(true)
+  })
+})
+
+describe('persist sink', () => {
+  it('hands the settled task to the sink once, on success and on failure', async () => {
+    const persisted: Array<{ id: string; phase: string }> = []
+    const okDeps = makeDeps(fixture(), fakeCliSpawn(true).spawnFn)
+    okDeps.deps.persist = task => { persisted.push({ id: task.id, phase: task.phase }) }
+    const value = await runDispatch(okDeps.deps, { ...assessment, cli: 'codex', task: 'x' }, new AbortController().signal)
+    expect(value.ok).toBe(true)
+    expect(persisted).toHaveLength(1)
+    expect(persisted[0]).toMatchObject({ phase: 'done' })
+
+    const failDeps = makeDeps(fixture(), fakeCliSpawn(false).spawnFn)
+    failDeps.deps.persist = task => { persisted.push({ id: task.id, phase: task.phase }) }
+    await expect(runDispatch(failDeps.deps, { ...assessment, cli: 'codex', task: 'x' }, new AbortController().signal)).rejects.toThrow()
+    expect(persisted).toHaveLength(2)
+    expect(persisted[1]).toMatchObject({ phase: 'failed' })
+  })
+
+  it('does not fail the dispatch when the sink throws', async () => {
+    const { deps } = makeDeps(fixture(), fakeCliSpawn(true).spawnFn)
+    deps.persist = () => { throw new Error('sink exploded') }
     const value = await runDispatch(deps, { ...assessment, cli: 'claude', task: 'x' }, new AbortController().signal)
     expect(value.ok).toBe(true)
   })

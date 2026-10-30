@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest'
-import { claudeArgs, claudeEnv, claudeFrameEvents, claudePermissionArgs, claudeResultOf, lastLines, runClaudeTask } from '../src/channels/claude.js'
-import { codexArgs, codexDshModelArgs, codexEnv, codexFrameEvents, codexSandboxArgs, runCodexTask, tomlString } from '../src/channels/codex.js'
+import { claudeArgs, claudeEnv, claudeFrameEvents, claudeMcpArgs, claudePermissionArgs, claudeResultOf, lastLines, runClaudeTask } from '../src/channels/claude.js'
+import { codexArgs, codexDshModelArgs, codexEnv, codexFrameEvents, codexSandboxArgs, codexWindowsSandboxArgs, runCodexTask, tomlString } from '../src/channels/codex.js'
 import { scriptedSpawn } from './fake-child.js'
 
 describe('claude argv/env', () => {
@@ -23,6 +23,29 @@ describe('claude argv/env', () => {
       ANTHROPIC_BASE_URL: 'https://gw.example.com',
       ANTHROPIC_AUTH_TOKEN: 'sk-1',
     })
+  })
+
+  it('rides the thinking level on MAX_THINKING_TOKENS', () => {
+    expect(claudeEnv('', '', '')).toEqual({})
+    expect(claudeEnv('', '', 'off')).toEqual({ MAX_THINKING_TOKENS: '0' })
+    expect(claudeEnv('', '', 'medium')).toEqual({ MAX_THINKING_TOKENS: '10000' })
+    expect(claudeEnv('', '', 'high')).toEqual({ MAX_THINKING_TOKENS: '31999' })
+    // Levels come from the model's configured reasoningEfforts; an unmapped
+    // key (catalog drift) is ignored, never guessed.
+    expect(claudeEnv('', '', 'mega')).toEqual({})
+  })
+
+  it('grants bridged servers only through --allowedTools, never as bare argv tokens', () => {
+    const args = claudeMcpArgs('C:/tmp/mcp.json', ['dsh-image', 'obsidian_mcp'])
+    // A bare `mcp__…` token in `claude -p` lands in the positional prompt and
+    // would be prepended to every task's stdin text.
+    expect(args.filter(arg => arg === 'mcp__dsh-image' || arg === 'mcp__obsidian_mcp')).toEqual([])
+    expect(args).toEqual([
+      '--strict-mcp-config',
+      '--mcp-config', 'C:/tmp/mcp.json',
+      '--allowedTools', 'mcp__dsh-image,mcp__obsidian_mcp',
+    ])
+    expect(claudeMcpArgs('C:/tmp/mcp.json', [])).toEqual(['--strict-mcp-config', '--mcp-config', 'C:/tmp/mcp.json'])
   })
 })
 
@@ -104,6 +127,30 @@ describe('runClaudeTask (fake spawn)', () => {
     expect(result.error).toContain('boom happened')
     expect(lastLines('a\nb\nc\nd\ne', 3)).toBe('c | d | e')
   })
+
+  it('names the missing-answer reason when claude exits 0 without a result frame', async () => {
+    const { spawnFn } = scriptedSpawn(child => {
+      child.finish([
+        JSON.stringify({ type: 'system', subtype: 'init', session_id: 's1' }),
+        JSON.stringify({ type: 'result', subtype: 'success', result: '' }),
+      ].join('\n'))
+    })
+    const result = await runClaudeTask({
+      spawnFn,
+      claudePath: 'claude',
+      task: '任务',
+      cwd: undefined,
+      model: '',
+      permissionMode: 'inherit',
+      baseUrl: '',
+      authToken: '',
+      timeoutMs: 10_000,
+      signal: new AbortController().signal,
+      onEvent: () => {},
+    })
+    expect(result.ok).toBe(false)
+    expect(result.error).toContain('未返回文本结果')
+  })
 })
 
 describe('codex argv/env', () => {
@@ -111,7 +158,9 @@ describe('codex argv/env', () => {
     expect(codexArgs('gpt-5-codex', 'workspace-write')).toEqual([
       'exec', '--json', '--skip-git-repo-check', '-m', 'gpt-5-codex', '--sandbox', 'workspace-write', '-',
     ])
-    expect(codexArgs('', 'read-only')).toEqual(['exec', '--json', '--skip-git-repo-check', '--sandbox', 'read-only', '-'])
+    expect(codexArgs('', 'read-only')).toEqual([
+      'exec', '--json', '--skip-git-repo-check', '--sandbox', 'read-only', '-',
+    ])
   })
 
   it('splices -c config overrides before the sandbox flags', () => {
@@ -120,20 +169,52 @@ describe('codex argv/env', () => {
     ])
   })
 
-  it('synthesizes the dsh provider overrides in place of -m', () => {
-    const args = codexArgs('cli-model', 'workspace-write', [], { model: 'group/deepseek-v4.1-flash', baseUrl: 'https://gw/v1', wireApi: 'chat' })
-    expect(args).toEqual([
+  it('puts the thinking override ahead of the user -c list, skipping unsupported keys', () => {
+    expect(codexArgs('', 'read-only', ['model_reasoning_effort="low"'], undefined, undefined, 'high')).toEqual([
       'exec', '--json', '--skip-git-repo-check',
+      '-c', 'model_reasoning_effort="high"',
+      '-c', 'model_reasoning_effort="low"',
+      '--sandbox', 'read-only',
+      '-',
+    ])
+    expect(codexArgs('', 'read-only', [], undefined, undefined, '')).toEqual([
+      'exec', '--json', '--skip-git-repo-check', '--sandbox', 'read-only', '-',
+    ])
+    // codex config-parses the value up front: a key it can't parse (the catalog
+    // may declare `off`) must not reach the argv.
+    expect(codexArgs('', 'read-only', [], undefined, undefined, 'off')).toEqual([
+      'exec', '--json', '--skip-git-repo-check', '--sandbox', 'read-only', '-',
+    ])
+    expect(codexArgs('', 'read-only', [], undefined, undefined, 'mega')).toEqual([
+      'exec', '--json', '--skip-git-repo-check', '--sandbox', 'read-only', '-',
+    ])
+  })
+
+  it('synthesizes the dsh provider overrides in place of -m', () => {
+    const args = codexArgs('cli-model', 'workspace-write', [], { model: 'group/deepseek-v4.1-flash', baseUrl: 'https://gw/v1' })
+    expect(args).toEqual([
+      'exec', '--json', '--skip-git-repo-check', '--ignore-user-config',
       '-c', 'model="group/deepseek-v4.1-flash"',
       '-c', 'model_provider=maestro_dsh',
       '-c', 'model_providers.maestro_dsh.name="dsh-maestro"',
       '-c', 'model_providers.maestro_dsh.base_url="https://gw/v1"',
       '-c', 'model_providers.maestro_dsh.env_key="MAESTRO_DSH_PROVIDER_KEY"',
-      '-c', 'model_providers.maestro_dsh.wire_api="chat"',
+      // codex ≥0.146 refuses `wire_api="chat"` at config-parse time, so the dsh
+      // provider is always injected over the responses dialect.
+      '-c', 'model_providers.maestro_dsh.wire_api="responses"',
+      // `--ignore-user-config` drops the operator's `[windows] sandbox` too, and
+      // without it codex refuses every exec_command on Windows — re-stated here.
+      ...codexWindowsSandboxArgs(),
       '--sandbox', 'workspace-write',
       '-',
     ])
-    expect(codexDshModelArgs('m', 'https://x', 'responses').envKey).toBe('MAESTRO_DSH_PROVIDER_KEY')
+    expect(codexDshModelArgs('m', 'https://x').envKey).toBe('MAESTRO_DSH_PROVIDER_KEY')
+  })
+
+  it('re-states the Windows sandbox only on win32', () => {
+    expect(codexWindowsSandboxArgs('win32')).toEqual(['-c', 'windows.sandbox="elevated"'])
+    expect(codexWindowsSandboxArgs('darwin')).toEqual([])
+    expect(codexWindowsSandboxArgs('linux')).toEqual([])
   })
 
   it('quotes TOML strings for -c overrides', () => {
@@ -171,7 +252,7 @@ describe('codex frame parsing', () => {
     const events = codexFrameEvents({ type: 'item.completed', item })
     expect(events).toHaveLength(1)
     expect(events[0]?.kind).toBe('note')
-    expect(events[0]?.text).toContain('(completed)')
+    expect(events[0]?.text).toContain('命令完成')
     expect(events[0]?.text).toContain('退出码 0')
     expect(events[0]?.text).toContain('hi\n')
   })

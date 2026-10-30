@@ -6,6 +6,10 @@
  * 2. 后台任务名册（`ctx.jobs`）—— 运行中/已结束的 job，含状态与输出；
  * 3. 本插件的 CLI 任务路由（`/plugin/dsh-maestro-codex/tasks`）。
  *
+ * 会话树是骨架，CLI 任务按归属会话挂成那个会话的子节点（`attachRows`），所以
+ * 「某个子代理派出去的 CLI 子代理」就长在它下面，而不是另起一段列表。后台
+ * 作业**不进树**：渲染层把它们单独画在底部的固定高度任务列表里（见 Board）。
+ *
  * 纯函数、不 import React：单测直接跑模型，渲染层只负责把模型画出来。
  *
  * @module dsh-maestro-codex/client/board/model
@@ -78,8 +82,12 @@ export interface BoardJobRow {
   readonly job: BoardJob
 }
 
+/** 节点种类：会话/子代理、CLI 子代理任务、后台作业、折叠组。 */
+export type BoardNodeKind = 'agent' | 'cli' | 'job' | 'fold'
+
 /** 任务树的一个节点。 */
 export interface BoardNode {
+  readonly kind: BoardNodeKind
   readonly id: string
   readonly title: string
   /** 根会话还是子代理。 */
@@ -92,6 +100,14 @@ export interface BoardNode {
   readonly status: BoardStatus
   readonly tokens?: BoardTokenUsage
   readonly timing?: BoardTiming
+  /** CLI 子代理任务（`kind === 'cli'` 时才有）。 */
+  readonly task?: MaestroTaskSummary
+  /** 后台作业行（`kind === 'job'` 时才有）。 */
+  readonly jobRow?: BoardJobRow
+  /** 折进这一行的成员（`kind === 'fold'` 时才有）。 */
+  readonly members?: readonly BoardNode[]
+  /** 折叠组挂在哪个父节点下（`kind === 'fold'` 时才有）。 */
+  readonly foldParent?: string
   readonly children: readonly BoardNode[]
 }
 
@@ -111,30 +127,45 @@ interface ChildRef {
   readonly mode?: string
 }
 
-function childrenOf(
-  parentId: string,
+/**
+ * 一次扫描把「父 → 直系子级」索引建好，供整棵树的铺开共用。
+ *
+ * 逐节点全量扫会话表找子级是 O(会话数²)——会话上百后看板每 2.5s 的重建就
+ * 开始发热了。语义保持原样：目录在前（去重）、血缘按标题序补后、两边去重。
+ */
+function childIndex(
   sessions: TreeInput['sessions'],
   catalogs: TreeInput['catalogs'],
-): ChildRef[] {
-  const seen = new Set<string>()
-  const refs: ChildRef[] = []
-  for (const entry of catalogs?.[parentId] ?? []) {
-    if (seen.has(entry.id)) continue
-    seen.add(entry.id)
-    refs.push({ id: entry.id, createdAt: entry.createdAt, mode: entry.mode })
+): ReadonlyMap<string, readonly ChildRef[]> {
+  const buckets = new Map<string, { refs: ChildRef[]; seen: Set<string> }>()
+  const bucketOf = (parentId: string): { refs: ChildRef[]; seen: Set<string> } => {
+    const bucket = buckets.get(parentId)
+    if (bucket !== undefined) return bucket
+    const fresh = { refs: [] as ChildRef[], seen: new Set<string>() }
+    buckets.set(parentId, fresh)
+    return fresh
   }
-  // 会话列表里的血缘是权威补充：continuable 子代理再开的子级未必在父目录里
-  // （目录只记直系、且 external 行不进会话列表），所以两边取并集。
-  const extra = Object.values(sessions)
-    .filter((entry): entry is BoardSession => entry !== undefined && entry.parentId === parentId)
-    .filter(entry => !seen.has(entry.id))
-    .sort((left, right) => left.displayTitle.localeCompare(right.displayTitle, 'zh-Hans-CN'))
-  // 目录在前、血缘补充在后：目录带着 createdAt，是更“原生”的顺序。
-  for (const entry of extra) {
-    seen.add(entry.id)
-    refs.push({ id: entry.id, createdAt: 0 })
+  for (const [parentId, entries] of Object.entries(catalogs ?? {})) {
+    const bucket = bucketOf(parentId)
+    for (const entry of entries ?? []) {
+      if (bucket.seen.has(entry.id)) continue
+      bucket.seen.add(entry.id)
+      bucket.refs.push({ id: entry.id, createdAt: entry.createdAt, mode: entry.mode })
+    }
   }
-  return refs
+  const extra: Array<{ parentId: string; session: BoardSession }> = []
+  for (const entry of Object.values(sessions)) {
+    if (entry === undefined || entry.parentId === undefined || entry.parentId === '') continue
+    extra.push({ parentId: entry.parentId, session: entry })
+  }
+  extra.sort((left, right) => left.session.displayTitle.localeCompare(right.session.displayTitle, 'zh-Hans-CN'))
+  for (const { parentId, session } of extra) {
+    const bucket = bucketOf(parentId)
+    if (bucket.seen.has(session.id)) continue
+    bucket.seen.add(session.id)
+    bucket.refs.push({ id: session.id, createdAt: 0 })
+  }
+  return new Map([...buckets].map(([parentId, bucket]) => [parentId, bucket.refs]))
 }
 
 function statusOf(session: BoardSession | undefined, isRoot: boolean): BoardStatus {
@@ -155,6 +186,15 @@ export function buildSessionTree(input: TreeInput): BoardNode {
   const { rootId, sessions, catalogs, tokens, timings } = input
   const rootSession = sessions[rootId]
   const visiting = new Set<string>()
+  const childrenByParent = childIndex(sessions, catalogs)
+  // 目录行里带着 label，但 build 拿不到那条 entry；一次反查建好索引，
+  // external 幽灵节点取名不再每个节点扫一遍全部目录。
+  const labelById = new Map<string, string>()
+  for (const entries of Object.values(catalogs ?? {})) {
+    for (const entry of entries ?? []) {
+      if ((entry.label ?? '') !== '' && !labelById.has(entry.id)) labelById.set(entry.id, entry.label ?? '')
+    }
+  }
 
   const build = (id: string, depth: number, session: BoardSession | undefined, mode: string | undefined): BoardNode => {
     const external = mode === 'external' || session === undefined
@@ -163,7 +203,7 @@ export function buildSessionTree(input: TreeInput): BoardNode {
      * id 也一并剪掉——血缘数据是宿主写的，但看板不能假设它一定无环。 */
     const childRefs = external
       ? []
-      : childrenOf(id, sessions, catalogs).filter(ref => !visiting.has(ref.id))
+      : (childrenByParent.get(id) ?? []).filter(ref => !visiting.has(ref.id))
     visiting.add(id)
     const children = childRefs.map((ref) => {
       const child = sessions[ref.id]
@@ -171,8 +211,9 @@ export function buildSessionTree(input: TreeInput): BoardNode {
     })
     visiting.delete(id)
     return {
+      kind: 'agent',
       id,
-      title: session?.displayTitle ?? labelOf(id, session, catalogs),
+      title: session?.displayTitle ?? labelOf(id, session, labelById),
       depth,
       running: session?.running === true,
       hasSession: session !== undefined,
@@ -190,21 +231,20 @@ export function buildSessionTree(input: TreeInput): BoardNode {
   return { ...root, title: '当前会话', status: 'idle' }
 }
 
-/** 目录行里带着 label，但 build 拿不到那条 entry，所以按 id 反查一次。 */
-function labelOf(id: string, session: BoardSession | undefined, catalogs: TreeInput['catalogs']): string {
+/** 幽灵节点取名：会话标题优先，否则用目录里那条 label（已建好的索引）。 */
+function labelOf(id: string, session: BoardSession | undefined, labelById: ReadonlyMap<string, string>): string {
   if (session !== undefined) return session.displayTitle
-  for (const entries of Object.values(catalogs ?? {})) {
-    for (const entry of entries ?? []) {
-      if (entry.id === id && entry.label !== undefined && entry.label !== '') return entry.label
-    }
-  }
-  return id
+  return labelById.get(id) ?? id
 }
 
-/** 把树按先序摊平成带缩进的行。 */
+/** 把树按先序摊平成带缩进的行（`depth` 按实际位置重算：挂上来的行原本没有深度）。 */
 export function flattenTree(node: BoardNode): BoardNode[] {
-  const rows: BoardNode[] = [node]
-  for (const child of node.children) rows.push(...flattenTree(child))
+  const rows: BoardNode[] = []
+  const walk = (entry: BoardNode, depth: number): void => {
+    rows.push(entry.depth === depth ? entry : { ...entry, depth })
+    for (const child of entry.children) walk(child, depth + 1)
+  }
+  walk(node, 0)
   return rows
 }
 
@@ -228,15 +268,208 @@ export function filterTree(node: BoardNode, filter: BoardFilter): BoardNode | un
   return { ...node, children }
 }
 
-/** 树里所有会话 id（含根）：后台任务按这组 id 订阅名册。 */
+/**
+ * 树里所有**会话** id（含根）。
+ *
+ * 只收 `kind === 'agent'`：挂上来的 CLI/作业节点 id 带前缀，不是会话 id，
+ * 混进来会让 `watchRows` 与 CLI 任务的会话过滤都查错。
+ */
 export function collectTreeIds(node: BoardNode): string[] {
   const ids: string[] = []
   const walk = (entry: BoardNode): void => {
-    ids.push(entry.id)
+    if (entry.kind === 'agent') ids.push(entry.id)
     for (const child of entry.children) walk(child)
   }
   walk(node)
   return ids
+}
+
+/** 折叠组节点的 id 前缀。 */
+export const FOLD_NODE_PREFIX = 'fold:'
+
+/** 结束态：已经跑完的节点，可以在兄弟层收成一行。 */
+function isSettled(node: BoardNode): boolean {
+  return node.status === 'done' || node.status === 'cancelled' || node.status === 'idle'
+}
+
+/**
+ * 整棵子树都结束了吗。
+ *
+ * 只看自己不够：一个会话可能自己已结束、底下还挂着在跑的子代理或 CLI 任务，
+ * 收起来就把活的东西藏了——那种节点必须留在明面上。
+ */
+function quiet(node: BoardNode): boolean {
+  return isSettled(node) && node.children.every(child => quiet(child))
+}
+
+/** 一个折叠组（把同层已结束的兄弟收成一行）。 */
+function foldNode(id: string, parentId: string, members: readonly BoardNode[]): BoardNode {
+  return {
+    kind: 'fold',
+    id,
+    title: `已完成 ${String(members.length)}`,
+    depth: 0,
+    running: false,
+    hasSession: false,
+    status: 'done',
+    members,
+    foldParent: parentId,
+    // 默认收起；展开由 expandFolds 把 members 塞进 children。
+    children: [],
+  }
+}
+
+/** 折叠选项。 */
+export interface FoldOptions {
+  /** 至少几个已结束的兄弟才值得收起来（默认 2：只剩一个时不收，收了反而多点一次）。 */
+  readonly minMembers?: number
+}
+
+/**
+ * 把同层**已结束**的兄弟节点收成一个折叠组，运行中的照旧平铺。
+ *
+ * 层里节点一多（一次跑十几个子代理），已完成的会淹没还在跑的那几个；收成
+ * 一行「已完成 N」后，视线就落在活着的事情上。失败的不收——出错要一眼看见。
+ *
+ * 折叠组本身是个节点（`kind === 'fold'`），`members` 存着被收起来的原节点，
+ * 默认 `children` 为空（收起）。要展开就再过一遍 `expandFolds`。
+ *
+ * @param node - 子树根。
+ * @param options - 阈值。
+ * @returns 新树；没有任何分组被折时原样返回 `node`（引用稳定）。
+ */
+export function foldFinished(node: BoardNode, options: FoldOptions = {}): BoardNode {
+  const min = options.minMembers ?? 2
+  let touched = false
+  const walk = (entry: BoardNode): BoardNode => {
+    const children = entry.children.map(walk)
+    const live: BoardNode[] = []
+    const settled: BoardNode[] = []
+    for (const child of children) {
+      if (quiet(child)) settled.push(child)
+      else live.push(child)
+    }
+    const next = settled.length >= min
+      ? [...live, foldNode(`${FOLD_NODE_PREFIX}${entry.id}`, entry.id, settled)]
+      : [...live, ...settled]
+    const unchanged = next.length === entry.children.length
+      && next.every((child, index) => child === entry.children[index])
+    if (unchanged) return entry
+    touched = true
+    return { ...entry, children: next }
+  }
+  const result = walk(node)
+  return touched ? result : node
+}
+
+/**
+ * 把 `expanded` 里的折叠组摊开成它的成员。
+ *
+ * 分组在 `foldFinished` 里一次算好，展开只是把 `members` 塞回 `children`——
+ * 单独一趟，避免每次点开都重算整棵树的分组。
+ *
+ * @param node - 子树根。
+ * @param expanded - 要展开的折叠组 id。
+ * @returns 新树；没有折叠组需要展开时原样返回 `node`（引用稳定）。
+ */
+export function expandFolds(node: BoardNode, expanded: ReadonlySet<string>): BoardNode {
+  if (node.kind === 'fold') {
+    if (!expanded.has(node.id)) return node
+    const members = node.members ?? []
+    if (members.length === 0 || node.children.length > 0) return node
+    return { ...node, children: members }
+  }
+  let touched = false
+  const children = node.children.map((child) => {
+    const next = expandFolds(child, expanded)
+    if (next !== child) touched = true
+    return next
+  })
+  return touched ? { ...node, children } : node
+}
+
+/** CLI 任务节点的 id 前缀（避免与会话 id 撞）。 */
+export const CLI_NODE_PREFIX = 'cli:'
+
+/** 后台作业节点的 id 前缀。 */
+export const JOB_NODE_PREFIX = 'job:'
+
+/** 挂载到树上的外部行（CLI 任务）。 */
+export interface AttachInput {
+  readonly tasks?: readonly MaestroTaskSummary[]
+}
+
+/**
+ * 把 CLI 子代理任务挂进会话树。
+ *
+ * 挂载点是任务的**归属会话**（`task.sessionId`）：CLI 子代理是某个会话派出
+ * 去的，所以它天然是那个会话的子级，而不是旁边另开一段列表——这正是「树里
+ * 能看到 CLI 子代理」的关键。后台作业不在这里挂（渲染层单独成面板）。
+ *
+ * 没有归属会话的任务（`sessionId === undefined`，比如配置页手工触发）挂在根上；
+ * 归属会话不在树上时丢弃（树外的会话不属于这个看板的视野）。
+ *
+ * @param root - 会话树根。
+ * @param input - 要挂上去的 CLI 任务。
+ * @returns 新树；没有可挂行时原样返回 `root`（引用稳定）。
+ */
+export function attachRows(root: BoardNode, input: AttachInput): BoardNode {
+  const tasks = input.tasks ?? []
+  if (tasks.length === 0) return root
+
+  const known = new Set(collectTreeIds(root))
+  const taskNodes = new Map<string, BoardNode[]>()
+  for (const task of tasks) {
+    const owner = task.sessionId === undefined || task.sessionId === '' ? root.id : task.sessionId
+    if (!known.has(owner)) continue
+    const bucket = taskNodes.get(owner) ?? []
+    bucket.push(cliNode(task))
+    taskNodes.set(owner, bucket)
+  }
+  if (taskNodes.size === 0) return root
+
+  const walk = (node: BoardNode): BoardNode => {
+    const extra = taskNodes.get(node.id)
+    const children = node.children.map(walk)
+    if (extra === undefined && children.every((child, index) => child === node.children[index])) return node
+    return { ...node, children: [...children, ...(extra ?? [])] }
+  }
+  return walk(root)
+}
+
+/** 一个 CLI 子代理任务节点（叶子：它的日志在行内展开）。 */
+export function cliNode(task: MaestroTaskSummary): BoardNode {
+  return {
+    kind: 'cli',
+    id: `${CLI_NODE_PREFIX}${task.id}`,
+    title: task.title,
+    depth: 0,
+    running: task.phase === 'running' || task.phase === 'queued',
+    hasSession: false,
+    status: cliStatusOf(task.phase),
+    task,
+    children: [],
+  }
+}
+
+/**
+ * 一个后台作业节点（叶子）。
+ *
+ * 作业不挂会话树——渲染层把它们单独画在底部的固定高度面板里；节点模型仍然
+ * 共用 `BoardNode`，这样详情浮层、状态点、元信息行都不用另写一套。
+ */
+export function jobNode(row: BoardJobRow): BoardNode {
+  return {
+    kind: 'job',
+    id: `${JOB_NODE_PREFIX}${row.ownerSessionId}:${row.job.id}`,
+    title: row.job.label,
+    depth: 0,
+    running: jobLive(row.job),
+    hasSession: false,
+    status: jobStatusOf(row.job.status),
+    jobRow: row,
+    children: [],
+  }
 }
 
 /** CLI 任务的阶段 → 看板状态。 */

@@ -12,6 +12,7 @@ import type { ClientContext } from './types.js'
 import { MaestroCard } from './MaestroCard.js'
 import { MaestroForm, type SectionValue } from './form.js'
 import { registerBoardTab } from './board/register.js'
+import type { BoardHost } from './board/data.js'
 
 /** The host entry id — the cordis.patch.yml row id, and the settings namespace
  * the configForms service projects this plugin's volatile config under. */
@@ -34,6 +35,14 @@ export function apply(ctx: ClientContext): void {
   // 右侧栏「任务看板」：与配置卡片独立，配置页没就绪也要有它。
   registerBoardTab(ctx)
 
+  // 任务监视页的用量统计：读客户端会话 feed 里的 maestroCliUsage 投影。
+  // sessions 是壳的核心服务，apply 时已在；缺席时卡片显示空态，不影响其余。
+  const sessionsRef: { current?: unknown } = {}
+  ctx.inject(['sessions'], (injected) => {
+    sessionsRef.current = (injected as unknown as { get(name: string): unknown }).get('sessions')
+  })
+  const usageHost: BoardHost = { get: name => (name === 'sessions' ? sessionsRef.current : undefined) }
+
   const settingsForm = ctx.configForms.get<SectionValue>(PLUGIN_ENTRY_ID)
   const form = new MaestroForm(settingsForm)
   const store = form.bind()
@@ -52,6 +61,7 @@ export function apply(ctx: ClientContext): void {
         inject: () => ({
           maestroStore: store,
           maestro: form.actions(),
+          maestroCtx: usageHost,
         }),
       }, MaestroCard)
       configDisposer = ctx.slots.inject('plugins.bundle.config', register)
@@ -67,6 +77,7 @@ export function apply(ctx: ClientContext): void {
           inject: () => ({
             maestroStore: store,
             maestro: form.actions(),
+            maestroCtx: usageHost,
           }),
         }, MaestroCard))
       } catch {

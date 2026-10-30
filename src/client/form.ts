@@ -33,7 +33,18 @@ export interface SectionValue {
   codexConfigOverrides?: string[]
   codexDshModel?: string
   claudeDshModel?: string
+  /** Thinking level per CLI; '' = the CLI's own default. */
+  claudeThinking?: string
+  codexThinking?: string
   bridgeMcp?: boolean
+  /** Persist settled dispatch results under $DSH_HOME/maestro/tasks. */
+  persistTasks?: boolean
+  /** Mirror dispatched runs into the host jobs service (dsh 任务页). */
+  mirrorAsJob?: boolean
+  /** Prepend a read-only git branch/status snapshot to the child's task text. */
+  injectGitContext?: boolean
+  /** Automatic re-runs after a plain failure (0–2). */
+  failureRetries?: number
   npmRegistry?: string
   maxConcurrentTasks?: number
 }
@@ -49,15 +60,19 @@ export type ImmediateField =
   | 'enabled' | 'claudeEnabled' | 'codexEnabled'
   | 'defaultCli' | 'claudeMinTaskDifficulty' | 'codexMinTaskDifficulty' | 'claudePermissionMode' | 'codexSandbox'
   | 'claudeDshModel' | 'codexDshModel'
+  | 'claudeThinking' | 'codexThinking'
   | 'claudeTaskTypes' | 'codexTaskTypes'
   | 'bridgeMcp'
+  | 'persistTasks'
+  | 'mirrorAsJob'
+  | 'injectGitContext'
 
 /** Fields staged as text and committed on save. */
 export type StagedField =
   | 'codexConfigOverrides'
   | 'claudeBaseUrl' | 'claudeAuthToken' | 'claudeCliPath' | 'claudeTimeoutMinutes'
   | 'codexBaseUrl' | 'codexApiKey' | 'codexCliPath' | 'codexTimeoutMinutes'
-  | 'npmRegistry' | 'maxConcurrentTasks'
+  | 'npmRegistry' | 'maxConcurrentTasks' | 'failureRetries'
 
 /** The multi-line list fields (one entry per line). */
 const LIST_FIELDS: readonly StagedField[] = ['codexConfigOverrides']
@@ -67,6 +82,7 @@ const NUMBER_FIELDS: Readonly<Record<string, { min: number; max: number }>> = {
   claudeTimeoutMinutes: { min: 1, max: 240 },
   codexTimeoutMinutes: { min: 1, max: 240 },
   maxConcurrentTasks: { min: 1, max: 8 },
+  failureRetries: { min: 0, max: 2 },
 }
 
 /** What the card renders. */

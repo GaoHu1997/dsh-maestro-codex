@@ -37,13 +37,19 @@ describe('TaskRegistry', () => {
     expect(tail?.events.at(-1)?.text).toBe('e899')
   })
 
-  it('records terminal phases with an end timestamp and note', () => {
+  it('records terminal phases with an end timestamp; only failures carry an error', () => {
     const registry = new TaskRegistry()
     const task = newTask(registry)
     registry.setPhase(task, 'done', '执行完成')
     expect(task.phase).toBe('done')
     expect(task.endedAt).toBeGreaterThan(0)
-    expect(task.error).toBe('执行完成')
+    // `error` 是失败原因：成功/取消的标签只留在事件流里，否则 UI 会给每个
+    // 成功任务渲染红色错误横幅。
+    expect(task.error).toBeUndefined()
+    expect(task.events.some(event => event.text === '执行完成')).toBe(true)
+    registry.setPhase(task, 'failed', '进程退出码 1')
+    expect(task.error).toBe('进程退出码 1')
+    expect(task.phase).toBe('failed')
     expect(isTerminalPhase(task.phase)).toBe(true)
   })
 
@@ -91,6 +97,22 @@ describe('Limiter', () => {
     third.release()
   })
 
+  it('starts queued tasks when the limit rises without a new acquire', async () => {
+    // 配置页把并发数调大时，排队中的任务必须被放行——不能等某次 release。
+    let limit = 1
+    const limiter = new Limiter(() => limit)
+    const first = limiter.acquire(new AbortController().signal)
+    await first.waited
+    const second = limiter.acquire(new AbortController().signal)
+    let secondStarted = false
+    void second.waited.then(() => { secondStarted = true })
+    limit = 2
+    await new Promise(resolve => { setTimeout(resolve, 400) })
+    expect(secondStarted).toBe(true)
+    first.release()
+    second.release()
+  })
+
   it('rejects a queued waiter on abort without starting it', async () => {
     const limiter = new Limiter(() => 1)
     const controller = new AbortController()
@@ -106,5 +128,90 @@ describe('Limiter', () => {
     const third = limiter.acquire(new AbortController().signal)
     await third.waited
     third.release()
+  })
+})
+
+describe('TaskRegistry.restore', () => {
+  it('seeds a finished task from a persisted record with its event tail', () => {
+    const registry = new TaskRegistry()
+    const restored = registry.restore({
+      id: 'task-persisted',
+      cli: 'codex',
+      title: '历史任务',
+      model: 'm1',
+      sessionId: 's1',
+      phase: 'done',
+      startedAt: 1_000,
+      endedAt: 9_000,
+      exitCode: 0,
+      finalText: '结论',
+      stats: { outputTokens: 3 },
+      events: [
+        { seq: 1, at: 1_100, kind: 'phase' as const, text: '已创建' },
+        { seq: 2, at: 9_000, kind: 'text' as const, text: '结论' },
+      ],
+    })
+    expect(restored?.phase).toBe('done')
+    const summary = registry.list()[0]
+    expect(summary).toMatchObject({ id: 'task-persisted', durationMs: 8_000, sessionId: 's1' })
+    expect(registry.eventsSince('task-persisted', 0)?.events).toHaveLength(2)
+  })
+
+  it('rejects live phases, duplicate ids and malformed events', () => {
+    const registry = new TaskRegistry()
+    expect(registry.restore({
+      id: 'task-live', cli: 'claude', title: 't', phase: 'running', startedAt: 1,
+    })).toBeUndefined()
+    const first = registry.restore({
+      id: 'task-dup', cli: 'claude', title: 't', phase: 'done', startedAt: 1, events: [{ seq: 1, at: 1, kind: 'phase' as const, text: 'a' }],
+    })
+    expect(first).toBeDefined()
+    expect(registry.restore({
+      id: 'task-dup', cli: 'claude', title: 't', phase: 'failed', startedAt: 2,
+    })).toBeUndefined()
+    // 坏事件行被跳过，任务本身仍然进表。
+    expect(registry.restore({
+      id: 'task-badevents', cli: 'claude', title: 't', phase: 'failed', startedAt: 3,
+      events: [undefined, { seq: 1, at: 1, kind: 'phase' as const, text: 'ok' }, { seq: 'x', at: 1, kind: 'phase' as const, text: 'bad' }],
+    } as never)).toBeDefined()
+    expect(registry.eventsSince('task-badevents', 0)?.events).toHaveLength(1) // 只回放那 1 条干净事件
+  })
+
+  it('carries the truncated flag from the persisted record', () => {
+    const registry = new TaskRegistry()
+    registry.restore({
+      id: 'task-truncated', cli: 'claude', title: 't', phase: 'done', startedAt: 1, truncated: true,
+      events: [{ seq: 1, at: 1, kind: 'phase' as const, text: 'a' }],
+    })
+    expect(registry.list()[0]?.truncated).toBe(true)
+  })
+
+  it('keeps original event timestamps instead of resetting them to boot time', () => {
+    const registry = new TaskRegistry()
+    const at = 1_700_000_000_000
+    registry.restore({
+      id: 'task-old', cli: 'claude', title: '历史', phase: 'done', startedAt: at, endedAt: at + 5,
+      events: [{ seq: 1, at, kind: 'text' as const, text: '历史行' }],
+    })
+    const event = registry.eventsSince('task-old', 0)?.events[0]
+    expect(event?.at).toBe(at)
+  })
+
+  it('skips events with unknown kinds or non-integer seqs and still advances the cursor', () => {
+    const registry = new TaskRegistry()
+    registry.restore({
+      id: 'task-corrupt', cli: 'claude', title: 't', phase: 'done', startedAt: 10,
+      events: [
+        { seq: 1, at: 11, kind: 'phase' as const, text: 'ok' },
+        { seq: 4, at: 12, kind: 'bogus' as never, text: '坏 kind' },
+        { seq: 1.5, at: 13, kind: 'text' as const, text: '坏 seq' },
+        { seq: 5, at: 14, kind: 'text' as const, text: '跳跃 seq' },
+      ],
+    })
+    const page = registry.eventsSince('task-corrupt', 0)
+    expect(page?.events.map(event => event.seq)).toEqual([1, 5])
+    // 游标越过不连续的 seq，续读才不会重复投递。
+    expect(page?.nextCursor).toBe(5)
+    expect(registry.eventsSince('task-corrupt', 5)?.events).toEqual([])
   })
 })

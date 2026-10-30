@@ -48,7 +48,7 @@ export function assertTaskDifficulty(config: EffectiveConfig, cli: MaestroCliId,
   if (TASK_DIFFICULTIES.indexOf(assessed) < TASK_DIFFICULTIES.indexOf(minimum)) {
     const legacyNote = taskDifficulty === undefined ? '未提供难度评估，保守按低处理；' : ''
     throw new RoutingError(
-      `${legacyNote}任务难度 ${TASK_DIFFICULTY_LABELS[assessed]}（${assessed}）低于最低难度 ${TASK_DIFFICULTY_LABELS[minimum]}（${minimum}）（实际 CLI：${cli}），未启动 CLI。请由主代理直接完成；只有真实评估达到该 CLI 门槛时才提交 task_difficulty 和 difficulty_reason，指定 cli 或用户点名也不能绕过门槛，也不会改选另一 CLI 绕过限制。`,
+      `${legacyNote}任务难度 ${TASK_DIFFICULTY_LABELS[assessed]}（${assessed}）低于最低难度 ${TASK_DIFFICULTY_LABELS[minimum]}（${minimum}）（实际 CLI：${cli}），未启动 CLI。需要委派时请改用 dsh 子代理（subagent / subagent_fork）；不需要委派则由主代理直接完成。只有真实评估达到该 CLI 门槛时才提交 task_difficulty 和 difficulty_reason，指定 cli 或用户点名也不能绕过门槛，也不会改选另一 CLI 绕过限制。`,
     )
   }
   return assessed
@@ -153,7 +153,7 @@ export function routingHint(config: EffectiveConfig, toolName: string, unavailab
   if (sections.length === 0) return ''
   return [
     `## CLI 子代理（${toolName}）`,
-    '本环境接入了外部 CLI 子代理，但任务类型命中或用户点名不是派发许可。先由主代理按实际范围、步骤、依赖和风险做语义难度评估；按请求或 auto 路由确定真实 CLI 后，只有达到该 CLI 的独立最低难度才可调用。低于门槛请使用自己的工具直接完成，不要先尝试 CLI，也不要改选另一 CLI 绕过限制。',
+    '本环境接入了外部 CLI 子代理。派发前按三步决定：① 先判断该任务是否需要开子代理——不需要就由主代理用现有工具自己完成，不要为了委派而委派；② 需要委派时再按实际范围、步骤、依赖和风险做语义难度评估，并按请求或 auto 路由确定真实 CLI（任务类型命中或用户点名不是派发许可）；③ 真实评估达到该 CLI 的独立最低难度才调用本工具，低于门槛改用 dsh 子代理（subagent / subagent_fork），不要先尝试 CLI，也不要改选另一 CLI 绕过限制。',
     '各 CLI 分别配置最低任务难度。四级有序：low < medium < high < extreme，等于门槛允许派发。',
     '- 低（low）：简短问答、说明、单点修复或小范围编辑；即使提到重构/测试/文档，也不能仅凭关键词升档。',
     '- 中（medium）：范围明确但需要多步完成的一般任务。',

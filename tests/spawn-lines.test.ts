@@ -58,4 +58,29 @@ describe('runProcess line splitting', () => {
     expect(lines).toEqual([])
     expect(result.stderrTail).toContain('dropped an oversized line')
   })
+
+  it('survives a stdio stream error without crashing the host', async () => {
+    // 管道错误没有监听器就是未捕获异常——宿主必须活下来，退出路径照常结算。
+    const lines: string[] = []
+    const { spawnFn } = scriptedSpawn((child) => {
+      queueMicrotask(() => {
+        child.stdout.emit('data', Buffer.from('{"ok":true}\n', 'utf8'))
+        child.stdout.emit('error', new Error('EPIPE'))
+        child.exitCode = 0
+        child.emit('close', 0, null)
+      })
+    })
+    const { outcome } = runProcess({
+      file: 'node',
+      args: [],
+      spawnFn: spawnFn as unknown as SpawnFn,
+      timeoutMs: 5_000,
+      signal: new AbortController().signal,
+      onStdoutLine: (line) => { lines.push(line) },
+    })
+    const result = await outcome
+    expect(result.code).toBe(0)
+    expect(lines).toEqual(['{"ok":true}'])
+    expect(result.stderrTail).toContain('stdout stream error: EPIPE')
+  })
 })

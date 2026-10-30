@@ -6,10 +6,15 @@
  */
 
 import type { MaestroCliId, MaestroPhase, MaestroTaskEvent, MaestroTaskSummary } from './wire.js'
-import { cleanLogText, TERMINAL_PHASES } from './wire.js'
+import { cleanLogText, MAESTRO_EVENT_KINDS, TERMINAL_PHASES } from './wire.js'
 
 /** Event ring cap per task — the agent-facing value needs the summary, the UI needs the tail. */
 const EVENTS_CAP = 800
+
+/** Terminal phases whose note is a failure reason. `done`/`cancelled` notes are
+ * labels ("执行完成") — writing them into `error` made every successful task
+ * render the failure banner in the card and the board. */
+const FAILURE_PHASES: readonly MaestroPhase[] = ['failed', 'timeout']
 
 /** Finished-task cap before the oldest ones are pruned. */
 const TASKS_CAP = 60
@@ -92,12 +97,27 @@ export class TaskRegistry {
     return event
   }
 
+  /** Replays one persisted event verbatim (seq/at preserved; ring still capped). */
+  private replay(task: MaestroTask, seq: number, at: number, kind: MaestroTaskEvent['kind'], text: string): void {
+    const cleaned = cleanLogText(text)
+    const trimmed = cleaned.length > 4000 ? `${cleaned.slice(0, 4000)}…` : cleaned
+    // 非连续 seq（手改/截断的历史文件）也要让游标越过它们，否则续读会重复投递。
+    task.cursor = Math.max(task.cursor, seq)
+    task.events.push({ seq, at, kind, text: trimmed })
+    if (task.events.length > EVENTS_CAP) {
+      task.events.splice(0, task.events.length - EVENTS_CAP)
+      task.truncated = true
+    }
+  }
+
   /** Transition the phase (and stamp the end on terminal transitions). */
   setPhase(task: MaestroTask, phase: MaestroPhase, note?: string): void {
     task.phase = phase
     if (isTerminalPhase(phase)) {
       task.endedAt = Date.now()
-      if (note !== undefined) task.error = note
+      // `error` is the failure reason — a failed lookup for the UI's error
+      // banner. Success/cancel labels only live in the event trail.
+      if (note !== undefined && FAILURE_PHASES.includes(phase)) task.error = note
     }
     this.push(task, 'phase', note ?? `阶段 → ${phase}`)
   }
@@ -105,6 +125,65 @@ export class TaskRegistry {
   /** The route resolved after create(); record the model the child really got. */
   setModel(task: MaestroTask, model: string): void {
     task.model = model
+  }
+
+  /**
+   * Seed one finished task from a persisted record (boot-time history, see
+   * `persist.ts`). Skips live phases, duplicate ids and empty records; restored
+   * tasks age out through the normal prune once live dispatches fill the cap.
+   */
+  restore(record: {
+    id: string
+    cli: MaestroCliId
+    title: string
+    cwd?: string | undefined
+    model?: string | undefined
+    sessionId?: string | undefined
+    phase: MaestroPhase
+    startedAt: number
+    endedAt?: number | undefined
+    exitCode?: number | undefined
+    error?: string | undefined
+    finalText?: string | undefined
+    stats?: Record<string, string | number | boolean> | undefined
+    truncated?: boolean | undefined
+    events?: readonly MaestroTaskEvent[] | undefined
+  }): MaestroTask | undefined {
+    if (!isTerminalPhase(record.phase)) return undefined
+    if (this.tasks.has(record.id)) return undefined
+    const task: MaestroTask = {
+      id: record.id,
+      cli: record.cli,
+      title: record.title,
+      cwd: record.cwd,
+      model: record.model ?? '',
+      sessionId: record.sessionId,
+      phase: record.phase,
+      startedAt: record.startedAt,
+      endedAt: record.endedAt ?? record.startedAt,
+      exitCode: record.exitCode,
+      error: record.error,
+      finalText: record.finalText,
+      stats: record.stats,
+      events: [],
+      cursor: 0,
+      truncated: record.truncated === true,
+    }
+    for (const event of record.events ?? []) {
+      // 回放的是磁盘上可能被动过的 JSON：seq/at/kind/text 全部校验，坏行跳过。
+      if (typeof event?.seq !== 'number' || !Number.isInteger(event.seq) || event.seq <= 0) continue
+      if (typeof event.text !== 'string') continue
+      if (!(MAESTRO_EVENT_KINDS as readonly string[]).includes(event.kind)) continue
+      // 原始时间戳必须保留：重置为 now 会让重启后的历史时间线全部挤在启动一刻。
+      const at = typeof event.at === 'number' && Number.isFinite(event.at) ? event.at : record.startedAt
+      this.replay(task, event.seq, at, event.kind, event.text)
+    }
+    if (task.events.length > EVENTS_CAP) {
+      task.events.splice(0, task.events.length - EVENTS_CAP)
+      task.truncated = true
+    }
+    this.tasks.set(task.id, task)
+    return task
   }
 
   get(id: string): MaestroTask | undefined {
@@ -165,6 +244,7 @@ export class TaskRegistry {
 export class Limiter {
   private active = 0
   private readonly queue: Array<() => void> = []
+  private recheck: NodeJS.Timeout | undefined
 
   constructor(private readonly limit: () => number) {}
 
@@ -190,6 +270,7 @@ export class Limiter {
         const index = this.queue.indexOf(start)
         if (index >= 0) {
           this.queue.splice(index, 1)
+          if (this.queue.length === 0) this.stopRecheck()
           rejectPromise(signal.reason instanceof Error ? signal.reason : new Error('aborted while queued'))
         }
         // Already granted: nothing to unwind here; the runner observes the signal.
@@ -197,6 +278,9 @@ export class Limiter {
       signal.addEventListener('abort', onAbort, { once: true })
       if (this.active < Math.max(1, this.limit())) start()
       else this.queue.push(start)
+      // 上限可能在排队期间被调大（配置页热改并发数）：新 acquire 顺手放行
+      // 已排队的等待者，不必等某次 release 才 pump。
+      this.pump()
     })
     return { waited, release: () => { if (release !== undefined) release() } }
   }
@@ -204,8 +288,27 @@ export class Limiter {
   private pump(): void {
     while (this.active < Math.max(1, this.limit())) {
       const start = this.queue.shift()
-      if (start === undefined) return
+      if (start === undefined) {
+        this.stopRecheck()
+        return
+      }
       start()
     }
+    // 队列非空但槽位仍满：上限是读配置的函数，没有变更推送——只在有人排队时
+    // 低频复查，调大上限后无需等到某次 release / 新派发才放行。
+    if (this.queue.length > 0) this.armRecheck()
+  }
+
+  private armRecheck(): void {
+    if (this.recheck !== undefined) return
+    const timer = setInterval(() => { this.pump() }, 250)
+    timer.unref?.()
+    this.recheck = timer
+  }
+
+  private stopRecheck(): void {
+    if (this.recheck === undefined) return
+    clearInterval(this.recheck)
+    this.recheck = undefined
   }
 }

@@ -88,7 +88,10 @@ describe('claude MCP argv', () => {
 describe('codex MCP argv', () => {
   it('synthesizes one inline-table -c override per server', () => {
     const args = codexMcpArgs([{ name: 'dsh-image', transport: 'stdio', command: 'node.exe', args: ['a.mjs'], env: { K: 'v' } }])
-    expect(args).toEqual(['-c', 'mcp_servers.dsh-image = { command = "node.exe", args = ["a.mjs"], env = { K = "v" } }'])
+    expect(args).toEqual(['-c', 'mcp_servers.dsh-image={ command = "node.exe", args = ["a.mjs"], env = { K = "v" } }'])
+    // The override splits on the first `=`: the key must be bare (no trailing
+    // space) or the whole server would be dropped by codex's -c parser.
+    expect(args[1]?.slice(0, args[1].indexOf('='))).toBe('mcp_servers.dsh-image')
     expect(codexArgs('', 'workspace-write', [], undefined, [{ name: 's', transport: 'stdio', command: 'c', args: [], env: {} }]).join(' ')).toContain('mcp_servers.s')
   })
 })

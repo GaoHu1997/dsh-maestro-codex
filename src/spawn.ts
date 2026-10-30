@@ -174,11 +174,12 @@ export function runProcess(options: {
   if (options.signal.aborted) abort()
   else options.signal.addEventListener('abort', abort, { once: true })
 
-  if (options.stdin !== undefined && child.stdin !== null) {
-    child.stdin.on('error', () => { /* EPIPE when the CLI exits early — the exit code carries the failure */ })
-    child.stdin.end(options.stdin)
-  } else if (child.stdin !== null) {
-    child.stdin.end()
+  if (child.stdin !== null) {
+    // EPIPE when the child exits before the pipe closes — the exit code
+    // carries the failure; an unhandled 'error' here would kill the host.
+    child.stdin.on('error', () => { /* ignored */ })
+    if (options.stdin !== undefined) child.stdin.end(options.stdin)
+    else child.stdin.end()
   }
 
   const wire = (stream: NodeJS.ReadableStream | null, onLine: ((line: string) => void) | undefined, isStderr: boolean): void => {
@@ -217,6 +218,11 @@ export function runProcess(options: {
           onLine(rest)
         }
       }
+    })
+    // A stdio pipe error with no listener is an uncaught exception — the host
+    // must survive the child; the close event still settles the outcome.
+    stream.on('error', (error: Error) => {
+      stderrTail = appendTail(stderrTail, `\n[maestro] ${isStderr ? 'stderr' : 'stdout'} stream error: ${error.message}`)
     })
   }
   wire(child.stdout, options.onStdoutLine, false)

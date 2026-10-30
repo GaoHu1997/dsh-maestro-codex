@@ -2,7 +2,7 @@ import { describe, expect, it } from 'vitest'
 import { effectiveOf, type EffectiveConfig } from '../src/config.js'
 import { CliPathCache } from '../src/dispatch.js'
 import { Limiter, TaskRegistry } from '../src/task-registry.js'
-import { StatusStore, handleCliNpmJob, handleCliVersions, handleHint, handleOverview, handleTaskCancel, handleTaskDetail, handleTasks } from '../src/routes.js'
+import { StatusStore, crossSitePost, handleCliNpmJob, handleCliVersions, handleHint, handleOverview, handleTaskCancel, handleTaskDetail, handleTasks } from '../src/routes.js'
 import { scriptedSpawn } from './fake-child.js'
 
 function makeDeps(
@@ -198,6 +198,24 @@ describe('handleCliNpmJob', () => {
     expect(uninstall?.spawnArgs).toContain('@anthropic-ai/claude-code')
     expect(uninstall?.spawnArgs).not.toContain('@anthropic-ai/claude-code@0.3.312')
   })
+
+  it('refuses a second npm job for the same CLI while one is in flight', async () => {
+    const { deps, registry } = makeDeps()
+    const first = handleCliNpmJob(deps, 'install', { cli: 'claude' })
+    expect(first.status).toBe(200)
+    const duplicate = handleCliNpmJob(deps, 'install', { cli: 'claude', version: '9.9.9' })
+    expect(duplicate.status).toBe(409)
+    expect((duplicate.body as { error: string }).error).toContain('已有 npm 任务进行中')
+    // 卸载与安装共用同一把「每 CLI 一把」的锁。
+    expect(handleCliNpmJob(deps, 'uninstall', { cli: 'claude' }).status).toBe(409)
+    // 另一个 CLI 不受影响。
+    expect(handleCliNpmJob(deps, 'install', { cli: 'codex' }).status).toBe(200)
+    await new Promise(resolvePromise => setTimeout(resolvePromise, 50))
+    // 结束后放行（再等它跑完）。
+    expect(handleCliNpmJob(deps, 'install', { cli: 'claude', version: '9.9.9' }).status).toBe(200)
+    await new Promise(resolvePromise => setTimeout(resolvePromise, 50))
+    expect(registry.list().filter(task => task.id.startsWith('npm-') && task.phase !== 'done')).toHaveLength(0)
+  })
 })
 
 describe('handleHint', () => {
@@ -217,5 +235,22 @@ describe('handleHint', () => {
     expect(body.redacted).not.toHaveProperty('minTaskDifficulty')
     expect(JSON.stringify(body)).not.toContain('sk-secret')
     expect(JSON.stringify(body)).not.toContain('sk-codex-secret')
+  })
+})
+
+describe('crossSitePost', () => {
+  it('allows same-origin, origin-less and host-less requests', () => {
+    expect(crossSitePost({ origin: 'http://127.0.0.1:3000', host: '127.0.0.1:3000' })).toBe(false)
+    expect(crossSitePost({ origin: 'http://localhost:3000', host: 'localhost:3000' })).toBe(false)
+    expect(crossSitePost({ host: '127.0.0.1:3000' })).toBe(false)
+    expect(crossSitePost({ origin: 'https://evil.example' })).toBe(false)
+    expect(crossSitePost({})).toBe(false)
+  })
+
+  it('rejects a cross-site origin (CSRF against the unauthenticated routes)', () => {
+    expect(crossSitePost({ origin: 'https://evil.example', host: '127.0.0.1:3000' })).toBe(true)
+    expect(crossSitePost({ origin: 'http://127.0.0.1:9999', host: '127.0.0.1:3000' })).toBe(true)
+    // Sandboxed iframes send the literal string "null" — not a URL, reject.
+    expect(crossSitePost({ origin: 'null', host: '127.0.0.1:3000' })).toBe(true)
   })
 })

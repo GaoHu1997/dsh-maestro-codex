@@ -7,8 +7,10 @@
  */
 
 import type { Context } from '@deepseek-ai/cordis'
+import { randomUUID } from 'node:crypto'
 import { TASK_DIFFICULTIES } from './config.js'
 import { parseDispatchParams, runDispatch, type DispatchDeps, type DispatchParams, type DispatchValue } from './dispatch.js'
+import { externalCatalogRow, mirrorAsJob } from './job-mirror.js'
 import { sessionUsageAppendOf, type CliUsageSession } from './usage.js'
 
 export const TOOL_NAME = 'dispatch_cli_task'
@@ -54,7 +56,8 @@ export const TOOL_PARAMETER_SCHEMA = {
     task_difficulty: { type: 'string', enum: [...TASK_DIFFICULTIES], description: '主代理对任务实际范围、步骤、依赖和风险的语义评估：简短问答/小范围编辑 low，多步一般任务 medium，跨模块重构 high，系统级复杂任务 extreme；不要按关键词或为了触发 CLI 夸大难度。' },
     difficulty_reason: { type: 'string', description: '非空评估依据（最多 2000 字符），说明真实任务范围、步骤、依赖或风险；必须与 task_difficulty 同时提供，不能仅用任务类型关键词当理由。' },
     cwd: { type: 'string', description: '执行目录（绝对路径）。省略时沿用本会话工作区，并在返回的 notes 里标注实际使用的目录。' },
-    model: { type: 'string', description: '临时指定该子代理的模型；不填则默认沿用主代理当前选择的模型（协议不支持该 CLI 时回退配置页的 dsh 模型），仍未选则用 CLI 默认模型。' },
+    resume: { type: 'string', description: '续接之前的 CLI 子代理会话：传上次结果里的 sessionRef（claude 的 session id 或 codex 的 thread id），本次任务作为该会话的后续指令执行。原会话对话不会自动带入，需要的结论要写进 task；不带此参数则开全新会话。' },
+    model: { type: 'string', description: '临时指定该子代理的模型；不填则默认沿用主代理当前选择的模型（协议不支持该 CLI 时改用配置页的 dsh 模型）。两者都不可用时任务会直接报错并说明原因，不会回落到 CLI 自身配置的模型。' },
     timeout_minutes: { type: 'number', description: '超时（分钟，1–240），缺省用配置页的每 CLI 超时。' },
   },
   required: ['task', 'task_difficulty', 'difficulty_reason'],
@@ -128,19 +131,39 @@ export function registerDispatchTool(ctx: Context, deps: MaestroToolDeps): { rea
     const primaryModel = primaryRouteOf(exec)
     const sessionId = ownerSessionOf(exec)
     const usageSession = usageSessionOf(exec)
-    // DispatchError messages are already agent-facing; anything else keeps its
-    // own shape (the abort reason included).
-    return runDispatch(deps, {
+    const params: DispatchParams = {
       ...parsed,
       ...(primaryModel === undefined ? {} : { primaryModel }),
       ...(sessionId === undefined ? {} : { sessionId }),
       ...(usageSession === undefined ? {} : { usageSession }),
-    }, exec.signal)
+    }
+    // DispatchError messages are already agent-facing; anything else keeps its
+    // own shape (the abort reason included).
+    const jobs = deps.jobs?.()
+    const mirror = deps.readConfig().mirrorAsJob !== false && jobs !== undefined && sessionId !== undefined
+    const value = mirror
+      ? await mirrorAsJob({
+          jobs,
+          owner: sessionId,
+          label: `CLI(${parsed.cli}) ${parsed.task.replace(/\s+/g, ' ').slice(0, 60)}`,
+          deps,
+          params,
+          signal: exec.signal,
+        })
+      : await runDispatch(deps, params, exec.signal)
+    // A2: 一次成功的派发在父会话补一行 external 目录（拓扑树里的 ✓ 叶子）。
+    // 会话事件模型不可见；失败的任务不写——✓ 只代表完成。绝不影响派发结果。
+    if (value.ok && usageSession !== undefined && deps.readConfig().mirrorAsJob !== false) {
+      try {
+        usageSession.append('subagent/catalog', externalCatalogRow(`u-${randomUUID().slice(0, 8)}`, `cli · ${parsed.task.replace(/\s+/g, ' ').slice(0, 60)}`, Date.now()))
+      } catch { /* catalog rows are observability; a refusal costs nothing */ }
+    }
+    return value
   }
 
   const definitionFor = (name: string): unknown => ({
     name,
-    description: '仅将主代理语义评估达到实际选定 CLI 独立最低难度的完整任务派发给外部 CLI 子代理（claude cli 或 codex cli）执行并取回结果。简短问答/小范围编辑 low，多步一般任务 medium，跨模块重构 high，系统级复杂任务 extreme。先评估真实难度并提供 task_difficulty 和 difficulty_reason，按请求或 auto 路由确定真实 CLI（含停用回落），再检查该 CLI 的配置门槛；低于门槛由主代理直接完成，禁止改选门槛更低的 CLI 绕过限制。任务类型命中、指定 cli 或用户点名均不能绕过门槛。CLI 看不到会话上下文，task 必须自包含。',
+    description: '仅将主代理语义评估达到实际选定 CLI 独立最低难度的完整任务派发给外部 CLI 子代理（claude cli 或 codex cli）执行并取回结果。派发前先判断该任务是否需要开子代理：不需要就由主代理自己完成，不要为了委派而委派；需要委派时再评估真实难度并提供 task_difficulty 和 difficulty_reason，按请求或 auto 路由确定真实 CLI（含停用回落），再检查该 CLI 的配置门槛；低于门槛改用 dsh 子代理（subagent / subagent_fork），禁止改选门槛更低的 CLI 绕过限制。简短问答/小范围编辑 low，多步一般任务 medium，跨模块重构 high，系统级复杂任务 extreme。任务类型命中、指定 cli 或用户点名均不能绕过门槛。CLI 看不到会话上下文，task 必须自包含；需要在上次结果的基础上继续时，传 resume=上次返回的 sessionRef 续接同一 CLI 会话。',
     parameters: TOOL_PARAMETER_SCHEMA,
     output: {
       schema: TOOL_OUTPUT_SCHEMA,
@@ -194,9 +217,16 @@ export function parseToolArgs(raw: unknown): DispatchParams | string {
   return parseDispatchParams(raw)
 }
 
+/** The rendered result text cap: the canonical value keeps the full text, the
+ * conversation surface must not eat the context window with one CLI answer. */
+const RENDER_TEXT_CAP = 20_000
+
 /** The summary text the tool result renders into the conversation. */
 export function renderSummary(value: DispatchValue): string {
   const head = `[${value.cli}] ${value.ok ? '任务完成' : '任务失败'}（${Math.round(value.durationMs / 1000)}s，model=${value.model || '默认'}）`
-  const body = value.finalText.trim() === '' ? '（CLI 未返回文本）' : value.finalText
+  const rawBody = value.finalText.trim() === '' ? '（CLI 未返回文本）' : value.finalText
+  const body = rawBody.length > RENDER_TEXT_CAP
+    ? `${rawBody.slice(0, RENDER_TEXT_CAP)}\n…（结果过长已截断 ${rawBody.length - RENDER_TEXT_CAP} 字符，完整文本见任务看板转录）`
+    : rawBody
   return value.ok ? `${head}\n\n${body}` : `${head}\n${body}`
 }

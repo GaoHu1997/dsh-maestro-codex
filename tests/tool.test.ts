@@ -176,8 +176,10 @@ describe('registered tool difficulty gate', () => {
   it('describes semantic assessment rather than encouraging keyword-triggered quick fixes', () => {
     const description = registeredTool(deps()).description
     expect(description).toContain('实际选定 CLI 独立最低难度')
-    expect(description).toContain('先评估真实难度')
+    expect(description).toContain('先判断该任务是否需要开子代理')
+    expect(description).toContain('再评估真实难度')
     expect(description).toContain('再检查该 CLI')
+    expect(description).toContain('低于门槛改用 dsh 子代理')
     expect(description).toContain('禁止改选门槛更低')
     expect(TOOL_PARAMETER_SCHEMA.properties.cli.description).toContain('实际选定 CLI 的独立最低难度')
     expect(TOOL_PARAMETER_SCHEMA.properties.cli.description).not.toContain('达到配置门槛后选择 CLI')
@@ -363,9 +365,12 @@ describe('usage reporting seam', () => {
       { signal: new AbortController().signal, agent: { id: 'session-1', session } },
     )
     expect(value.ok).toBe(true)
-    expect(appended).toHaveLength(1)
+    // 一次成功派发结算两条会话事件：用量记录 + A2 的 external 目录行。
+    expect(appended).toHaveLength(2)
     expect(appended[0]?.type).toBe(CLI_USAGE_EVENT)
     expect(appended[0]?.data).toMatchObject({ cli: 'claude', phase: 'done', sessionId: 'session-1' })
+    expect(appended[1]?.type).toBe('subagent/catalog')
+    expect(appended[1]?.data).toMatchObject({ version: 2, mode: 'external' })
   })
 })
 
@@ -376,5 +381,19 @@ describe('renderSummary', () => {
       exitCode: 0, sessionRef: '', finalText: '', notes: [],
     })
     expect(text).toContain('（CLI 未返回文本）')
+  })
+
+  it('caps an oversized answer in the rendered text and says by how much', () => {
+    const finalText = `结论：${'x'.repeat(60_000)}`
+    const text = renderSummary({
+      ok: true, cli: 'claude', model: 'm', cwd: 'C:\\x', durationMs: 1_000,
+      exitCode: 0, sessionRef: 's', finalText, notes: [],
+    })
+    expect(text.length).toBeLessThan(21_500)
+    expect(text).toContain('已截断')
+    expect(text).toContain('40003')
+    expect(text.startsWith('[claude] 任务完成')).toBe(true)
+    // 截断只发生在渲染层：canonical 值仍带全文。
+    expect(finalText.length).toBe(60_003)
   })
 })

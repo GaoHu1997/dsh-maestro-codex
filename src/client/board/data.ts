@@ -21,6 +21,7 @@ import {
   type MaestroTaskEvent,
   type MaestroTaskSummary,
 } from '../../wire.js'
+import type { CliUsageState } from '../../usage.js'
 import type {
   BoardCatalogEntry, BoardJob, BoardJobRow, BoardSession, BoardTiming, BoardTokenUsage,
 } from './model.js'
@@ -40,12 +41,14 @@ export interface BoardSessionList {
   readonly projectionsBySession?: Readonly<Record<string, BoardProjectionSnapshot | undefined>>
 }
 
-/** 一个会话的投影快照（只声明看板读的那三个 key）。 */
+/** 一个会话的投影快照（只声明看板/用量面板读的那几个 key）。 */
 export interface BoardProjectionSnapshot {
   readonly values: {
     readonly subagentCatalog?: readonly BoardCatalogEntry[]
     readonly tokenUsage?: BoardTokenUsage
     readonly subagentTiming?: BoardTiming
+    /** 本插件自己的 CLI 用量投影（见 src/usage.ts），设置卡的用量统计读它。 */
+    readonly maestroCliUsage?: CliUsageState
   }
 }
 
@@ -303,6 +306,9 @@ export interface BoardCliDetailState {
 
 const EMPTY_DETAIL: BoardCliDetailState = { summary: undefined, events: [], error: undefined, failure: undefined }
 
+/** 连续失败多少次后放弃轮询（瞬时抖动要扛住，真被删除/剪掉的任务要停下）。 */
+const DETAIL_MAX_FAILURES = 5
+
 /**
  * 跟随式读取一个任务的详情与日志（带游标，只追加）。
  * @param id - 任务 id；`null` 表示没有展开任何任务。
@@ -320,14 +326,21 @@ export function useCliDetail(id: string | null, active: boolean, sessionIds?: re
     let cancelled = false
     let cursor = 0
     let events: MaestroTaskEvent[] = []
+    let failures = 0
     let timer: number | undefined
     const load = async (): Promise<void> => {
       const result = await fetchTaskDetail(id, cursor, scopeKey === '' ? undefined : scopeKey.split(','))
       if (cancelled) return
       if (!result.ok) {
+        // 一次抖动不该冻结整个转录：有界重试，连续失败才停下。
+        failures += 1
         setState({ summary: undefined, events, error: result.error, failure: undefined })
+        if (failures < DETAIL_MAX_FAILURES) {
+          timer = window.setTimeout(() => { void load() }, DETAIL_POLL_MS)
+        }
         return
       }
+      failures = 0
       const detail: MaestroTaskDetail = result
       cursor = detail.nextCursor
       events = [...events, ...detail.events].slice(-LOG_CAP)

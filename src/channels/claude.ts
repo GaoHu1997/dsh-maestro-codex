@@ -5,6 +5,7 @@
  */
 
 import { runProcess } from '../spawn.js'
+import { CLAUDE_THINKING_BUDGETS } from '../wire.js'
 import type { ClaudePermissionMode } from '../config.js'
 
 /** Parsed outcome of one claude run. */
@@ -44,27 +45,38 @@ export function claudePermissionArgs(permissionMode: ClaudePermissionMode): stri
 
 /** MCP bridge argv: ONLY the bridged dsh servers, claude's own global config ignored. */
 export function claudeMcpArgs(mcpConfigPath: string, serverNames: readonly string[]): string[] {
+  // `--allowedTools` carries the server-level grants; the names must NOT ride
+  // as bare tokens — in `claude -p` a positional arg IS the prompt, so they
+  // would be prepended to every task's stdin text.
   return [
     '--strict-mcp-config',
     '--mcp-config', mcpConfigPath,
-    ...serverNames.map(name => `mcp__${name}`),
   ].concat(serverNames.length > 0 ? ['--allowedTools', serverNames.map(name => `mcp__${name}`).join(',')] : [])
 }
 
 /** The argv for one headless run (before the resolved path is prepended). */
-export function claudeArgs(model: string, permissionMode: ClaudePermissionMode, mcpConfigPath?: string, mcpServerNames?: readonly string[]): string[] {
+export function claudeArgs(model: string, permissionMode: ClaudePermissionMode, mcpConfigPath?: string, mcpServerNames?: readonly string[], resume?: string): string[] {
   const args = ['-p', '--output-format', 'stream-json', '--verbose']
   if (model !== '') args.push('--model', model)
   args.push(...claudePermissionArgs(permissionMode))
+  // `--resume <session-id>` continues a previous headless session; the
+  // follow-up instruction still rides stdin.
+  if (resume !== undefined && resume !== '') args.push('--resume', resume)
   if (mcpConfigPath !== undefined) args.push(...claudeMcpArgs(mcpConfigPath, mcpServerNames ?? []))
   return args
 }
 
-/** Environment overlays for pointing claude at a dsh-configured provider. */
-export function claudeEnv(baseUrl: string, authToken: string): Record<string, string> {
+/**
+ * Environment overlays for pointing claude at a dsh-configured provider, plus
+ * the thinking budget: the level rides `MAX_THINKING_TOKENS`, the env knob
+ * Claude Code itself reads (headless runs cannot flip the /think keywords).
+ */
+export function claudeEnv(baseUrl: string, authToken: string, thinking: string = ''): Record<string, string> {
   const env: Record<string, string> = {}
   if (baseUrl !== '') env['ANTHROPIC_BASE_URL'] = baseUrl
   if (authToken !== '') env['ANTHROPIC_AUTH_TOKEN'] = authToken
+  const budget = (CLAUDE_THINKING_BUDGETS as Record<string, number | undefined>)[thinking]
+  if (budget !== undefined) env['MAX_THINKING_TOKENS'] = String(budget)
   return env
 }
 
@@ -150,6 +162,10 @@ export async function runClaudeTask(options: {
   cwd: string | undefined
   model: string
   permissionMode: ClaudePermissionMode
+  /** Configured thinking level ('' = CLI default); rides MAX_THINKING_TOKENS. */
+  thinking?: string
+  /** Continue a previous headless session (its result frame's session_id). */
+  resume?: string
   baseUrl: string
   authToken: string
   mcpConfigPath?: string
@@ -158,8 +174,13 @@ export async function runClaudeTask(options: {
   signal: AbortSignal
   onEvent: (kind: 'text' | 'note' | 'error', text: string) => void
 }): Promise<ClaudeRunResult> {
-  const args = claudeArgs(options.model, options.permissionMode, options.mcpConfigPath, options.mcpServerNames)
-  const env = claudeEnv(options.baseUrl, options.authToken)
+  const args = claudeArgs(options.model, options.permissionMode, options.mcpConfigPath, options.mcpServerNames, options.resume)
+  const env = claudeEnv(options.baseUrl, options.authToken, options.thinking ?? '')
+  // The level came from the model's configured reasoningEfforts; a key with no
+  // budget mapping (catalog drift) must not fail the run — say so and move on.
+  if (options.thinking !== undefined && options.thinking !== '' && !(options.thinking in CLAUDE_THINKING_BUDGETS)) {
+    options.onEvent('note', `思考档位 "${options.thinking}" 未映射到 claude 思考预算，已忽略（沿用 CLI 默认）`)
+  }
 
   let finalText = ''
   let sessionId = ''
@@ -222,7 +243,10 @@ export async function runClaudeTask(options: {
     stats,
     error: resultError
       ?? (ended.timedOut ? '任务超时，进程已被终止' : undefined)
-      ?? (ended.code === 0 ? undefined : `进程退出码 ${ended.code ?? 'null'}${ended.stderrTail.trim() === '' ? '' : `：${lastLines(ended.stderrTail)}`}`),
+      ?? (ended.code === 0 ? undefined : `进程退出码 ${ended.code ?? 'null'}${ended.stderrTail.trim() === '' ? '' : `：${lastLines(ended.stderrTail)}`}`)
+      // Exit 0 with no text is a silent CLI (filtered output, crashed renderer):
+      // name the reason instead of letting the dispatch report "unknown".
+      ?? (finalText.trim() === '' ? 'Claude CLI 未返回文本结果（result 帧缺失或为空）' : undefined),
   }
 }
 

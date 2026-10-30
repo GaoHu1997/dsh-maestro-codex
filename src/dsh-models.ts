@@ -30,7 +30,18 @@ export interface DshProviderInfo {
   readonly hasKeyRef: boolean
   /** Whether the protocol + key allow handing this provider to a CLI. */
   readonly mappable: boolean
-  readonly models: readonly string[]
+  readonly models: readonly DshModelInfo[]
+}
+
+/** One model in a provider's catalog, with its configured reasoning efforts. */
+export interface DshModelInfo {
+  readonly id: string
+  /**
+   * The effort keys the model declares under `reasoningEfforts` (order kept
+   * from the settings map). Empty when the entry is a bare id or declares none
+   * — the card then only offers the CLI's own default.
+   */
+  readonly reasoningEfforts: readonly string[]
 }
 
 export interface DshModelCatalog {
@@ -92,13 +103,27 @@ export function providerProfiles(settings: SettingsDescribeFace | undefined): Re
   return providers as Record<string, Record<string, unknown>>
 }
 
-/** The statically declared model ids of one provider profile. */
-export function declaredModelIds(profile: Record<string, unknown>): string[] {
+/**
+ * The statically declared models of one provider profile: string entries are
+ * bare ids; object entries carry `id` plus the `reasoningEfforts` map whose
+ * keys are the effort levels the card offers for that model.
+ */
+export function declaredModels(profile: Record<string, unknown>): DshModelInfo[] {
   const models = profile['models']
   if (!Array.isArray(models)) return []
-  return models
-    .map(model => typeof model === 'string' ? model : typeof model === 'object' && model !== null ? (model as Record<string, unknown>)['id'] : undefined)
-    .filter((id): id is string => typeof id === 'string' && id.trim() !== '')
+  const parsed: Array<DshModelInfo | undefined> = models.map((model): DshModelInfo | undefined => {
+    if (typeof model === 'string') return model.trim() === '' ? undefined : { id: model.trim(), reasoningEfforts: [] }
+    if (typeof model !== 'object' || model === null) return undefined
+    const entry = model as Record<string, unknown>
+    const id = entry['id']
+    if (typeof id !== 'string' || id.trim() === '') return undefined
+    const efforts = entry['reasoningEfforts']
+    const keys = typeof efforts === 'object' && efforts !== null && !Array.isArray(efforts)
+      ? Object.keys(efforts).filter(key => key.trim() !== '')
+      : []
+    return { id: id.trim(), reasoningEfforts: keys }
+  })
+  return parsed.filter((model): model is DshModelInfo => model !== undefined)
 }
 
 /** List the dsh model catalog joined with CLI-mappability facts. */
@@ -121,7 +146,7 @@ export async function listDshModels(_ctx: Context, settings: SettingsDescribeFac
       baseURL,
       hasKeyRef: apiKeyEnv !== '',
       mappable,
-      models: declaredModelIds(profile),
+      models: declaredModels(profile),
     })
   }
   providers.sort((a, b) => a.displayName.localeCompare(b.displayName))
