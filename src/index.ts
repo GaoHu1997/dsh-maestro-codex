@@ -20,9 +20,9 @@ import { preflightDshModel as runPreflight } from './preflight.js'
 import { discoverMcpServers } from './mcp.js'
 import { installCliUsageProjection } from './usage.js'
 import { dshHomeOf, loadPersistedTasks, persistTask } from './persist.js'
-import { StatusStore, crossSitePost, handleCliNpmJob, handleCliRefresh, handleCliVersions, handleHint, handleModels, handleOverview, handleTaskCancel, handleTaskDetail, handleTasks, fail, ok, type RouteDeps, type RouteOutcome } from './routes.js'
+import { StatusStore, crossSitePost, handleCliNpmJob, handleCliRefresh, handleCliVersions, handleHint, handleModels, handleOverview, handleTaskCancel, handleTaskDetail, handleTaskReply, handleTasks, fail, ok, type RouteDeps, type RouteOutcome } from './routes.js'
 import {
-  ROUTE_HINT, ROUTE_MODELS, ROUTE_OVERVIEW, ROUTE_CLI_INSTALL, ROUTE_CLI_REFRESH, ROUTE_CLI_UNINSTALL, ROUTE_CLI_VERSIONS, ROUTE_TASK_CANCEL, ROUTE_TASK_DETAIL, ROUTE_TASKS,
+  ROUTE_HINT, ROUTE_MODELS, ROUTE_OVERVIEW, ROUTE_CLI_INSTALL, ROUTE_CLI_REFRESH, ROUTE_CLI_UNINSTALL, ROUTE_CLI_VERSIONS, ROUTE_TASK_CANCEL, ROUTE_TASK_DETAIL, ROUTE_TASK_REPLY, ROUTE_TASKS,
 } from './wire.js'
 
 export const name = 'dsh-maestro-codex'
@@ -196,6 +196,7 @@ export function apply(ctx: Context, config: Config = {}): void {
     route(ROUTE_TASKS, 'tasks', (req) => handleTasks(deps, new URL(req.url ?? '/', 'http://x').searchParams))
     route(ROUTE_TASK_DETAIL, 'task-detail', (req) => handleTaskDetail(deps, new URL(req.url ?? '/', 'http://x').searchParams))
     route(ROUTE_TASK_CANCEL, 'task-cancel', (_req, body) => handleTaskCancel(deps, body))
+    route(ROUTE_TASK_REPLY, 'task-reply', (_req, body) => handleTaskReply(deps, body))
     route(ROUTE_CLI_REFRESH, 'cli-refresh', async (_req, body) => handleCliRefresh(deps, body))
     route(ROUTE_CLI_VERSIONS, 'cli-versions', (req) => handleCliVersions(deps, new URL(req.url ?? '/', 'http://x').searchParams))
     route(ROUTE_CLI_INSTALL, 'cli-install', (_req, body) => handleCliNpmJob(deps, 'install', body))

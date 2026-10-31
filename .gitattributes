@@ -1,0 +1,5 @@
+# Vendored upstream sources are hash-pinned byte-for-byte in
+# src/client/board/upstream/source-manifest.json (upstream-source.test.ts):
+# never normalize their line endings, or a Windows autocrlf checkout
+# rewrites CRLF/LF and breaks the fidelity hashes.
+src/client/board/upstream/** -text

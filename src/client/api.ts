@@ -6,7 +6,7 @@
 
 import {
   ROUTE_CLI_INSTALL, ROUTE_CLI_REFRESH, ROUTE_CLI_UNINSTALL, ROUTE_CLI_VERSIONS, ROUTE_HINT, ROUTE_MODELS, ROUTE_OVERVIEW,
-  ROUTE_TASK_CANCEL, ROUTE_TASK_DETAIL, ROUTE_TASKS,
+  ROUTE_TASK_CANCEL, ROUTE_TASK_DETAIL, ROUTE_TASK_REPLY, ROUTE_TASKS,
   type DshProviderModels, type MaestroCliId, type MaestroCliVersions, type MaestroMcpServerRef, type MaestroOverview, type MaestroTaskDetail, type MaestroTaskRef, type MaestroTaskSummary,
 } from '../wire.js'
 
@@ -51,6 +51,25 @@ export async function fetchTaskDetail(id: string, after: number, sessionIds?: re
 
 export async function cancelTask(id: string, sessionIds?: readonly string[]): Promise<Call<MaestroTaskRef>> {
   return send<MaestroTaskRef>('POST', ROUTE_TASK_CANCEL, sessionIds === undefined || sessionIds.length === 0 ? { id } : { id, sessions: [...sessionIds] })
+}
+
+/**
+ * Send one follow-up message into a settled CLI task's session (the board's
+ * session page composer). `model` is a dsh-catalog selection from the picker
+ * ('' = follow the configured route); the answer is the new reply task, which
+ * the page then follows through {@link fetchTaskDetail}.
+ */
+export async function replyTask(id: string, text: string, options?: {
+  sessionIds?: readonly string[]
+  model?: string
+  thinking?: string
+}): Promise<Call<MaestroTaskRef>> {
+  const sessions = options?.sessionIds
+  const body: Record<string, unknown> = { id, text }
+  if (sessions !== undefined && sessions.length > 0) body['sessions'] = [...sessions]
+  if (options?.model !== undefined && options.model !== '') body['model'] = options.model
+  if (options?.thinking !== undefined && options.thinking !== '') body['thinking'] = options.thinking
+  return send<MaestroTaskRef>('POST', ROUTE_TASK_REPLY, body)
 }
 
 /** The board's session-tree scope, encoded for a query string ('' = unscoped). */

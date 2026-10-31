@@ -44,6 +44,15 @@
 
 已结束/空闲聚合与树折叠沿用原版行为；聚合预览保留任务名称，运行中的后代不能被折叠隐藏。
 
+## CLI 会话页（`Session.tsx`）
+
+CLI 子代理没有本地 DSH 会话，CLI 卡片详情浮层里的「**查看会话**」会盖上看板渲染一个**对话式的会话页**，观感对齐 DSH 的会话窗口（「查看转录」保留原始日志窗，快速排错用）：
+
+- **转录画成对话流**：任务全文是右侧的用户气泡（detail 的 `prompt` 字段，title 只有截断的 80 字符），CLI 的流式 `text` 事件是左侧气泡（第一条带 CLI 名），`note` 是细窄等宽工具行，`error` 红字，`phase` 是居中分隔行；`finalText` 与流式文本重复时不再画第二遍。
+- **多轮串成一段**：回复任务带 `replyTo`（`MaestroTaskSummary`），页面从打开的任务沿链爬到根再铺回来（`buildChain`），每轮自带时间/模型/耗时元信息行。
+- **续发消息**：底部输入框 Enter 发送（Shift+Enter 换行），走 `POST /task/reply {id, text, model?, thinking?}`——服务端以 `stats.sessionRef` 起一个新的 resume 任务（claude `--resume` / codex `exec resume`），`replyTo` 链回原任务；回复**固定原 CLI**（claude 的 session 引用对 codex 毫无意义）、**不重复难度门槛**（原任务派发时已审过）。续发落点由 `replyAnchorOf` 决定：从链尾往前找最近一个带 `sessionRef` 的轮次——尾轮失败/超时常常没拿到引用，会话不该因此卡死。发送成功到任务列表轮到新回复之间，输入框按 pending id 锁定（列表空档里再点一次发送就是两条并发 resume）；服务端也兜一层：同一任务已有进行中的回复时 `/task/reply` 直接 409。上一轮还在跑时输入框禁用，头部给「取消」。
+- **模型列表只来自 dsh**：下拉读 `/models`（llm-pi-ai 供应商目录），按 CLI 协议过滤（claude 仅 anthropic-messages；codex 收 openai-responses/completions，统一 responses 方言）；空选项 = 沿用配置页模型。思考档位来自所选模型配置的 `reasoningEfforts`。CLI 自身配置的模型永远不出现。会话页挑中的模型经 `resolveDshModel` 解析、过与派发同一道 `preflightDshModel` 预检后注入子进程，解析失败直接失败，不回落 CLI 自身配置。
+
 ## CLI 无输出保护
 
 `timeout_minutes` 和配置页的 CLI 超时现在表示连续无 stdout/stderr 输出的分钟数（1–240），不是总运行时限。非空输出分片会重置计时，包含无换行的 JSON/文本片段与 stderr；这只是可观测的无输出保护，不能判断任务是否具有语义进展。持续输出的任务不会仅因总运行时长达到 30 分钟而被杀。

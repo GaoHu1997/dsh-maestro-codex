@@ -24,6 +24,14 @@ export const ROUTE_TASK_DETAIL = `${ROUTE_PREFIX}/task`
 /** POST ROUTE_PREFIX/task/cancel {id} — abort one queued/running task. */
 export const ROUTE_TASK_CANCEL = `${ROUTE_PREFIX}/task/cancel`
 
+/**
+ * POST ROUTE_PREFIX/task/reply {id,text,model?,thinking?} — send one follow-up
+ * message into a settled CLI task's session (claude `--resume` / codex
+ * `exec resume`). The board's session page posts here; the reply runs as a new
+ * task chained to the original via `replyTo`.
+ */
+export const ROUTE_TASK_REPLY = `${ROUTE_PREFIX}/task/reply`
+
 /** POST ROUTE_PREFIX/cli/refresh {cli} — re-detect one CLI's install state. */
 export const ROUTE_CLI_REFRESH = `${ROUTE_PREFIX}/cli/refresh`
 
@@ -210,6 +218,14 @@ export interface MaestroTaskSummary {
   readonly exitCode?: number
   readonly durationMs?: number
   readonly usage?: MaestroTokenUsage
+  /**
+   * The CLI session reference a follow-up message resumes (claude session id /
+   * codex thread id, reported through `stats.sessionRef`); absent = the turn
+   * cannot be continued.
+   */
+  readonly sessionRef?: string
+  /** The task this one continues (a session-page reply); absent = a root turn. */
+  readonly replyTo?: string
   /** The event ring dropped older entries: a client must not trust gaps as idle time. */
   readonly truncated?: boolean
 }
@@ -218,6 +234,8 @@ export interface MaestroTaskSummary {
 export interface MaestroTaskDetail {
   readonly summary: MaestroTaskSummary
   readonly cwd?: string
+  /** The full task text of this turn — the session page's user message. */
+  readonly prompt?: string
   readonly finalText?: string
   readonly error?: string
   readonly stats?: Readonly<Record<string, string | number | boolean>>

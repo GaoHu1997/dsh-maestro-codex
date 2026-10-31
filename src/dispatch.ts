@@ -84,6 +84,16 @@ export interface DispatchParams {
   resume?: string | undefined
   cwd?: string | undefined
   model?: string | undefined
+  /**
+   * An explicit dsh-catalog selection (`provider::model`, e.g. the session
+   * page's model picker). Resolved through `resolveDshModel` and fatal when it
+   * cannot be — it never falls back to the CLI's own configuration.
+   */
+  dshModel?: string | undefined
+  /** Thinking level override (the model's configured reasoningEfforts keys). */
+  thinking?: string | undefined
+  /** The task this run continues (a session-page reply); pins CLI + skips the difficulty gate. */
+  replyTo?: string | undefined
   timeoutMinutes?: number | undefined
   /** The calling agent's session id — the task board scopes by it. Not a model
    * parameter: the tool injects it from `exec.agent`. */
@@ -233,18 +243,30 @@ export async function runDispatch(deps: DispatchDeps, params: DispatchParams, si
   const config = deps.readConfig()
   if (!config.enabled) throw new DispatchError('CLI 子代理插件已停用（配置页可重新开启）')
 
+  // A session-page reply continues an existing CLI conversation: the CLI is
+  // pinned to the parent task's (the parent dispatch already passed its
+  // difficulty gate), and a human follow-up must never be re-gated or silently
+  // rerouted onto the other CLI mid-session.
+  const isReply = params.replyTo !== undefined
   let decision
   let taskDifficulty: TaskDifficulty
-  try {
-    decision = pickCli(config, params.cli, params.task)
-    taskDifficulty = assertTaskDifficulty(config, decision.cli, params.taskDifficulty, params.difficultyReason)
-  } catch (error) {
-    throw error instanceof RoutingError ? new DispatchError(error.message) : error
+  if (isReply) {
+    decision = { cli: params.cli as MaestroCliId, reason: 'requested' as const, note: undefined }
+    taskDifficulty = 'low'
+  } else {
+    try {
+      decision = pickCli(config, params.cli, params.task)
+      taskDifficulty = assertTaskDifficulty(config, decision.cli, params.taskDifficulty, params.difficultyReason)
+    } catch (error) {
+      throw error instanceof RoutingError ? new DispatchError(error.message) : error
+    }
   }
 
-  const notes: string[] = [
-    `难度评估：${taskDifficulty}；${decision.cli} 最低难度：${config[decision.cli].minTaskDifficulty}；依据：${params.difficultyReason === undefined ? '旧调用未提供评估，保守按 low 处理' : cleanLogText(params.difficultyReason.trim())}`,
-  ]
+  const notes: string[] = isReply
+    ? [`会话续接（回复 ${params.replyTo}）：CLI 固定为 ${decision.cli}，沿用已通过的难度门槛`]
+    : [
+      `难度评估：${taskDifficulty}；${decision.cli} 最低难度：${config[decision.cli].minTaskDifficulty}；依据：${params.difficultyReason === undefined ? '旧调用未提供评估，保守按 low 处理' : cleanLogText(params.difficultyReason.trim())}`,
+    ]
   if (decision.note !== undefined) notes.push(decision.note)
   const model = params.model ?? ''
   const timeoutMinutes = params.timeoutMinutes ?? (decision.cli === 'claude' ? config.claude.timeoutMinutes : config.codex.timeoutMinutes)
@@ -268,9 +290,11 @@ export async function runDispatch(deps: DispatchDeps, params: DispatchParams, si
     id,
     cli: decision.cli,
     title: params.task.replace(/\s+/g, ' ').slice(0, 80),
+    prompt: params.task,
     cwd,
     model,
     ...(params.sessionId === undefined ? {} : { sessionId: params.sessionId }),
+    ...(params.replyTo === undefined ? {} : { replyTo: params.replyTo }),
   })
   hooks?.onTaskId?.(id)
 
@@ -302,6 +326,8 @@ export async function runDispatch(deps: DispatchDeps, params: DispatchParams, si
         deps.registry.push(task, kind, text)
         hooks?.onEvent?.(kind, text)
       }
+      // 回复轮的续接说明也进事件流：会话页/看板上能看到这一轮是怎么来的。
+      if (isReply && notes[0] !== undefined) onEvent('note', notes[0])
       // CLI watchdogs measure consecutive output silence, not total runtime.
       // Warnings live beside the watchdog so actual chunks reset both clocks.
       const timeoutMs = timeoutMinutes * 60_000
@@ -327,7 +353,40 @@ export async function runDispatch(deps: DispatchDeps, params: DispatchParams, si
           notes.push(text)
           onEvent('note', text)
         }
-        if (params.model === undefined) {
+        // An explicit dsh-catalog selection (the session page's model picker)
+        // outranks every automatic route: resolve it on the spot and fail
+        // loudly when it cannot — it never falls back to the CLI's own config.
+        // The same preflight as the automatic routes guards the spawn.
+        if (params.dshModel !== undefined && params.dshModel !== '') {
+          if (deps.resolveDshModel === undefined) {
+            const message = `本部署读不到 dsh 模型目录（settings/credentials 服务不可用），无法使用所选模型 ${params.dshModel}`
+            setPhaseOf('failed', message)
+            throw new DispatchError(message)
+          }
+          let endpoint: DshModelEndpoint
+          try {
+            endpoint = await deps.resolveDshModel(params.dshModel)
+          } catch (error) {
+            const message = error instanceof Error ? error.message : String(error)
+            setPhaseOf('failed', message)
+            throw error instanceof DispatchError ? error : new DispatchError(message)
+          }
+          const problem = protocolProblem(decision.cli, endpoint)
+          if (problem !== undefined) {
+            setPhaseOf('failed', problem)
+            throw new DispatchError(problem)
+          }
+          const preflight = deps.preflightDshModel === undefined
+            ? undefined
+            : await deps.preflightDshModel(endpoint)
+          if (preflight !== undefined && preflight.status === 'mismatch') {
+            setPhaseOf('failed', preflight.detail)
+            throw new DispatchError(preflight.detail)
+          }
+          if (preflight?.note !== undefined) note(preflight.note)
+          dshEndpoint = endpoint
+          note(`使用会话页选择的 dsh 模型：${params.dshModel}`)
+        } else if (params.model === undefined) {
           const cliLabel = decision.cli
           const configuredSelection = cliLabel === 'claude' ? config.claude.dshModel : config.codex.dshModel
           const configuredKey = cliLabel === 'claude' ? 'claudeDshModel' : 'codexDshModel'
@@ -424,6 +483,10 @@ export async function runDispatch(deps: DispatchDeps, params: DispatchParams, si
           onEvent('note', `续接 ${decision.cli} 会话 ${params.resume}：原会话对话不会自动带入，需要的结论请写在任务里`)
         }
 
+        // The thinking level: an explicit override (the session page's picker)
+        // wins over the configured per-CLI default.
+        const thinking = params.thinking ?? (decision.cli === 'claude' ? config.claude.thinking : config.codex.thinking)
+
         const mcpServers = config.bridgeMcp === true ? deps.listMcpServers?.() ?? [] : []
         // 失败自动重试（默认 0 次）：只重试普通失败——超时重试会翻倍等待、取消
         // 重试违背取消语义；文件改动型任务请保持 0，重试可能叠加改动。
@@ -452,7 +515,7 @@ export async function runDispatch(deps: DispatchDeps, params: DispatchParams, si
                   model: effectiveModel,
                   ...(params.resume === undefined ? {} : { resume: params.resume }),
                   permissionMode: config.claude.permissionMode,
-                  thinking: config.claude.thinking,
+                  thinking,
                   baseUrl: dshEndpoint !== undefined ? dshEndpoint.baseURL : config.claude.baseUrl,
                   authToken: dshEndpoint !== undefined ? dshEndpoint.apiKey : config.claude.authToken,
                   ...(mcpConfigPath === undefined ? {} : { mcpConfigPath, mcpServerNames: mcpServers.map(server => server.name) }),
@@ -469,7 +532,7 @@ export async function runDispatch(deps: DispatchDeps, params: DispatchParams, si
                   model: effectiveModel,
                   ...(params.resume === undefined ? {} : { resume: params.resume }),
                   sandbox: config.codex.sandbox,
-                  thinking: config.codex.thinking,
+                  thinking,
                   configOverrides: config.codex.configOverrides,
                   ...(dshEndpoint === undefined ? {} : {
                     dshModel: {

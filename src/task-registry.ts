@@ -23,12 +23,16 @@ export interface MaestroTask {
   readonly id: string
   readonly cli: MaestroCliId
   readonly title: string
+  /** The full task text (the session page's user message); title is a truncated echo. */
+  prompt: string | undefined
   readonly cwd: string | undefined
   /** The CLI model actually handed to the child; updated once the route resolves. */
   model: string
   /** The session (agent) that owns this task; undefined for owner-less jobs
    * (npm installs), which stay visible in every session's board. */
   readonly sessionId: string | undefined
+  /** The task this one continues (a session-page reply); undefined = a root turn. */
+  readonly replyTo: string | undefined
   phase: MaestroPhase
   startedAt: number
   endedAt: number | undefined
@@ -66,14 +70,16 @@ export class TaskRegistry {
   private readonly tasks = new Map<string, MaestroTask>()
 
   /** Create one task; returns the record for the runner to update. */
-  create(input: { id: string; cli: MaestroCliId; title: string; cwd?: string | undefined; model: string; sessionId?: string | undefined }): MaestroTask {
+  create(input: { id: string; cli: MaestroCliId; title: string; cwd?: string | undefined; model: string; sessionId?: string | undefined; prompt?: string | undefined; replyTo?: string | undefined }): MaestroTask {
     const task: MaestroTask = {
       id: input.id,
       cli: input.cli,
       title: input.title,
+      prompt: input.prompt,
       cwd: input.cwd,
       model: input.model,
       sessionId: input.sessionId,
+      replyTo: input.replyTo,
       phase: 'queued',
       startedAt: Date.now(),
       endedAt: undefined,
@@ -155,9 +161,11 @@ export class TaskRegistry {
     id: string
     cli: MaestroCliId
     title: string
+    prompt?: string | undefined
     cwd?: string | undefined
     model?: string | undefined
     sessionId?: string | undefined
+    replyTo?: string | undefined
     phase: MaestroPhase
     startedAt: number
     endedAt?: number | undefined
@@ -174,9 +182,11 @@ export class TaskRegistry {
       id: record.id,
       cli: record.cli,
       title: record.title,
+      prompt: record.prompt,
       cwd: record.cwd,
       model: record.model ?? '',
       sessionId: record.sessionId,
+      replyTo: record.replyTo,
       phase: record.phase,
       startedAt: record.startedAt,
       endedAt: record.endedAt ?? record.startedAt,
@@ -225,6 +235,10 @@ export class TaskRegistry {
   summaryOf(task: MaestroTask): MaestroTaskSummary {
     // Settled numbers win; the live snapshot is only a stand-in while running.
     const usage = tokenUsageOfStats(task.stats ?? task.liveStats)
+    // The runner records the CLI session reference inside the extensible stats
+    // contract (`stats.sessionRef`, persisted with the rest of the stats); the
+    // session page resumes through it.
+    const sessionRef = typeof task.stats?.['sessionRef'] === 'string' ? task.stats['sessionRef'] : ''
     return {
       id: task.id,
       cli: task.cli,
@@ -237,6 +251,8 @@ export class TaskRegistry {
       ...(task.exitCode === undefined ? {} : { exitCode: task.exitCode }),
       ...(task.endedAt === undefined ? {} : { durationMs: task.endedAt - task.startedAt }),
       ...(usage === undefined ? {} : { usage }),
+      ...(sessionRef === '' ? {} : { sessionRef }),
+      ...(task.replyTo === undefined || task.replyTo === '' ? {} : { replyTo: task.replyTo }),
       ...(task.truncated ? { truncated: true } : {}),
     }
   }

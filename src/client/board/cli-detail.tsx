@@ -40,7 +40,9 @@ function CancelCli(props: { task: MaestroTaskSummary; onCancel: () => Promise<st
   </>
 }
 export function CliNodePopover(props: {
-  node: BoardNode; now: number; onOutput: () => void; onCancel: () => Promise<string | undefined>
+  node: BoardNode; now: number; onOutput: () => void; onCancel: () => Promise<string | undefined>;
+  /** 打开这个 CLI 任务的会话页（气泡转录 + 续发消息，盖在看板之上）。 */
+  onOpenSession?: () => void
 }): ReactNode {
   const task = props.node.task
   if (task === undefined) return null
@@ -51,7 +53,11 @@ export function CliNodePopover(props: {
     <CliFacts node={props.node} now={props.now} />
     {task.truncated === true ? <span className={css.popHint}>较早输出已截断</span> : null}
     <div className={css.popActions}>
-      <Button variant="primary" size="sm" onClick={props.onOutput}>查看转录</Button>
+      {/* CLI 子代理没有本地 DSH 会话，「查看会话」进插件的会话页（对话式转录 +
+        续发输入框）；「查看转录」保留原始日志窗，快速排错用。 */}
+      {props.onOpenSession === undefined ? null
+        : <Button variant="primary" size="sm" onClick={props.onOpenSession}>查看会话</Button>}
+      <Button variant={props.onOpenSession === undefined ? 'primary' : 'outline'} size="sm" onClick={props.onOutput}>查看转录</Button>
       <CancelCli task={task} onCancel={props.onCancel} />
     </div>
   </div>

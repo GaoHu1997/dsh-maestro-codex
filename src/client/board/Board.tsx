@@ -1,10 +1,13 @@
 /** The original Tasks graph/tree shell, with Maestro CLI rows bridged into it. */
 import { useCallback, useEffect, useMemo, useState, useSyncExternalStore, type ReactNode } from 'react'
 import { Button, IconRefreshOutlineRegular } from '@deepseek-ai/dsh-client-ui-primitives'
+import type { MaestroCliId } from '../../wire.js'
 import { attachRows, buildSessionTree, collectTreeIds, type BoardCatalogEntry, type BoardTiming, type BoardTokenUsage } from './model.js'
 import { jobsFaceOf, sessionsFaceOf, useBoardJobs, useCliDetail, useCliTasks, useNow, useSessionList, type BoardHost, type BoardSessionList } from './data.js'
 import { boardCliUsage, boardJobRows, boardRendererInput, boardRootId, hasBoardTranscriptAside, jumpBoardAddress, jumpBoardNode, renderBoardNodes, withBoardNative } from './bridge.js'
 import { CliNodePopover, CliOutputWindow } from './cli-detail.js'
+import { SessionPage } from './Session.js'
+import { injectBoardAccent } from './accent.js'
 import { useBoardNative } from './native.js'
 import {
   AgentNodePopover, AnchoredPopover, JobsDrawer, JobOutputWindow, TasksGraph, TasksTree,
@@ -45,6 +48,8 @@ type BoardPopover = {
 
 /** Keep topology rooted at the main ancestor when opening a child transcript. */
 export function BoardTab(props: BoardTabProps): ReactNode {
+  // 湖蓝色 CLI 标识：插件自有样式表，按 id 幂等（上游 vendored 文件不动）。
+  useEffect(() => { injectBoardAccent() }, [])
   const locale = useMemo(() => props.ctx.get('locale') as {
     getSnapshot?(): { active?: string; revision?: number }
     subscribe?(listener: () => void): () => void
@@ -104,6 +109,8 @@ function BoardPage(props: BoardTabProps & { readonly rootId: string; readonly li
   const [collapsedIds, setCollapsedIds] = useState<ReadonlySet<string>>(() => new Set())
   const [teamBoardCollapsed, setTeamBoardCollapsed] = useState(false)
   const [popover, setPopover] = useState<BoardPopover | null>(null)
+  // 打开的 CLI 会话页（盖在看板之上）；null = 没开。cli 取打开时那颗节点的 CLI。
+  const [sessionTask, setSessionTask] = useState<{ id: string; cli: MaestroCliId } | null>(null)
   const nodes = useMemo(() => renderBoardNodes(renderer, { folded, autoFoldSettled, autoFoldBranches, autoFoldIdle, foldedIds, expandedGroups }),
     [renderer, folded, autoFoldSettled, autoFoldBranches, autoFoldIdle, foldedIds, expandedGroups])
   const jobs = useBoardJobs(ctx, treeIds, active, popover?.kind === 'job' ? popover.id : null)
@@ -235,8 +242,17 @@ function BoardPage(props: BoardTabProps & { readonly rootId: string; readonly li
     </AnchoredPopover> : null}
     {active && popover?.kind === 'node' && selectedNode?.kind === 'agent' ? <AnchoredPopover anchor={popover.anchor} onClose={closePopover}>
       {selectedDomain?.task !== undefined
-        ? <CliNodePopover node={selectedDomain} now={now} onCancel={cancelSelected} onOutput={() => { setPopover({ ...popover, kind: 'cli-output' }) }} />
+        ? <CliNodePopover node={selectedDomain} now={now} onCancel={cancelSelected}
+          onOutput={() => { setPopover({ ...popover, kind: 'cli-output' }) }}
+          onOpenSession={() => { const task = selectedDomain.task; if (task !== undefined) setSessionTask({ id: task.id, cli: task.cli }) }} />
         : <AgentNodePopover node={selectedNode} asideAvailable={asideAvailable} onJump={jump} onOpenTask={onOpenTask} onClose={closePopover} />}
     </AnchoredPopover> : null}
+
+    {sessionTask === null ? null : <SessionPage
+      taskId={sessionTask.id}
+      cli={sessionTask.cli}
+      onClose={() => { setSessionTask(null) }}
+      {...(treeIds.length === 0 ? {} : { sessionIds: treeIds })}
+    />}
   </div>
 }

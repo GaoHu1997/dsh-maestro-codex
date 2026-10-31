@@ -5,12 +5,12 @@
  */
 
 import { randomUUID } from 'node:crypto'
-import { redactEffective, type EffectiveConfig } from './config.js'
-import type { DispatchDeps } from './dispatch.js'
+import { modelTokenError, redactEffective, type EffectiveConfig } from './config.js'
+import { runDispatch, type DispatchDeps } from './dispatch.js'
 import { detectCli, queryPackageVersions, runNpmJob } from './cli-manager.js'
 import { isTerminalPhase, type MaestroTask } from './task-registry.js'
 import { routingHint } from './routing.js'
-import type { DshModelCatalog } from './dsh-models.js'
+import { dshModelSelectionError, type DshModelCatalog } from './dsh-models.js'
 import type { DshMcpServer } from './mcp.js'
 import { CLI_PACKAGES, CLI_LABELS, MAESTRO_CLI_IDS, type MaestroCliId, type MaestroCliStatus, type MaestroCliVersions, type MaestroOverview, type MaestroRouteError, type MaestroTaskDetail, type MaestroTaskRef, type MaestroTaskSummary } from './wire.js'
 
@@ -181,6 +181,7 @@ export function handleTaskDetail(deps: RouteDeps, query: URLSearchParams): Route
   const detail: MaestroTaskDetail = {
     summary,
     ...(task.cwd === undefined ? {} : { cwd: task.cwd }),
+    ...(task.prompt === undefined || task.prompt === '' ? {} : { prompt: task.prompt }),
     ...(task.finalText === undefined ? {} : { finalText: task.finalText }),
     ...(task.error === undefined ? {} : { error: task.error }),
     ...(task.stats === undefined ? {} : { stats: task.stats }),
@@ -202,6 +203,88 @@ export function handleTaskCancel(deps: RouteDeps, body: unknown): RouteOutcome {
   if (controller === undefined) return fail(409, '任务尚未挂起执行进程，请稍后重试')
   controller.abort(new Error('用户在配置页取消了任务'))
   return ok({ id, phase: task.phase } satisfies MaestroTaskRef)
+}
+
+/**
+ * POST task/reply {id, text, sessions?, model?, thinking?, timeout_minutes?} —
+ * send one follow-up message into a settled CLI task's session (claude
+ * `--resume` / codex `exec resume`). The reply runs as a new task chained to
+ * the original via `replyTo` and answers with its id immediately; the session
+ * page follows it through the ordinary task-detail poll.
+ *
+ * `model` is a dsh-catalog selection (`provider::model`) from the session
+ * page's picker — it resolves against dsh's configured providers and never
+ * touches the CLI's own configuration. An empty model follows the dispatch's
+ * usual route (配置页模型).
+ */
+export function handleTaskReply(deps: RouteDeps, body: unknown): RouteOutcome {
+  const record = typeof body === 'object' && body !== null ? body as Record<string, unknown> : {}
+  const id = typeof record['id'] === 'string' ? record['id'] : ''
+  const text = typeof record['text'] === 'string' ? record['text'].trim() : ''
+  if (id === '') return fail(400, '"id" 不能为空')
+  if (text === '') return fail(400, '"text" 不能为空：回复内容就是发给 CLI 的新指令')
+  if (text.length > 100_000) return fail(400, '"text" 超过 100k 字符上限')
+  if (!deps.readConfig().enabled) return fail(409, 'CLI 子代理插件已停用（配置页可重新开启）')
+  const task = deps.registry.get(id)
+  if (task === undefined || !taskVisible(task, parseSessionList(record['sessions']))) return fail(404, `任务不存在：${id}`)
+  if (!isTerminalPhase(task.phase)) return fail(409, '任务还在运行中，等它结束再续发')
+  // The runner records the CLI session reference inside the extensible stats
+  // contract (persisted with the stats); that is the handle a reply resumes.
+  const sessionRef = typeof task.stats?.['sessionRef'] === 'string' ? task.stats['sessionRef'] : ''
+  if (sessionRef === '') {
+    return fail(409, `这个任务没有可续接的 ${task.cli} 会话引用（CLI 未返回会话 id），无法续发`)
+  }
+  const model = typeof record['model'] === 'string' ? record['model'].trim() : ''
+  const modelError = dshModelSelectionError(model)
+  if (modelError !== undefined) return fail(400, `"model" ${modelError}`)
+  const thinking = typeof record['thinking'] === 'string' ? record['thinking'].trim() : ''
+  const thinkingError = modelTokenError(thinking)
+  if (thinkingError !== undefined) return fail(400, `"thinking" ${thinkingError}`)
+  const rawTimeout = record['timeout_minutes']
+  const timeoutMinutes = typeof rawTimeout === 'number' && Number.isFinite(rawTimeout)
+    ? Math.min(240, Math.max(1, Math.round(rawTimeout)))
+    : undefined
+  // 一个 CLI 会话同一时刻只能有一条回复在跑：两条并发 resume 打在同一个
+  // claude session / codex thread 上会互相踩。客户端在发送后到列表轮询到
+  // 新回复前会锁输入，这里是双开窗口时的兜底。（排在参数校验之后：坏请求
+  // 无论什么状态都该拿到 400，而不是被状态检查截成 409。）
+  const runningReply = deps.registry.list().find(candidate => candidate.replyTo === id && !isTerminalPhase(candidate.phase))
+  if (runningReply !== undefined) {
+    return fail(409, `上一条回复（${runningReply.id}）还在执行，等它结束再续发`)
+  }
+
+  // runDispatch's synchronous prefix (enabled check → CLI pin → registry.create
+  // → onTaskId) completes before its first await, so the reply's id exists by
+  // the time this call returns. Its own AbortController is registered under the
+  // reply id, so the ordinary cancel route keeps working; nothing here needs a
+  // second handle on the run.
+  let replyId = ''
+  const running = runDispatch(
+    deps,
+    {
+      cli: task.cli,
+      task: text,
+      resume: sessionRef,
+      cwd: task.cwd,
+      ...(model === '' ? {} : { dshModel: model }),
+      ...(thinking === '' ? {} : { thinking }),
+      ...(timeoutMinutes === undefined ? {} : { timeoutMinutes }),
+      replyTo: task.id,
+      ...(task.sessionId === undefined ? {} : { sessionId: task.sessionId }),
+    },
+    new AbortController().signal,
+    { onTaskId: (newId) => { replyId = newId } },
+  )
+  if (replyId === '') {
+    // Only reachable when the plugin was disabled between the two checks above:
+    // the record never existed, so there is nothing to poll — say so outright.
+    void running.catch(() => { /* no record to carry the failure; the answer says it */ })
+    return fail(409, '续发未能启动：插件可能刚被停用，请刷新后重试')
+  }
+  // Settle failures (spawn errors, timeouts, cancel) are recorded on the reply
+  // task by runDispatch itself; the session page renders them like any turn.
+  void running.catch(() => { /* recorded on the reply task */ })
+  return ok({ id: replyId, phase: 'queued' } satisfies MaestroTaskRef)
 }
 
 /** POST cli/refresh {cli?} — re-detect (one CLI or both) right now. */
