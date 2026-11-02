@@ -1,12 +1,17 @@
 import { Context } from '@deepseek-ai/cordis'
 import { createElement } from 'react'
 import { renderToStaticMarkup } from 'react-dom/server'
-import { describe, expect, it, vi } from 'vitest'
+import { beforeEach, describe, expect, it, vi } from 'vitest'
 import {
   jobsFaceOf, killJob, sessionsFaceOf, useBoardJobs, useSessionList,
   type BoardHost, type BoardJobsFace, type BoardSessionList, type BoardSessionsFace,
 } from '../src/client/board/data.js'
 import { BoardTab } from '../src/client/board/Board.js'
+import { attachLocale } from '../src/client/board/upstream/client/locales.js'
+
+beforeEach(() => {
+  attachLocale({ getSnapshot: () => ({ active: 'zh-CN' }) })
+})
 
 const list: BoardSessionList = {
   byId: { root: { id: 'root', displayTitle: 'Native root', running: true } },

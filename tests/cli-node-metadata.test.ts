@@ -1,6 +1,6 @@
 import { createElement } from 'react'
 import { renderToStaticMarkup } from 'react-dom/server'
-import { describe, expect, it } from 'vitest'
+import { beforeEach, describe, expect, it } from 'vitest'
 import { TaskRegistry } from '../src/task-registry.js'
 import { tokenUsageOfStats, type MaestroTaskSummary } from '../src/wire.js'
 import { attachRows, buildSessionTree, cliNode } from '../src/client/board/model.js'
@@ -8,6 +8,11 @@ import { boardRendererInput, renderBoardNodes } from '../src/client/board/bridge
 import { CliNodePopover } from '../src/client/board/cli-detail.js'
 import { headerTokenText } from '../src/client/header/CliCatalogChip.js'
 import { TasksGraph, TasksTree, type TasksAgentNode } from '../src/client/board/upstream/index.js'
+import { attachLocale } from '../src/client/board/upstream/client/locales.js'
+
+beforeEach(() => {
+  attachLocale({ getSnapshot: () => ({ active: 'zh-CN' }) })
+})
 
 const callbacks = { rootId: 'root', folded: false, onNodeInfo() {}, onWorkflowInfo() {},
   onOpenTask() {}, onToggleFold() {}, onExpandGroup() {}, onFoldNode() {}, onModeChange() {} }
