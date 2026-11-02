@@ -94,7 +94,7 @@ function runner(deps: {
 describe('CLI child session replay', () => {
   it('keeps only the most recently active sessions per project', async () => {
     const ids = Array.from({ length: 40 }, (_, index) => `session-${index}`)
-    const home = homeWithRegistry([{ path: 'D:/work', sessionIds: ids }])
+    const home = homeWithRegistry([{ path: '/work', sessionIds: ids }])
     const records = ids.map((id, index) => recordOf(`task-${index}`, id))
     const sessions = ids.map((id, index) => listedOf(id, 1_000 + index))
     const { created, run } = runner({ home, records, sessions })
@@ -103,11 +103,11 @@ describe('CLI child session replay', () => {
     expect(kept).toHaveLength(30)
     expect(kept).toContain('cli-task-39')
     expect(kept).not.toContain('cli-task-0')
-    expect(created[0]?.options.meta).toMatchObject({ cwd: 'D:/work', parentSession: 'session-39', origin: 'subagent' })
+    expect(created[0]?.options.meta).toMatchObject({ cwd: '/work', parentSession: 'session-39', origin: 'subagent' })
   })
 
   it('skips archived sessions and sessions without a settled record', async () => {
-    const home = homeWithRegistry([{ path: 'D:/work', sessionIds: ['s-a', 's-b', 's-c'] }], ['s-a'])
+    const home = homeWithRegistry([{ path: '/work', sessionIds: ['s-a', 's-b', 's-c'] }], ['s-a'])
     const records = [recordOf('t-a', 's-a'), recordOf('t-b', 's-b')]
     const sessions = [listedOf('s-a', 1), listedOf('s-b', 2), listedOf('s-c', 3)]
     const { created, run } = runner({ home, records, sessions })
@@ -116,7 +116,7 @@ describe('CLI child session replay', () => {
   })
 
   it('skips child sessions that are already live', async () => {
-    const home = homeWithRegistry([{ path: 'D:/work', sessionIds: ['s-a'] }])
+    const home = homeWithRegistry([{ path: '/work', sessionIds: ['s-a'] }])
     const { created, run } = runner({
       home,
       records: [recordOf('t-a', 's-a')],
@@ -128,7 +128,7 @@ describe('CLI child session replay', () => {
   })
 
   it('ranks recent activity ahead of newer creation timestamps', async () => {
-    const home = homeWithRegistry([{ path: 'D:/work', sessionIds: ['new-created', 'recently-active'] }])
+    const home = homeWithRegistry([{ path: '/work', sessionIds: ['new-created', 'recently-active'] }])
     const { created, run } = runner({
       home,
       records: [recordOf('new', 'new-created'), recordOf('active', 'recently-active')],
@@ -139,9 +139,9 @@ describe('CLI child session replay', () => {
   })
 
   it('never creates a cold persisted child or rewrites any persisted header', async () => {
-    const home = homeWithRegistry([{ path: 'D:/work', sessionIds: ['s-a'] }])
+    const home = homeWithRegistry([{ path: '/work', sessionIds: ['s-a'] }])
     const parent = Object.freeze({ header: Object.freeze({
-      version: 4, id: 's-a', createdAt: 123, cwd: 'D:/original-parent', isSeeded: false, delegationDepth: 0,
+      version: 4, id: 's-a', createdAt: 123, cwd: '/original-parent', isSeeded: false, delegationDepth: 0,
     }) })
     // Real persisted children may live in _no-cwd, unlike the current project.
     // Copying the usage record's time/cwd would NOT preserve this identity.
@@ -162,7 +162,7 @@ describe('CLI child session replay', () => {
   })
 
   it('is idempotent across replay calls after creating a missing live child', async () => {
-    const home = homeWithRegistry([{ path: 'D:/work', sessionIds: ['s-a'] }])
+    const home = homeWithRegistry([{ path: '/work', sessionIds: ['s-a'] }])
     const { created, run } = runner({
       home, records: [recordOf('t-a', 's-a')], sessions: [listedOf('s-a', 1)],
     })
@@ -172,7 +172,7 @@ describe('CLI child session replay', () => {
   })
 
   it('does not create after disposal while the asynchronous persistence list is pending', async () => {
-    const home = homeWithRegistry([{ path: 'D:/work', sessionIds: ['s-a'] }])
+    const home = homeWithRegistry([{ path: '/work', sessionIds: ['s-a'] }])
     const controller = new AbortController()
     const sessions = [listedOf('s-a', 1)]
     let releaseList!: (value: readonly ReplayListedSession[]) => void
@@ -193,7 +193,7 @@ describe('CLI child session replay', () => {
   })
 
   it('rechecks persisted children after preparing the selected parent', async () => {
-    const home = homeWithRegistry([{ path: 'D:/work', sessionIds: ['s-a'] }])
+    const home = homeWithRegistry([{ path: '/work', sessionIds: ['s-a'] }])
     const sessions: ReplayListedSession[] = [listedOf('s-a', 1)]
     const cold = Object.freeze({ header: Object.freeze({
       version: 4, id: 'cli-t-a', createdAt: 456, parentSession: 's-a', isSeeded: false,
@@ -214,7 +214,7 @@ describe('CLI child session replay', () => {
   })
 
   it('fails closed when parent preparation rejects', async () => {
-    const home = homeWithRegistry([{ path: 'D:/work', sessionIds: ['s-a'] }])
+    const home = homeWithRegistry([{ path: '/work', sessionIds: ['s-a'] }])
     const prepareParent = vi.fn(async () => { throw new Error('parent restore refused') })
     const { created, run } = runner({
       home, records: [recordOf('t-a', 's-a')], sessions: [listedOf('s-a', 1)], prepareParent,
@@ -225,7 +225,7 @@ describe('CLI child session replay', () => {
   })
 
   it('does not create after disposal while parent preparation is pending', async () => {
-    const home = homeWithRegistry([{ path: 'D:/work', sessionIds: ['s-a'] }])
+    const home = homeWithRegistry([{ path: '/work', sessionIds: ['s-a'] }])
     const controller = new AbortController()
     let releasePreparation!: () => void
     let notifyPreparationStarted!: () => void
@@ -244,7 +244,7 @@ describe('CLI child session replay', () => {
   })
 
   it('fails closed when the post-preparation persistence list rejects', async () => {
-    const home = homeWithRegistry([{ path: 'D:/work', sessionIds: ['s-a'] }])
+    const home = homeWithRegistry([{ path: '/work', sessionIds: ['s-a'] }])
     const sessions = [listedOf('s-a', 1)]
     const list = vi.fn<() => Promise<readonly ReplayListedSession[]>>()
       .mockResolvedValueOnce(sessions)
@@ -259,7 +259,7 @@ describe('CLI child session replay', () => {
   })
 
   it('holds the shared owner gate across a slow fresh list and live publication', async () => {
-    const home = homeWithRegistry([{ path: 'D:/work', sessionIds: ['s-a'] }])
+    const home = homeWithRegistry([{ path: '/work', sessionIds: ['s-a'] }])
     const gate = new CliSessionRecoveryGate()
     const sessions = [listedOf('s-a', 1)]
     let releaseFreshList!: (value: readonly ReplayListedSession[]) => void
@@ -305,7 +305,7 @@ describe('CLI child session replay', () => {
   })
 
   it('skips a durable child when native recovery owns the shared gate first', async () => {
-    const home = homeWithRegistry([{ path: 'D:/work', sessionIds: ['s-a'] }])
+    const home = homeWithRegistry([{ path: '/work', sessionIds: ['s-a'] }])
     const gate = new CliSessionRecoveryGate()
     const sessions: ReplayListedSession[] = [listedOf('s-a', 1)]
     const cold = Object.freeze({ header: Object.freeze({
@@ -350,7 +350,7 @@ describe('CLI child session replay', () => {
   })
 
   it('does not publish after disposal while waiting for the shared owner gate', async () => {
-    const home = homeWithRegistry([{ path: 'D:/work', sessionIds: ['s-a'] }])
+    const home = homeWithRegistry([{ path: '/work', sessionIds: ['s-a'] }])
     const gate = new CliSessionRecoveryGate()
     const controller = new AbortController()
     let releaseOwner!: () => void
@@ -387,15 +387,15 @@ describe('CLI child session replay', () => {
   })
 
   it('preserves real live headers and persisted cold identity while announcing only missing children', async () => {
-    const home = homeWithRegistry([{ path: 'D:/work', sessionIds: ['s-a'] }])
+    const home = homeWithRegistry([{ path: '/work', sessionIds: ['s-a'] }])
     const root = new Context()
     const fiber = root.plugin(SessionStore)
     await fiber.await()
     try {
       const nativeStore = root.sessions
-      const parent = nativeStore.create('s-a', { meta: { createdAt: 123, cwd: 'D:/original-parent' } })
+      const parent = nativeStore.create('s-a', { meta: { createdAt: 123, cwd: '/original-parent' } })
       const live = nativeStore.create('cli-live', { meta: {
-        createdAt: 789, cwd: 'D:/original-child', parentSession: 's-a', origin: 'subagent', delegationDepth: 1,
+        createdAt: 789, cwd: '/original-child', parentSession: 's-a', origin: 'subagent', delegationDepth: 1,
       } })
       const cold = Object.freeze({ header: Object.freeze({
         version: 4, id: 'cli-cold', createdAt: 456, parentSession: 's-a', isSeeded: false, origin: 'subagent', delegationDepth: 1,
@@ -425,7 +425,7 @@ describe('CLI child session replay', () => {
       expect(persisted).toEqual(before)
       const fresh = nativeStore.get('cli-fresh')
       expect(fresh?.header).toMatchObject({
-        version: 4, id: 'cli-fresh', createdAt: 1_000, cwd: 'D:/work', parentSession: 's-a', isSeeded: false, origin: 'subagent',
+        version: 4, id: 'cli-fresh', createdAt: 1_000, cwd: '/work', parentSession: 's-a', isSeeded: false, origin: 'subagent',
       })
       expect(fresh?.snapshotEvents().map(event => event.type)).toEqual([
         'user/message', 'maestro/cli-child', 'request/context', 'step/start', 'assistant/message', 'session/end-seed',
@@ -434,7 +434,7 @@ describe('CLI child session replay', () => {
   })
 
   it('replays the native settlement shape with the canonical usage', async () => {
-    const home = homeWithRegistry([{ path: 'D:/work', sessionIds: ['s-a'] }])
+    const home = homeWithRegistry([{ path: '/work', sessionIds: ['s-a'] }])
     const { created, run } = runner({ home, records: [recordOf('t-a', 's-a')], sessions: [listedOf('s-a', 1)] })
     await run()
     const seed = created[0]?.options.seed as readonly { type: string; data: any }[]
@@ -450,7 +450,7 @@ describe('CLI child session replay', () => {
   })
 
   it('replays failed settlements as an attempt', async () => {
-    const home = homeWithRegistry([{ path: 'D:/work', sessionIds: ['s-a'] }])
+    const home = homeWithRegistry([{ path: '/work', sessionIds: ['s-a'] }])
     const { created, run } = runner({
       home,
       records: [recordOf('t-a', 's-a', { phase: 'failed' })],
@@ -467,7 +467,7 @@ describe('CLI child session replay', () => {
     homes.push(home)
     const { run } = runner({ home, records: [recordOf('t-a', 's-a')], sessions: [listedOf('s-a', 1)] })
     expect(await run()).toBe(0)
-    const disabledHome = homeWithRegistry([{ path: 'D:/work', sessionIds: ['s-a'] }])
+    const disabledHome = homeWithRegistry([{ path: '/work', sessionIds: ['s-a'] }])
     const store = { create: () => { throw new Error('must not create') }, get: () => undefined }
     const count = await replayCliSessions({
       store: store as any,

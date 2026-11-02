@@ -295,13 +295,13 @@ describe('M: plugin-only recovery with explicit public writer barrier (not deplo
   })
   it('preserves seeded inherited cut and header metadata while supplementing only own zero usage', async () => {
     const h = harness(), prior = cold(false)
-    prior.session = { ...HEADER, isSeeded: true, cwd: 'D:/safe-audit-work', delegationDepth: 2 }
+    prior.session = { ...HEADER, isSeeded: true, cwd: '/safe-audit-work', delegationDepth: 2 }
     prior.inheritedEventCount = 2
     prior.events = [...prior.events.slice(0, 2), event(2, 'session/end-seed', { inherited: true }), event(3, 'maestro/cli-child', MARKER)]
     const before = structuredClone(prior); h.physical.set(HEADER.id, prior)
     const result = await new NativeRecovery(h.parts).recover(RECORD)
     expect(result, `${h.schemaErrors.join('\n')}\n${h.trace.join(',')}`).toMatchObject({ status: 'recovered' })
-    expect(h.creations[0]?.inheritedEventCount).toBe(2); expect(h.creations[0]?.meta).toMatchObject({ isSeeded: true, cwd: 'D:/safe-audit-work', delegationDepth: 2, createdAt: 888 })
+    expect(h.creations[0]?.inheritedEventCount).toBe(2); expect(h.creations[0]?.meta).toMatchObject({ isSeeded: true, cwd: '/safe-audit-work', delegationDepth: 2, createdAt: 888 })
     expect((h.physical.get(HEADER.id) as Snapshot).events.slice(0, before.events.length)).toEqual(before.events)
     expect(h.live.get(HEADER.id)?.inheritedEventCount).toBe(2); expect(h.states.get(HEADER.id)?.usageEventCount).toBe(1)
   })

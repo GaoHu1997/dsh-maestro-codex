@@ -13,7 +13,7 @@
 
 import { createHash, randomUUID } from 'node:crypto'
 import { cp, mkdir, rm, writeFile } from 'node:fs/promises'
-import { basename, dirname, join, resolve } from 'node:path'
+import { basename, dirname, join, resolve, win32 } from 'node:path'
 import type { ToolExec } from './tool.js'
 import { tmpdir } from 'node:os'
 import { fileURLToPath } from 'node:url'
@@ -593,7 +593,10 @@ export function bridgeShimPath(): string {
  * then (the CLI children resolve bare commands through their own PATH).
  */
 export function bridgeNodeCommand(execPath: string = process.execPath): string {
-  const base = basename(execPath).toLowerCase()
+  // A Windows exec path (`C:\...\node.exe`) must be recognized on every host OS:
+  // the app shell that hands the path over is Windows even when this module
+  // runs elsewhere (CI, cross-platform tests). Parse with the win32 rules.
+  const base = win32.basename(execPath).toLowerCase()
   return base === 'node' || base === 'node.exe' || base === 'node.cmd' ? execPath : 'node'
 }
 
