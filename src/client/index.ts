@@ -94,7 +94,7 @@ export function apply(ctx: ClientContext): void {
           name: 'settings.section',
           id: 'maestro-codex',
           order: 90,
-          label: 'CLI 子代理',
+          label: '子智能体',
           inject: () => ({
             maestroStore: store,
             maestro: form.actions(),

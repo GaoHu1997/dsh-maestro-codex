@@ -1,8 +1,13 @@
-import { createElement } from 'react'
+// @vitest-environment jsdom
+import { act, createElement } from 'react'
+import { createRoot } from 'react-dom/client'
 import { renderToStaticMarkup } from 'react-dom/server'
-import { describe, expect, it, vi } from 'vitest'
+import { afterEach, describe, expect, it, vi } from 'vitest'
 
 import type { BoardCliState } from '../src/client/board/data.js'
+
+// React 18 的 act 需要显式声明测试环境。
+;(globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true
 
 /* 页头 chip 的数据全部来自 board/data 的 feed；这里把 feed 换成固定快照，
  * 验证“本地 + CLI 合并计数、CLI 行带阶段/耗时/token、external 不重复”这一层。 */
@@ -59,5 +64,41 @@ describe('CliCatalogChip', () => {
   it('hides itself on subagent sessions (the core lineage chip owns that header)', () => {
     const html = renderToStaticMarkup(createElement(CliCatalogChip, { sessionId: 'child-1', host: { get: () => undefined } }))
     expect(html).toBe('')
+  })
+})
+
+/* 菜单行要等触发器点开才渲染，静态渲染只出 chip 本体；这里直接驱动组件
+ * 的菜单层：行头执行者徽标 + 副行的模式词（已移除）。 */
+describe('header catalog menu rows', () => {
+  afterEach(() => {
+    document.querySelector('.dmch-menu')?.remove()
+    document.body.innerHTML = ''
+    document.body.removeAttribute('data-maestro-cli-header')
+  })
+
+  const renderMenu = (): HTMLElement => {
+    const container = document.createElement('div')
+    document.body.appendChild(container)
+    const root = createRoot(container)
+    act(() => {
+      root.render(createElement(CliCatalogChip, { sessionId: 's1', host: { get: () => undefined } }))
+    })
+    act(() => {
+      container.querySelector<HTMLButtonElement>('[data-dmc-trigger]')?.click()
+    })
+    const menu = document.querySelector<HTMLElement>('.dmch-menu')
+    if (menu === null) throw new Error('menu did not open')
+    return menu
+  }
+
+  it('badges every row with its executor and drops the mode words', () => {
+    const menu = renderMenu()
+    const badges = [...menu.querySelectorAll<HTMLElement>('[data-cli-executor]')].map(badge => badge.dataset.cliExecutor)
+    // dsh 原生行标 DSH；CLI 行标它真正的执行者（不是笼统的 CLI）。
+    expect(badges.sort()).toEqual(['DSH', 'codex'])
+    expect(menu.textContent).not.toContain('可续接')
+    expect(menu.textContent).not.toContain('一次性')
+    // CLI 行副行不再重复 CLI 名（执行者徽标已经说了）。
+    expect(menu.textContent).not.toContain('codex cli')
   })
 })

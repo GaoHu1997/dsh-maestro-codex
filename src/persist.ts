@@ -11,7 +11,7 @@
 import { mkdir, readFile, readdir, stat, unlink, writeFile } from 'node:fs/promises'
 import { homedir } from 'node:os'
 import { join } from 'node:path'
-import type { MaestroTaskEvent } from './wire.js'
+import type { MaestroTaskEvent, MaestroTaskResult } from './wire.js'
 import { TERMINAL_PHASES, type MaestroCliId, type MaestroPhase } from './wire.js'
 
 /** dsh 主目录（与 mcp.ts / dsh-models.ts 同一解析规则）。 */
@@ -35,6 +35,7 @@ export const PERSIST_KEEP = 200
 export interface PersistedTask {
   readonly id: string
   readonly cli: MaestroCliId
+  readonly kind?: 'cli' | 'npm' | undefined
   readonly title: string
   readonly prompt?: string | undefined
   readonly cwd?: string | undefined
@@ -48,6 +49,8 @@ export interface PersistedTask {
   readonly error?: string | undefined
   readonly finalText?: string | undefined
   readonly stats?: Readonly<Record<string, string | number | boolean>> | undefined
+  /** 结构化收尾（协议行解析结果）；缺省 = 由 phase 推导。 */
+  readonly result?: MaestroTaskResult | undefined
   readonly truncated?: boolean | undefined
   readonly events: readonly MaestroTaskEvent[]
   readonly savedAt: number
@@ -57,6 +60,7 @@ export interface PersistedTask {
 export interface PersistInput {
   readonly id: string
   readonly cli: MaestroCliId
+  readonly kind?: 'cli' | 'npm' | undefined
   readonly title: string
   readonly prompt?: string | undefined
   readonly cwd?: string | undefined
@@ -70,6 +74,8 @@ export interface PersistInput {
   readonly error?: string | undefined
   readonly finalText?: string | undefined
   readonly stats?: Readonly<Record<string, string | number | boolean>> | undefined
+  /** 结构化收尾（协议行解析结果）；缺省 = 由 phase 推导。 */
+  readonly result?: MaestroTaskResult | undefined
   readonly truncated?: boolean | undefined
   readonly events: readonly MaestroTaskEvent[]
 }
@@ -79,6 +85,7 @@ export function persistedOf(task: PersistInput, savedAt: number, eventTail: numb
   return {
     id: task.id,
     cli: task.cli,
+    ...(task.kind === undefined ? {} : { kind: task.kind }),
     title: task.title,
     ...(task.prompt === undefined || task.prompt === '' ? {} : { prompt: task.prompt }),
     ...(task.cwd === undefined ? {} : { cwd: task.cwd }),
@@ -92,7 +99,8 @@ export function persistedOf(task: PersistInput, savedAt: number, eventTail: numb
     ...(task.error === undefined ? {} : { error: task.error }),
     ...(task.finalText === undefined ? {} : { finalText: task.finalText }),
     ...(task.stats === undefined ? {} : { stats: task.stats }),
-    ...(task.truncated === true ? { truncated: true } : {}),
+    ...(task.result === undefined ? {} : { result: task.result }),
+    ...(task.truncated === true || task.events.length > eventTail ? { truncated: true } : {}),
     // 只留事件尾：800 条满环最坏 3MB+，磁盘历史 200 条足够翻旧账。
     events: task.events.slice(-eventTail),
     savedAt,

@@ -10,7 +10,8 @@ export class FakeChild extends EventEmitter implements Partial<ChildProcess> {
   readonly stdin = new EventEmitter() as EventEmitter & { end(input?: string): void }
   readonly stdout = new EventEmitter()
   readonly stderr = new EventEmitter()
-  pid = 4242
+  // No real PID: Windows killTree must never taskkill an unrelated process.
+  pid: number | undefined = undefined
   exitCode: number | null = null
   signalCode: NodeJS.Signals | null = null
   killed = false

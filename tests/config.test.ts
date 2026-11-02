@@ -33,6 +33,28 @@ describe('effectiveOf', () => {
     expect(effective.maxConcurrentTasks).toBe(2)
   })
 
+  it('ships the approved four-character CLI assignments', () => {
+    const effective = effectiveOf({})
+    expect(effective.claude.taskTypes).toEqual(['仓库探索', '影响分析', '模块重构', '方案设计', '文档整理'])
+    expect(effective.codex.taskTypes).toEqual(['功能开发', '缺陷修复', '测试验证', '代码审查', '数据处理'])
+  })
+
+  it('renames legacy selections without replacing assignments or custom keywords', () => {
+    const claudeTaskTypes = ['需求分析', '代码审查', '重构', '模块重构', '自定义处理']
+    const codexTaskTypes = ['代码生成', '项目测试', '调试修复', '数据处理']
+    const effective = effectiveOf({ claudeTaskTypes, codexTaskTypes })
+    expect(effective.claude.taskTypes).toEqual(['方案设计', '代码审查', '模块重构', '自定义处理'])
+    expect(effective.codex.taskTypes).toEqual(['功能开发', '测试验证', '缺陷修复', '数据处理'])
+    expect(claudeTaskTypes).toEqual(['需求分析', '代码审查', '重构', '模块重构', '自定义处理'])
+    expect(codexTaskTypes).toEqual(['代码生成', '项目测试', '调试修复', '数据处理'])
+  })
+
+  it('does not repopulate task selections explicitly cleared by the user', () => {
+    const effective = effectiveOf({ claudeTaskTypes: [], codexTaskTypes: [] })
+    expect(effective.claude.taskTypes).toEqual([])
+    expect(effective.codex.taskTypes).toEqual([])
+  })
+
   it('applies provided values', () => {
     const effective = effectiveOf({ defaultCli: 'codex', claudePermissionMode: 'acceptEdits', maxConcurrentTasks: 3 })
     expect(effective.defaultCli).toBe('codex')
@@ -89,6 +111,24 @@ describe('minimum task difficulty', () => {
     const redacted = redactEffective(effectiveOf({ minTaskDifficulty: 'high', codexMinTaskDifficulty: 'low' }))
     expect(redacted.claude.minTaskDifficulty).toBe('high')
     expect(redacted.codex.minTaskDifficulty).toBe('low')
+  })
+
+  it('defaults the built-in dsh fallback to its own low floor and task types', () => {
+    expect(CONFIG_DEFAULTS.dshMinTaskDifficulty).toBe('low')
+    expect(CONFIG_DEFAULTS.dshTaskTypes).toEqual(['代码定位', '资料检索', '方案核验'])
+    expect(effectiveOf({}).dsh.minTaskDifficulty).toBe('low')
+    expect(effectiveOf({}).dsh.taskTypes).toEqual(['代码定位', '资料检索', '方案核验'])
+    // The dsh defaults must not leak into the two external CLIs.
+    expect(effectiveOf({}).claude.taskTypes).not.toContain('代码定位')
+    expect(effectiveOf({}).codex.taskTypes).not.toContain('代码定位')
+  })
+
+  it('accepts an independent dsh floor and task types and rejects an unknown level', () => {
+    const cfg = effectiveOf({ dshMinTaskDifficulty: 'high', dshTaskTypes: ['代码定位'] })
+    expect(cfg.dsh.minTaskDifficulty).toBe('high')
+    expect(cfg.dsh.taskTypes).toEqual(['代码定位'])
+    expect(() => validateConfig({ dshMinTaskDifficulty: 'nope' })).toThrow()
+    expect(() => validateConfig({ dshTaskTypes: ['代码定位', 7] })).toThrow()
   })
 
   it.each(TASK_DIFFICULTIES)('accepts and resolves the legacy %s threshold for both CLIs', minTaskDifficulty => {
@@ -185,5 +225,21 @@ describe('persistTasks', () => {
     const parsed = Config({ persistTasks: false }) as Config
     expect(readVolatile(parsed.persistTasks)).toBe(false)
     expect(Config.dict.persistTasks.meta.volatile).toBe(true)
+  })
+})
+
+describe('prepareCommand', () => {
+  it('defaults to nothing and passes a configured command through', () => {
+    expect(CONFIG_DEFAULTS.prepareCommand).toBe('')
+    expect(effectiveOf({}).prepareCommand).toBe('')
+    expect(effectiveOf({ prepareCommand: 'git worktree add ../w' }).prepareCommand).toBe('git worktree add ../w')
+    const parsed = Config({ prepareCommand: 'npm ci' }) as Config
+    expect(readVolatile(parsed.prepareCommand)).toBe('npm ci')
+    expect(Config.dict.prepareCommand.meta.volatile).toBe(true)
+  })
+
+  it('caps the command length so a bad paste cannot reach the shell', () => {
+    expect(() => validateConfig({ prepareCommand: 'x'.repeat(4000) })).not.toThrow()
+    expect(() => validateConfig({ prepareCommand: 'x'.repeat(4001) })).toThrow(/prepareCommand/)
   })
 })

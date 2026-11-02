@@ -9,7 +9,7 @@ import { unlink, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { runProcess } from '../spawn.js'
-import { CLAUDE_THINKING_BUDGETS } from '../wire.js'
+import { CLAUDE_THINKING_BUDGETS, type MaestroChannelEvent } from '../wire.js'
 import type { ClaudePermissionMode } from '../config.js'
 
 /** Parsed outcome of one claude run. */
@@ -38,7 +38,7 @@ interface ClaudeFrame {
   total_cost_usd?: number
   usage?: { input_tokens?: number; output_tokens?: number; cache_read_input_tokens?: number; cache_creation_input_tokens?: number }
   message?: {
-    content?: Array<{ type?: string; text?: string; name?: string; input?: Record<string, unknown>; tool_use_id?: string }>
+    content?: Array<{ type?: string; text?: string; thinking?: string; name?: string; input?: Record<string, unknown>; tool_use_id?: string; content?: unknown; is_error?: boolean }>
     /** Assistant frames carry their own usage; it is what feeds the live counters. */
     usage?: { input_tokens?: number; output_tokens?: number; cache_read_input_tokens?: number; cache_creation_input_tokens?: number }
   }
@@ -66,7 +66,7 @@ export function claudeMcpArgs(mcpConfigPath: string, serverNames: readonly strin
 }
 
 /** The argv for one headless run (before the resolved path is prepended). */
-export function claudeArgs(model: string, permissionMode: ClaudePermissionMode, mcpConfigPath?: string, mcpServerNames?: readonly string[], resume?: string, settingsPath?: string): string[] {
+export function claudeArgs(model: string, permissionMode: ClaudePermissionMode, mcpConfigPath?: string, mcpServerNames?: readonly string[], resume?: string, settingsPath?: string, addDir?: string): string[] {
   const args = ['-p', '--output-format', 'stream-json', '--verbose']
   if (settingsPath !== undefined && settingsPath !== '') args.push('--settings', settingsPath)
   if (model !== '') args.push('--model', model)
@@ -74,6 +74,9 @@ export function claudeArgs(model: string, permissionMode: ClaudePermissionMode, 
   // `--resume <session-id>` continues a previous headless session; the
   // follow-up instruction still rides stdin.
   if (resume !== undefined && resume !== '') args.push('--resume', resume)
+  // An additional working directory whose `.claude/skills/` claude loads as
+  // native skills (the dsh skills staging tree — nothing else lives there).
+  if (addDir !== undefined && addDir !== '') args.push('--add-dir', addDir)
   if (mcpConfigPath !== undefined) args.push(...claudeMcpArgs(mcpConfigPath, mcpServerNames ?? []))
   return args
 }
@@ -90,8 +93,13 @@ export async function writeClaudeSettingsFile(env: Record<string, string>): Prom
   const file = join(tmpdir(), `dsh-maestro-claude-${randomUUID().slice(0, 8)}.json`)
   // The file carries the auth token: owner-only where the platform honours the
   // mode, and unlinked as soon as the run settles.
-  await writeFile(file, JSON.stringify({ env }, null, 2), { encoding: 'utf8', mode: 0o600 })
-  return file
+  try {
+    await writeFile(file, JSON.stringify({ env }, null, 2), { encoding: 'utf8', mode: 0o600 })
+    return file
+  } catch (error) {
+    await unlink(file).catch(() => {})
+    throw error
+  }
 }
 
 /**
@@ -108,19 +116,22 @@ export function claudeEnv(baseUrl: string, authToken: string, thinking: string =
   return env
 }
 
-/** Extract the progress-worthy text/tool facts out of one assistant frame. */
-export function claudeFrameEvents(frame: ClaudeFrame): Array<{ kind: 'text' | 'note' | 'error'; text: string }> {
-  const events: Array<{ kind: 'text' | 'note' | 'error'; text: string }> = []
+/** Extract the progress-worthy text/thinking/tool facts out of one assistant frame. */
+export function claudeFrameEvents(frame: ClaudeFrame): MaestroChannelEvent[] {
+  const events: MaestroChannelEvent[] = []
   if (frame.type === 'system' && frame.subtype === 'init') {
     events.push({ kind: 'note', text: `会话已初始化（model=${frame.model ?? '?'}${frame.session_id === undefined ? '' : `, session=${frame.session_id}`}）` })
     return events
   }
   if (frame.type === 'assistant') {
-    for (const block of frame.message?.content ?? []) {
-      if (block.type === 'text' && (block.text ?? '').trim() !== '') {
+    for (const block of claudeBlocks(frame)) {
+      if (block.type === 'text' && typeof block.text === 'string' && block.text.trim() !== '') {
         events.push({ kind: 'text', text: block.text ?? '' })
-      } else if (block.type === 'tool_use' && block.name !== undefined) {
-        events.push({ kind: 'note', text: `调用工具 ${block.name}${toolUseDetail(block)}` })
+      } else if (block.type === 'thinking' && typeof block.thinking === 'string' && block.thinking.trim() !== '') {
+        // 思考正文单独成事件：会话页折叠成「思考过程」行，不再混进回答。
+        events.push({ kind: 'thinking', text: block.thinking ?? '' })
+      } else if (block.type === 'tool_use' && typeof block.name === 'string') {
+        events.push({ kind: 'tool', text: block.name, detail: toolUseDetail(block) })
       }
     }
     return events
@@ -132,8 +143,18 @@ export function claudeFrameEvents(frame: ClaudeFrame): Array<{ kind: 'text' | 'n
   return events
 }
 
-/** A short detail suffix for tool calls the user tracks (subagents notably). */
+/** The tool row's expandable body: a one-line summary, then the call's params. */
 function toolUseDetail(block: { name?: string; input?: Record<string, unknown> }): string {
+  const input = block.input
+  const summary = toolUseSummary(block)
+  const params = typeof input !== 'object' || input === null || Object.keys(input).length === 0
+    ? ''
+    : JSON.stringify(input, null, 2)
+  return params === '' ? summary : `${summary}\n${params}`
+}
+
+/** A short detail line for tool calls the user tracks (subagents notably). */
+function toolUseSummary(block: { name?: string; input?: Record<string, unknown> }): string {
   const input = block.input
   if (typeof input !== 'object' || input === null) return ''
   const subagentType = input['subagent_type']
@@ -141,23 +162,34 @@ function toolUseDetail(block: { name?: string; input?: Record<string, unknown> }
   const pattern = input['pattern']
   const command = input['command']
   if (typeof subagentType === 'string' && subagentType !== '') {
-    return typeof description === 'string' && description !== '' ? `（子代理 ${subagentType}：${description.slice(0, 80)}）` : `（子代理 ${subagentType}）`
+    return typeof description === 'string' && description !== '' ? `子代理 ${subagentType}：${description.slice(0, 80)}` : `子代理 ${subagentType}`
   }
-  if (typeof pattern === 'string' && pattern !== '') return `（${pattern.slice(0, 60)}）`
-  if (typeof command === 'string' && command !== '') return `（${command.slice(0, 60)}）`
+  if (typeof pattern === 'string' && pattern !== '') return pattern.slice(0, 60)
+  if (typeof command === 'string' && command !== '') return command.slice(0, 60)
   return ''
 }
 
-/** The tool_result frames of one user message (for subagent completion notes). */
-export function claudeToolResultEvents(frame: ClaudeFrame, toolNamesById: ReadonlyMap<string, string>): Array<{ kind: 'text' | 'note' | 'error'; text: string }> {
-  const events: Array<{ kind: 'text' | 'note' | 'error'; text: string }> = []
+/** Ignore malformed/null content blocks without losing subsequent frames. */
+function claudeBlocks(frame: ClaudeFrame): NonNullable<NonNullable<ClaudeFrame['message']>['content']> {
+  const blocks = frame.message?.content
+  return Array.isArray(blocks) ? blocks.filter(block => typeof block === 'object' && block !== null && !Array.isArray(block)) : []
+}
+
+/** Tool-result identity and full text/error projection, including MCP skills. */
+export function claudeToolResultEvents(frame: ClaudeFrame, toolNamesById: ReadonlyMap<string, string>): MaestroChannelEvent[] {
+  const events: MaestroChannelEvent[] = []
   if (frame.type !== 'user') return events
-  for (const block of frame.message?.content ?? []) {
+  for (const block of claudeBlocks(frame)) {
     if (block.type !== 'tool_result' || typeof block.tool_use_id !== 'string') continue
-    const name = toolNamesById.get(block.tool_use_id)
-    if (name === 'Task' || name === 'Agent') {
-      events.push({ kind: 'note', text: `子代理完成（${name}）` })
-    }
+    const name = toolNamesById.get(block.tool_use_id) ?? (typeof block.name === 'string' ? block.name : 'tool_result')
+    const content = block.content
+    const detail = typeof content === 'string' ? content : Array.isArray(content)
+      ? content.map(part => typeof part === 'object' && part !== null && typeof (part as Record<string, unknown>)['text'] === 'string'
+        ? (part as Record<string, unknown>)['text'] as string : JSON.stringify(part)).join('\n')
+      : content === undefined ? '' : JSON.stringify(content)
+    events.push({ kind: block.is_error === true ? 'error' : 'tool',
+      text: `${name}（${block.is_error === true ? '工具失败' : '工具完成'}，use_id=${block.tool_use_id}）`, detail })
+    if (name === 'Task' || name === 'Agent') events.push({ kind: 'note', text: `子代理${block.is_error === true ? '失败' : '完成'}（${name}）` })
   }
   return events
 }
@@ -177,11 +209,16 @@ export function mergeLiveUsage(
   usage: ClaudeUsage,
   kind: 'assistant' | 'result',
 ): Record<string, string | number | boolean> {
+  if (typeof usage !== 'object' || usage === null) return { ...previous }
   const next: Record<string, string | number | boolean> = { ...previous }
-  if (typeof usage.input_tokens === 'number') next['inputTokens'] = usage.input_tokens
-  if (typeof usage.cache_read_input_tokens === 'number') next['cachedInputTokens'] = usage.cache_read_input_tokens
-  if (typeof usage.cache_creation_input_tokens === 'number') next['cacheWriteTokens'] = usage.cache_creation_input_tokens
-  if (typeof usage.output_tokens === 'number') {
+  const measured = (value: unknown): value is number => typeof value === 'number' && Number.isFinite(value) && value >= 0
+  if (measured(usage.input_tokens)) {
+    next['inputTokens'] = usage.input_tokens
+    next['usageInputSemantics'] = 'uncached'
+  }
+  if (measured(usage.cache_read_input_tokens)) next['cachedInputTokens'] = usage.cache_read_input_tokens
+  if (measured(usage.cache_creation_input_tokens)) next['cacheWriteTokens'] = usage.cache_creation_input_tokens
+  if (measured(usage.output_tokens)) {
     const prior = next['outputTokens']
     next['outputTokens'] = kind === 'result'
       ? usage.output_tokens
@@ -199,10 +236,14 @@ export function claudeResultOf(frame: ClaudeFrame): { finalText: string; stats: 
   if (frame.session_id !== undefined) stats['sessionId'] = frame.session_id
   const usage = frame.usage
   if (typeof usage === 'object' && usage !== null) {
-    if (typeof usage.input_tokens === 'number') stats['inputTokens'] = usage.input_tokens
-    if (typeof usage.output_tokens === 'number') stats['outputTokens'] = usage.output_tokens
-    if (typeof usage.cache_read_input_tokens === 'number') stats['cachedInputTokens'] = usage.cache_read_input_tokens
-    if (typeof usage.cache_creation_input_tokens === 'number') stats['cacheWriteTokens'] = usage.cache_creation_input_tokens
+    const measured = (value: unknown): value is number => typeof value === 'number' && Number.isFinite(value) && value >= 0
+    if (measured(usage.input_tokens)) {
+      stats['inputTokens'] = usage.input_tokens
+      stats['usageInputSemantics'] = 'uncached'
+    }
+    if (measured(usage.output_tokens)) stats['outputTokens'] = usage.output_tokens
+    if (measured(usage.cache_read_input_tokens)) stats['cachedInputTokens'] = usage.cache_read_input_tokens
+    if (measured(usage.cache_creation_input_tokens)) stats['cacheWriteTokens'] = usage.cache_creation_input_tokens
   }
   return { finalText: frame.result ?? '', stats }
 }
@@ -226,16 +267,21 @@ export async function runClaudeTask(options: {
   authToken: string
   mcpConfigPath?: string
   mcpServerNames?: readonly string[]
+  /** Extra `--add-dir` (the staged dsh skills tree; see bridge.stageNativeSkills). */
+  addDir?: string
   timeoutMs: number
   signal: AbortSignal
-  onEvent: (kind: 'text' | 'note' | 'error', text: string) => void
+  onEvent: (kind: MaestroChannelEvent['kind'], text: string, detail?: string) => void
   /** Running usage snapshot, one call per frame that carries counts. */
   onUsage?: (stats: Record<string, string | number | boolean>) => void
 }): Promise<ClaudeRunResult> {
-  const env = claudeEnv(options.baseUrl, options.authToken, options.thinking ?? '')
-  // No provider env to pin: the run rides whatever claude is configured with.
-  const settingsPath = Object.keys(env).length === 0 ? undefined : await writeClaudeSettingsFile(env)
-  const args = claudeArgs(options.model, options.permissionMode, options.mcpConfigPath, options.mcpServerNames, options.resume, settingsPath)
+  // Claude auto memory is repository-global across independent conversations.
+  // Disable it for delegated runs via the documented per-process switch; native
+  // session transcripts/resume remain enabled and user settings are untouched.
+  const env = { ...claudeEnv(options.baseUrl, options.authToken, options.thinking ?? ''), CLAUDE_CODE_DISABLE_AUTO_MEMORY: '1' }
+  const settingsPath = await writeClaudeSettingsFile(env)
+  try {
+  const args = claudeArgs(options.model, options.permissionMode, options.mcpConfigPath, options.mcpServerNames, options.resume, settingsPath, options.addDir)
   // The level came from the model's configured reasoningEfforts; a key with no
   // budget mapping (catalog drift) must not fail the run — say so and move on.
   if (options.thinking !== undefined && options.thinking !== '' && !(options.thinking in CLAUDE_THINKING_BUDGETS)) {
@@ -252,7 +298,13 @@ export async function runClaudeTask(options: {
   const handleLine = (line: string): void => {
     let frame: ClaudeFrame
     try {
-      frame = JSON.parse(line) as ClaudeFrame
+      const parsed: unknown = JSON.parse(line)
+      if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) return
+      const record = parsed as Record<string, unknown>
+      for (const key of ['type', 'subtype', 'session_id', 'result', 'model', 'cwd']) {
+        if (record[key] !== undefined && typeof record[key] !== 'string') delete record[key]
+      }
+      frame = record as ClaudeFrame
     } catch {
       // Non-JSON chatter (update banners, warnings) — keep it visible but harmless.
       if (line.trim().startsWith('{')) return
@@ -260,14 +312,14 @@ export async function runClaudeTask(options: {
       return
     }
     if (frame.session_id !== undefined && sessionId === '') sessionId = frame.session_id
-    for (const event of claudeFrameEvents(frame)) options.onEvent(event.kind, event.text)
-    for (const block of frame.message?.content ?? []) {
+    for (const event of claudeFrameEvents(frame)) options.onEvent(event.kind, event.text, event.detail)
+    for (const block of claudeBlocks(frame)) {
       if (block.type === 'tool_use' && typeof block.name === 'string') {
         const id = typeof (block as { id?: unknown }).id === 'string' ? (block as { id: string }).id : undefined
         if (id !== undefined) toolNamesById.set(id, block.name)
       }
     }
-    for (const event of claudeToolResultEvents(frame, toolNamesById)) options.onEvent(event.kind, event.text)
+    for (const event of claudeToolResultEvents(frame, toolNamesById)) options.onEvent(event.kind, event.text, event.detail)
     if (frame.type === 'result') {
       const parsed = claudeResultOf(frame)
       finalText = parsed.finalText
@@ -301,15 +353,7 @@ export async function runClaudeTask(options: {
     // failing run is visible while it runs, not only in the final error string.
     onStderrLine: (line: string) => { options.onEvent('note', `stderr: ${line.slice(0, 300)}`) },
   })
-  // The settings file exists only for this run: drop it however the run ends.
-  let ended: Awaited<typeof outcome>
-  try {
-    ended = await outcome
-  } finally {
-    if (settingsPath !== undefined) {
-      try { await unlink(settingsPath) } catch { /* best effort */ }
-    }
-  }
+  const ended = await outcome
 
   const stats = { ...resultStats }
   if (sessionId !== '') stats['sessionId'] = sessionId
@@ -329,6 +373,9 @@ export async function runClaudeTask(options: {
       // Exit 0 with no text is a silent CLI (filtered output, crashed renderer):
       // name the reason instead of letting the dispatch report "unknown".
       ?? (finalText.trim() === '' ? 'Claude CLI 未返回文本结果（result 帧缺失或为空）' : undefined),
+  }
+  } finally {
+    if (settingsPath !== undefined) await unlink(settingsPath).catch(() => {})
   }
 }
 

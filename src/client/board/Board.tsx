@@ -1,17 +1,19 @@
 /** The original Tasks graph/tree shell, with Maestro CLI rows bridged into it. */
-import { useCallback, useEffect, useMemo, useState, useSyncExternalStore, type ReactNode } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore, type ReactNode } from 'react'
 import { Button, IconRefreshOutlineRegular } from '@deepseek-ai/dsh-client-ui-primitives'
 import type { MaestroCliId } from '../../wire.js'
 import { attachRows, buildSessionTree, collectTreeIds, type BoardCatalogEntry, type BoardTiming, type BoardTokenUsage } from './model.js'
-import { jobsFaceOf, sessionsFaceOf, useBoardJobs, useCliDetail, useCliTasks, useNow, useSessionList, type BoardHost, type BoardSessionList } from './data.js'
-import { boardCliUsage, boardJobRows, boardRendererInput, boardRootId, hasBoardTranscriptAside, jumpBoardAddress, jumpBoardNode, renderBoardNodes, withBoardNative } from './bridge.js'
-import { CliNodePopover, CliOutputWindow } from './cli-detail.js'
+import { jobsFaceOf, sessionsFaceOf, useBoardJobs, useCliTasks, useNow, useSessionList, type BoardHost, type BoardSessionList } from './data.js'
+import { boardCliUsage, boardJobRows, boardRendererInput, boardRootId, groupMemberIds, hasBoardTranscriptAside, jumpBoardAddress, jumpBoardCliSession, jumpBoardNode, renderBoardNodes, withBoardNative } from './bridge.js'
+import { CliNodePopover } from './cli-detail.js'
+import { useCliAccess } from '../access.js'
 import { SessionPage } from './Session.js'
-import { injectBoardAccent } from './accent.js'
+import { injectBoardAccent, watchBoardBadges } from './accent.js'
+import { JOBS_DOCK_ATTRIBUTE, injectJobsDock } from './jobs-dock.js'
 import { useBoardNative } from './native.js'
 import {
   AgentNodePopover, AnchoredPopover, JobsDrawer, JobOutputWindow, TasksGraph, TasksTree,
-  WorkflowNodePopover, TeamBoard, TaskWindow, teamMembersOf, useNarrowViewport, t,
+  WorkflowNodePopover, TeamBoard, TaskWindow, foldGroupId, teamMembersOf, useNarrowViewport, t,
   type Context, type SidebarTeamTaskView, type TasksAgentNode, type TasksFoldNode, type TasksWorkflowNode,
 } from './upstream/index.js'
 import legacy from './upstream/client/SubagentView.module.css'
@@ -23,7 +25,6 @@ export interface BoardPrefs {
   readonly tasksAutoFoldSettled: boolean
   readonly tasksAutoFoldBranches: boolean
   readonly tasksAutoFoldIdle: boolean
-  readonly jobsAutoCollapse: boolean
   readonly mobileDefaultTree: boolean
 }
 export interface BoardStore {
@@ -32,7 +33,7 @@ export interface BoardStore {
 }
 const DEFAULT_PREFS: BoardPrefs = {
   tasksViewMode: 'graph', tasksAutoFoldSettled: true, tasksAutoFoldBranches: true,
-  tasksAutoFoldIdle: true, jobsAutoCollapse: true, mobileDefaultTree: true,
+  tasksAutoFoldIdle: true, mobileDefaultTree: true,
 }
 export interface BoardTabProps {
   readonly ctx: BoardHost
@@ -41,7 +42,7 @@ export interface BoardTabProps {
   readonly store?: BoardStore
 }
 type BoardPopover = {
-  readonly kind: 'node' | 'workflow' | 'task' | 'cli-output' | 'job'
+  readonly kind: 'node' | 'workflow' | 'task' | 'job'
   readonly id: string
   readonly anchor: HTMLElement
 }
@@ -89,7 +90,8 @@ function BoardPage(props: BoardTabProps & { readonly rootId: string; readonly li
     rootId, sessions: list.byId, catalogs: catalogs.table, tokens: catalogs.tokens, timings: catalogs.timings,
   }), [rootId, list, catalogs])
   const treeIds = useMemo(() => collectTreeIds(sessionTree).filter(id => id === rootId || list.byId[id] !== undefined), [sessionTree, list, rootId])
-  const cli = useCliTasks(active, treeIds)
+  const access = useCliAccess(list, props.scope.sessionId, active)
+  const cli = useCliTasks(active, treeIds, access)
   const attached = useMemo(() => attachRows(sessionTree, { tasks: cli.tasks, usage: catalogs.usage }), [sessionTree, cli.tasks, catalogs.usage])
   const renderer = useMemo(() => withBoardNative(boardRendererInput(attached, props.scope.sessionId), list,
     native.live, native.runs, teamMembers, team?.tasks), [attached, props.scope.sessionId, list, native.live, native.runs, teamMembers, team])
@@ -113,23 +115,25 @@ function BoardPage(props: BoardTabProps & { readonly rootId: string; readonly li
   const [sessionTask, setSessionTask] = useState<{ id: string; cli: MaestroCliId } | null>(null)
   const nodes = useMemo(() => renderBoardNodes(renderer, { folded, autoFoldSettled, autoFoldBranches, autoFoldIdle, foldedIds, expandedGroups }),
     [renderer, folded, autoFoldSettled, autoFoldBranches, autoFoldIdle, foldedIds, expandedGroups])
-  const jobs = useBoardJobs(ctx, treeIds, active, popover?.kind === 'job' ? popover.id : null)
+  /* 后台任务只按主会话统计：子智能体会话里注册的 bash 作业属于它们自己的会话面，
+   * 不并入看板的「N 个后台任务」，这样与宿主页头 chip 的口径一致。 */
+  const jobsScope = useMemo(() => [rootId], [rootId])
+  const jobs = useBoardJobs(ctx, jobsScope, active, popover?.kind === 'job' ? popover.id : null)
   const jobsService = useMemo(() => jobsFaceOf(ctx), [ctx])
   const jobRows = useMemo(() => boardJobRows(jobs.rows, list), [jobs.rows, list])
   const selectedRow = popover?.kind === 'job' ? jobRows.find(row => row.job.id === popover.id) : undefined
   const selectedDomain = popover === null ? undefined : renderer.byNodeId.get(popover.id)
   const selectedNode = popover === null ? undefined : nodes.find(node => node.id === popover.id)
   const selectedTask = popover?.kind === 'task' ? team?.tasks.find(task => task.id === popover.id && task.status !== 'deleted') : undefined
-  const detail = useCliDetail(popover?.kind === 'cli-output' ? selectedDomain?.task?.id ?? null : null, active, treeIds)
   const asideAvailable = useMemo(() => hasBoardTranscriptAside(ctx), [ctx])
   const closePopover = useCallback(() => { setPopover(null) }, [])
   useEffect(() => {
     if (popover === null) return
     const missing = popover.kind === 'job' ? selectedRow === undefined
       : popover.kind === 'task' ? team === undefined || (popover.id !== '' && selectedTask === undefined)
-      : popover.kind === 'cli-output' ? selectedDomain?.task === undefined : selectedNode === undefined
+      : selectedNode === undefined
     if (!active || missing) setPopover(null)
-  }, [active, popover, selectedRow, selectedDomain, selectedNode, selectedTask, team])
+  }, [active, popover, selectedRow, selectedNode, selectedTask, team])
 
   const onNodeInfo = useCallback((node: TasksAgentNode, anchor: HTMLElement): void => {
     setPopover({ kind: 'node', id: node.id, anchor })
@@ -145,7 +149,25 @@ function BoardPage(props: BoardTabProps & { readonly rootId: string; readonly li
     if (!folded) setExpandedGroups(new Set())
     setFolded(!folded)
   }, [folded])
-  const foldNode = useCallback((node: TasksAgentNode) => { setFoldedIds(current => new Set([...current, node.id])) }, [])
+  /**
+   * 收起一颗已结束的卡片；若它属于一个**已展开**的折叠组，则整组收起。
+   *
+   * 组一旦展开，组卡片本身就消失了——再收起没有任何入口，正是「点开之后
+   * 收不回去」的问题。展开组里成员卡片自己的收起箭头于是升级为组开关：
+   * 删掉展开记录让自动折叠接管，同时把组内成员逐个手动折叠兜底（手动路径
+   * 不受全局折叠开关影响；与自动路径叠加是幂等的）。
+   */
+  const foldNode = useCallback((node: TasksAgentNode) => {
+    if (node.parentId !== undefined) {
+      const group = foldGroupId(node.state === 'idle' ? 'idle' : 'done', node.parentId)
+      if (expandedGroups.has(group)) {
+        setExpandedGroups(current => { const next = new Set(current); next.delete(group); return next })
+        setFoldedIds(current => new Set([...current, ...groupMemberIds(nodes, node)]))
+        return
+      }
+    }
+    setFoldedIds(current => new Set([...current, node.id]))
+  }, [expandedGroups, nodes])
   const expandGroup = useCallback((node: TasksFoldNode) => {
     setExpandedGroups(current => new Set([...current, node.id]))
     setFoldedIds(current => new Set([...current].filter(id => !node.memberIds.includes(id))))
@@ -169,10 +191,11 @@ function BoardPage(props: BoardTabProps & { readonly rootId: string; readonly li
       void result?.catch(cause => { console.error('[dsh-maestro-codex] refresh catalog failed:', cause) })
     }
   }, [cli.refresh, native.refresh, ctx, treeIds])
-  const jump = useCallback((node: TasksAgentNode, place: 'side' | 'main') => {
+  /** 跳转只有侧边一条路（原生 `subagentchat`），任何入口都不引开主窗口。 */
+  const jump = useCallback((node: TasksAgentNode) => {
     const row = renderer.byNodeId.get(node.id)
     if (row !== undefined && (row.kind !== 'agent' || !row.hasSession)) return
-    try { if (jumpBoardNode(ctx, node, place)) closePopover() }
+    try { if (jumpBoardNode(ctx, node)) closePopover() }
     catch (cause) { console.error('[dsh-maestro-codex] open session failed:', cause) }
   }, [renderer, ctx, closePopover])
   const cancelSelected = useCallback(async (): Promise<string | undefined> => {
@@ -193,7 +216,15 @@ function BoardPage(props: BoardTabProps & { readonly rootId: string; readonly li
   const failedParents = Object.values(renderer.input.catalogs).filter(catalog => catalog?.state === 'error')
   const common = { nodes, folded, loading, onNodeInfo, onWorkflowInfo, onOpenTask,
     onToggleFold: toggleFold, onExpandGroup: expandGroup, mode, onModeChange: setMode }
-  return <div className={legacy.subagent} style={{ position: 'relative' }} data-maestro-board-root={rootId}>
+  // 来源标识样式表 + 后台任务停靠槽 + DSH 徽标 title 修正（见 accent.ts / jobs-dock.ts）；样式表按 id 幂等。
+  const boardRef = useRef<HTMLDivElement>(null)
+  useEffect(() => {
+    injectBoardAccent()
+    injectJobsDock()
+    const root = boardRef.current
+    return root === null ? undefined : watchBoardBadges(root)
+  }, [])
+  return <div ref={boardRef} className={legacy.subagent} style={{ position: 'relative' }} data-maestro-board-root={rootId}>
     <div className={legacy.subagentHeader}>
       <span className={legacy.subagentHeading}>
         <span className={legacy.subagentTitle}>{t('subagent')}</span>
@@ -222,18 +253,20 @@ function BoardPage(props: BoardTabProps & { readonly rootId: string; readonly li
     </div> : mode === 'graph'
       ? <TasksGraph {...common} rootId={rootId} onFoldNode={foldNode} />
       : <TasksTree {...common} collapsedIds={collapsedIds} onToggleCollapse={toggleCollapse} onCollapseAll={collapseAll} onExpandAll={expandAll} />}
-    {jobs.available ? <JobsDrawer rows={jobRows} jobs={jobsService} autoCollapse={prefs.jobsAutoCollapse ?? true}
-      observed={selectedRow === undefined ? undefined : jobs.observed[selectedRow.job.id]}
-      agentCount={renderer.byNodeId.size} visible={active}
-      {...(selectedRow === undefined ? {} : { openJobId: selectedRow.job.id })}
-      onOpenOutput={(row, anchor) => { setPopover({ kind: 'job', id: row.job.id, anchor }) }} /> : null}
+    {/* 后台任务钉在看板底部，固定占 1/5 高度（见 jobs-dock.ts）。代理多时不再自动收起：
+        收起会让这 1/5 只剩一条 28px 的标题栏；用户点标题栏仍可手动折叠。 */}
+    {jobs.available && jobRows.length > 0 ? <div {...{ [JOBS_DOCK_ATTRIBUTE]: '' }}>
+      <JobsDrawer rows={jobRows} jobs={jobsService} autoCollapse={false}
+        observed={selectedRow === undefined ? undefined : jobs.observed[selectedRow.job.id]}
+        agentCount={renderer.byNodeId.size} visible={active}
+        {...(selectedRow === undefined ? {} : { openJobId: selectedRow.job.id })}
+        onOpenOutput={(row, anchor) => { setPopover({ kind: 'job', id: row.job.id, anchor }) }} />
+    </div> : null}
     {active && popover?.kind === 'task' && team !== undefined ? <TaskWindow key={popover.id || 'create'} rootId={rootId}
       task={selectedTask} members={teamMembers} ctx={ctx as unknown as Context} anchor={popover.anchor} onClose={closePopover} /> : null}
     {active && popover?.kind === 'job' && selectedRow !== undefined ? <JobOutputWindow
       jobs={jobsService} job={selectedRow.job} ownerSessionId={selectedRow.ownerSessionId}
       observed={jobs.observed[selectedRow.job.id]} anchor={popover.anchor} onClose={closePopover} /> : null}
-    {active && popover?.kind === 'cli-output' && selectedDomain?.task !== undefined ? <CliOutputWindow
-      node={selectedDomain} detail={detail} now={now} anchor={popover.anchor} onClose={closePopover} onCancel={cancelSelected} /> : null}
     {active && popover?.kind === 'workflow' && selectedNode?.kind === 'workflow' ? <AnchoredPopover anchor={popover.anchor} onClose={closePopover}>
       <WorkflowNodePopover node={selectedNode} onJumpMember={address => {
         try { if (jumpBoardAddress(ctx, address)) closePopover() }
@@ -243,8 +276,14 @@ function BoardPage(props: BoardTabProps & { readonly rootId: string; readonly li
     {active && popover?.kind === 'node' && selectedNode?.kind === 'agent' ? <AnchoredPopover anchor={popover.anchor} onClose={closePopover}>
       {selectedDomain?.task !== undefined
         ? <CliNodePopover node={selectedDomain} now={now} onCancel={cancelSelected}
-          onOutput={() => { setPopover({ ...popover, kind: 'cli-output' }) }}
-          onOpenSession={() => { const task = selectedDomain.task; if (task !== undefined) setSessionTask({ id: task.id, cli: task.cli }) }} />
+          onOpenSession={() => {
+            const task = selectedDomain.task
+            if (task === undefined) return
+            // 与 dsh 子代理同一条侧边通道（右栏 maestro-cli-chat tab）；宿主
+            // 没有这个面时才回落看板覆盖层。跳成功就收浮层（同 dsh jump）。
+            if (jumpBoardCliSession(ctx, task, treeIds)) { closePopover(); return }
+            setSessionTask({ id: task.id, cli: task.cli })
+          }} />
         : <AgentNodePopover node={selectedNode} asideAvailable={asideAvailable} onJump={jump} onOpenTask={onOpenTask} onClose={closePopover} />}
     </AnchoredPopover> : null}
 
@@ -252,6 +291,7 @@ function BoardPage(props: BoardTabProps & { readonly rootId: string; readonly li
       taskId={sessionTask.id}
       cli={sessionTask.cli}
       onClose={() => { setSessionTask(null) }}
+      {...(access === undefined ? {} : { access })}
       {...(treeIds.length === 0 ? {} : { sessionIds: treeIds })}
     />}
   </div>

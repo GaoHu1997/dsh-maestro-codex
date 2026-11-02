@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest'
 import { CONFIG_DEFAULTS, TASK_DIFFICULTIES, TASK_DIFFICULTY_LABELS, effectiveOf, type TaskDifficulty } from '../src/config.js'
-import { CLI_IDS, assertTaskDifficulty, pickCli, routingHint, RoutingError, taskDifficultyError } from '../src/routing.js'
+import { CLI_IDS, assertTaskDifficulty, keywordScore, pickCli, routingHint, RoutingError, taskDifficultyError } from '../src/routing.js'
 
 function config(overrides: Partial<ReturnType<typeof effectiveOf>> = {}): ReturnType<typeof effectiveOf> {
   return { ...effectiveOf({}), ...overrides }
@@ -34,6 +34,29 @@ describe('pickCli', () => {
     expect(pickCli(cfg, 'auto', '帮我重构这个模块').cli).toBe('claude')
     expect(pickCli(cfg, 'auto', '生成一个数据处理函数').cli).toBe('codex')
     expect(pickCli(cfg, 'auto', '帮我重构并补个项目测试').reason).toBe('keyword')
+  })
+
+  it.each([
+    ['仓库探索', 'claude'], ['影响分析', 'claude'], ['模块重构', 'claude'],
+    ['方案设计', 'claude'], ['文档整理', 'claude'], ['功能开发', 'codex'],
+    ['缺陷修复', 'codex'], ['测试验证', 'codex'], ['代码审查', 'codex'], ['数据处理', 'codex'],
+  ])('routes the new type %s to %s by default', (type, cli) => {
+    const decision = pickCli(effectiveOf({}), 'auto', type)
+    expect(decision.cli).toBe(cli)
+    expect(decision.reason).toBe('keyword')
+  })
+
+  it('counts a legacy type and its current name only once', () => {
+    const cfg = effectiveOf({ claudeTaskTypes: ['模块重构'], codexTaskTypes: [] })
+    cfg.claude.taskTypes = ['重构', '模块重构']
+    expect(keywordScore(cfg, 'claude', '重构和模块重构')).toBe(1)
+    expect(keywordScore(cfg, 'claude', '重构')).toBe(1)
+  })
+
+  it('preserves case-insensitive custom task keywords', () => {
+    const cfg = effectiveOf({ claudeTaskTypes: [], codexTaskTypes: ['Custom-Task'] })
+    expect(pickCli(cfg, 'auto', 'run CUSTOM-TASK now').cli).toBe('codex')
+    expect(pickCli(cfg, 'auto', 'run CUSTOM-TASK now').reason).toBe('keyword')
   })
 
   it('uses the default CLI when nothing matches', () => {
@@ -108,6 +131,17 @@ describe('task difficulty gate', () => {
 })
 
 describe('routingHint', () => {
+  it('shows current names even when a direct caller supplies legacy task types', () => {
+    const cfg = effectiveOf({})
+    cfg.claude.taskTypes = ['需求分析', '重构']
+    cfg.codex.taskTypes = ['代码生成', '调试修复']
+    const hint = routingHint(cfg, 'dispatch_cli_task')
+    expect(hint).toContain('claude cli：擅长 方案设计、模块重构')
+    expect(hint).toContain('codex cli：擅长 功能开发、缺陷修复')
+    expect(hint).not.toContain('擅长 需求分析')
+    expect(hint).not.toContain('擅长 代码生成')
+  })
+
   it.each(TASK_DIFFICULTIES)('advertises each live %s threshold and the same assessment contract', minimum => {
     const hint = routingHint(effectiveOf({ minTaskDifficulty: minimum }), 'dispatch_cli_task')
     expect(hint).toContain(`最低任务难度：${TASK_DIFFICULTY_LABELS[minimum]}（${minimum}）`)
@@ -163,5 +197,33 @@ describe('routingHint', () => {
     const base = effectiveOf({})
     const cfg = config({ claude: { ...base.claude, enabled: false }, codex: { ...base.codex, enabled: false } })
     expect(routingHint(cfg, 'dispatch_cli_task')).toBe('')
+  })
+})
+
+describe('built-in dsh fallback', () => {
+  it('refuses to route a dsh-owned task type to either external CLI', () => {
+    expect(() => pickCli(effectiveOf({}), 'auto', '帮我做代码定位')).toThrow(/dsh 子代理/)
+    expect(() => pickCli(effectiveOf({}), 'auto', '整理资料检索结果')).toThrow(RoutingError)
+  })
+
+  it('lets a CLI win when it matches more task types than dsh', () => {
+    const cfg = effectiveOf({ claudeTaskTypes: ['模块重构', '方案设计'], dshTaskTypes: ['模块重构'] })
+    expect(pickCli(cfg, 'auto', '先做模块重构的方案设计').cli).toBe('claude')
+  })
+
+  it('only suggests dsh when the task also clears the dsh floor', () => {
+    expect(() => assertTaskDifficulty(effectiveOf({}), 'claude', 'low', '小改动'))
+      .toThrow(/达到内置 dsh 子代理门槛/)
+    expect(() => assertTaskDifficulty(effectiveOf({ dshMinTaskDifficulty: 'high' }), 'claude', 'low', '小改动'))
+      .toThrow(/也未达到内置 dsh 子代理门槛/)
+  })
+
+  it('advertises the dsh fallback and its live floor in the hint', () => {
+    const hint = routingHint(effectiveOf({}), 'dispatch_cli_task')
+    expect(hint).toContain('dsh 子代理（内置，默认回退）')
+    expect(hint).toContain('最低任务难度：低（low）')
+    expect(hint).toContain('无需安装')
+    expect(routingHint(effectiveOf({ dshMinTaskDifficulty: 'extreme' }), 'dispatch_cli_task'))
+      .toContain('最低任务难度：极高（extreme）')
   })
 })

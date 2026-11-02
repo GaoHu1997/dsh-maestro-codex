@@ -6,7 +6,7 @@
  */
 
 import { TASK_DIFFICULTIES, TASK_DIFFICULTY_LABELS, isTaskDifficulty, type EffectiveConfig, type TaskDifficulty } from './config.js'
-import type { MaestroCliId } from './wire.js'
+import { normalizeTaskTypes, taskTypeKeywords, type MaestroCliId } from './wire.js'
 
 export const CLI_IDS: readonly MaestroCliId[] = ['claude', 'codex']
 
@@ -35,6 +35,28 @@ export function taskDifficultyError(taskDifficulty: unknown, difficultyReason: u
   return undefined
 }
 
+/** Case-insensitive keywords of one task type, lowercased. */
+function keywordsOf(type: string): string[] {
+  return taskTypeKeywords(type).map(keyword => keyword.trim().toLowerCase()).filter(keyword => keyword !== '')
+}
+
+/** The configured task types whose keywords appear in the task text. */
+function hitTaskTypes(types: readonly string[], taskText: string): string[] {
+  const text = taskText.toLowerCase()
+  return normalizeTaskTypes(types).filter(type => keywordsOf(type).some(keyword => text.includes(keyword)))
+}
+
+/** The dsh fallback's configured task types ([] when an old caller omits them). */
+function dshTaskTypes(config: EffectiveConfig): string[] {
+  return normalizeTaskTypes(config.dsh?.taskTypes ?? [])
+}
+
+/** The dsh fallback's minimum task difficulty; `low` when an old caller omits it. */
+function dshMinimum(config: EffectiveConfig): TaskDifficulty {
+  const minimum = config.dsh?.minTaskDifficulty
+  return isTaskDifficulty(minimum) ? minimum : 'low'
+}
+
 /** Runtime gate for the CLI already selected by routing; never reroutes. */
 export function assertTaskDifficulty(config: EffectiveConfig, cli: MaestroCliId, taskDifficulty: unknown, difficultyReason: unknown): TaskDifficulty {
   const error = taskDifficultyError(taskDifficulty, difficultyReason)
@@ -47,8 +69,13 @@ export function assertTaskDifficulty(config: EffectiveConfig, cli: MaestroCliId,
   }
   if (TASK_DIFFICULTIES.indexOf(assessed) < TASK_DIFFICULTIES.indexOf(minimum)) {
     const legacyNote = taskDifficulty === undefined ? '未提供难度评估，保守按低处理；' : ''
+    const dshMin = dshMinimum(config)
+    const reachedDsh = TASK_DIFFICULTIES.indexOf(assessed) >= TASK_DIFFICULTIES.indexOf(dshMin)
+    const dshNote = reachedDsh
+      ? `该任务达到内置 dsh 子代理门槛（${TASK_DIFFICULTY_LABELS[dshMin]}/${dshMin}）：需要委派时请改用 dsh 子代理（subagent / subagent_fork）。`
+      : `该任务也未达到内置 dsh 子代理门槛（${TASK_DIFFICULTY_LABELS[dshMin]}/${dshMin}）：由主代理直接完成，不要再派给子代理。`
     throw new RoutingError(
-      `${legacyNote}任务难度 ${TASK_DIFFICULTY_LABELS[assessed]}（${assessed}）低于最低难度 ${TASK_DIFFICULTY_LABELS[minimum]}（${minimum}）（实际 CLI：${cli}），未启动 CLI。需要委派时请改用 dsh 子代理（subagent / subagent_fork）；不需要委派则由主代理直接完成。只有真实评估达到该 CLI 门槛时才提交 task_difficulty 和 difficulty_reason，指定 cli 或用户点名也不能绕过门槛，也不会改选另一 CLI 绕过限制。`,
+      `${legacyNote}任务难度 ${TASK_DIFFICULTY_LABELS[assessed]}（${assessed}）低于最低难度 ${TASK_DIFFICULTY_LABELS[minimum]}（${minimum}）（实际 CLI：${cli}），未启动 CLI。${dshNote}只有真实评估达到该 CLI 门槛时才提交 task_difficulty 和 difficulty_reason，指定 cli 或用户点名也不能绕过门槛，也不会改选另一 CLI 绕过限制。`,
     )
   }
   return assessed
@@ -81,6 +108,15 @@ export function pickCli(config: EffectiveConfig, requested: string, taskText: st
   if (scored.length === 0) throw new RoutingError('两个 CLI 都未启用，无法派发任务')
   const best = scored[0]
   if (best === undefined) throw new RoutingError('两个 CLI 都未启用，无法派发任务')
+  // A task type that belongs to the built-in dsh fallback is not a CLI job:
+  // refuse it before the default CLI can silently take it. A tie keeps the CLI
+  // (a stale config may still list one type on both sides).
+  const dshHits = hitTaskTypes(dshTaskTypes(config), taskText)
+  if (dshHits.length > 0 && dshHits.length > best.score) {
+    throw new RoutingError(
+      `任务类型命中 dsh 子代理（${dshHits.join('、')}）：这类任务不派发给外部 CLI，请改用 dsh 子代理（subagent / subagent_fork），或由主代理直接完成。`,
+    )
+  }
   if (best.score > 0) {
     // A stable sort would otherwise always hand a tie to the first CLI_IDS
     // entry, silently ignoring the configured default. Break ties explicitly.
@@ -110,13 +146,7 @@ function otherOf(cli: MaestroCliId): MaestroCliId {
 /** Case-insensitive keyword hit count of one CLI's task types in the task text. */
 export function keywordScore(config: EffectiveConfig, cli: MaestroCliId, taskText: string): number {
   const types = cli === 'claude' ? config.claude.taskTypes : config.codex.taskTypes
-  const text = taskText.toLowerCase()
-  let score = 0
-  for (const type of types) {
-    const keyword = type.trim().toLowerCase()
-    if (keyword !== '' && text.includes(keyword)) score += 1
-  }
-  return score
+  return hitTaskTypes(types, taskText).length
 }
 
 /**
@@ -138,23 +168,29 @@ export function routingHint(config: EffectiveConfig, toolName: string, unavailab
   if (config.claude.enabled) {
     const permission = config.claude.permissionMode === 'inherit' ? 'CLI 默认策略' : config.claude.permissionMode
     sections.push(
-      `- claude cli：擅长 ${config.claude.taskTypes.join('、') || '（未配置任务类型）'}`
+      `- claude cli：擅长 ${normalizeTaskTypes(config.claude.taskTypes).join('、') || '（未配置任务类型）'}`
       + `，最低任务难度：${TASK_DIFFICULTY_LABELS[config.claude.minTaskDifficulty]}（${config.claude.minTaskDifficulty}）`
       + `，权限 ${permission}`,
     )
   }
   if (config.codex.enabled) {
     sections.push(
-      `- codex cli：擅长 ${config.codex.taskTypes.join('、') || '（未配置任务类型）'}`
+      `- codex cli：擅长 ${normalizeTaskTypes(config.codex.taskTypes).join('、') || '（未配置任务类型）'}`
       + `，最低任务难度：${TASK_DIFFICULTY_LABELS[config.codex.minTaskDifficulty]}（${config.codex.minTaskDifficulty}）`
       + `，沙箱 ${config.codex.sandbox}`,
     )
   }
   if (sections.length === 0) return ''
+  const dshMin = dshMinimum(config)
+  sections.push(
+    `- dsh 子代理（内置，默认回退）：擅长 ${dshTaskTypes(config).join('、') || '（未配置任务类型）'}`
+    + `，最低任务难度：${TASK_DIFFICULTY_LABELS[dshMin]}（${dshMin}），无需安装`,
+  )
   return [
     `## CLI 子代理（${toolName}）`,
-    '本环境接入了外部 CLI 子代理。派发前按三步决定：① 先判断该任务是否需要开子代理——不需要就由主代理用现有工具自己完成，不要为了委派而委派；② 需要委派时再按实际范围、步骤、依赖和风险做语义难度评估，并按请求或 auto 路由确定真实 CLI（任务类型命中或用户点名不是派发许可）；③ 真实评估达到该 CLI 的独立最低难度才调用本工具，低于门槛改用 dsh 子代理（subagent / subagent_fork），不要先尝试 CLI，也不要改选另一 CLI 绕过限制。',
+    '本环境接入了外部 CLI 子代理。派发前按三步决定：① 先判断该任务是否需要开子代理——不需要就由主代理用现有工具自己完成，不要为了委派而委派；② 需要委派时再按实际范围、步骤、依赖和风险做语义难度评估，并按请求或 auto 路由确定真实 CLI（任务类型命中或用户点名不是派发许可）；③ 真实评估达到该 CLI 的独立最低难度才调用本工具，低于门槛改用 dsh 子代理（subagent / subagent_fork）——但仅在也达到 dsh 门槛时；低于 dsh 门槛由主代理直接完成。不要先尝试 CLI，也不要改选另一 CLI 绕过限制。',
     '各 CLI 分别配置最低任务难度。四级有序：low < medium < high < extreme，等于门槛允许派发。',
+    '任务类型命中 dsh 子代理（内置回退）时不派发给外部 CLI，改用 subagent / subagent_fork；dsh 随宿主提供，无需安装或升级。',
     '- 低（low）：简短问答、说明、单点修复或小范围编辑；即使提到重构/测试/文档，也不能仅凭关键词升档。',
     '- 中（medium）：范围明确但需要多步完成的一般任务。',
     '- 高（high）：跨模块重构、多个组件协作且有明显依赖或回归风险的任务。',
@@ -167,5 +203,6 @@ export function routingHint(config: EffectiveConfig, toolName: string, unavailab
     '- task 必须自包含（CLI 看不到本会话上下文）：目标、涉及文件、验收标准、输出格式写全；若任务依赖本会话的技能或上下文，把关键指令内联进 task。',
     '- cwd 传入你正在工作的目录（绝对路径）；省略时沿用宿主进程的工作目录，结果 notes 会标注实际目录。',
     '- 桥接的 dsh MCP 服务器对子代理可用，task 里可直接要求使用相应工具。',
+    '- dsh 的技能与白名单宿主工具也会自动桥接给子代理：技能目录随任务注入、经 dsh_bridge 按需加载全文（claude 可为原生技能目录）；task 里可直接要求子代理使用相应技能或工具。',
   ].join('\n')
 }

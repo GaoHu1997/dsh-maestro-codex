@@ -88,7 +88,7 @@ describe('claude MCP argv', () => {
 describe('codex MCP argv', () => {
   it('synthesizes one inline-table -c override per server', () => {
     const args = codexMcpArgs([{ name: 'dsh-image', transport: 'stdio', command: 'node.exe', args: ['a.mjs'], env: { K: 'v' } }])
-    expect(args).toEqual(['-c', 'mcp_servers.dsh-image={ command = "node.exe", args = ["a.mjs"], env = { K = "v" } }'])
+    expect(args).toEqual(['-c', 'mcp_servers.dsh-image={ command = "node.exe", args = ["a.mjs"], env = { K = "v" }, default_tools_approval_mode = "approve" }'])
     // The override splits on the first `=`: the key must be bare (no trailing
     // space) or the whole server would be dropped by codex's -c parser.
     expect(args[1]?.slice(0, args[1].indexOf('='))).toBe('mcp_servers.dsh-image')
@@ -99,7 +99,8 @@ describe('codex MCP argv', () => {
 describe('claude subagent events', () => {
   it('maps Task tool_use ids to completion notes', () => {
     const events = claudeToolResultEvents({ type: 'user', message: { content: [{ type: 'tool_result', tool_use_id: 't1' }] } }, new Map([['t1', 'Task']]))
-    expect(events[0]?.text).toContain('子代理完成')
+    expect(events.some(event => event.kind === 'note' && event.text.includes('子代理完成'))).toBe(true)
+    expect(events[0]).toMatchObject({ kind: 'tool', detail: '' })
   })
 })
 

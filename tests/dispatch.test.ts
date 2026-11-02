@@ -1,19 +1,37 @@
-import { describe, expect, it, vi } from 'vitest'
+import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { TASK_DIFFICULTIES, effectiveOf, type EffectiveConfig } from '../src/config.js'
-import { CliPathCache, parseDispatchParams, runDispatch, type DispatchParams } from '../src/dispatch.js'
+import { CliPathCache, parseDispatchParams, runDispatch, taskNameOf, type DispatchParams } from '../src/dispatch.js'
+import { renderSummary } from '../src/tool.js'
 import type { DshModelEndpoint } from '../src/dsh-models.js'
 import { Limiter, TaskRegistry } from '../src/task-registry.js'
-import { CLI_USAGE_EVENT } from '../src/usage.js'
+import { clearCliUsageMirrors, cliUsageProjectionDefinition } from '../src/usage.js'
 import { scriptedSpawn } from './fake-child.js'
+import { resolveTestDshModel, withTestDshRoutes } from './dsh-route-fixture.js'
 
 const assessment = {
   taskDifficulty: 'medium',
   difficultyReason: '范围明确的多步任务，需要实现并验证输出和回归行为',
 } satisfies Pick<DispatchParams, 'taskDifficulty' | 'difficultyReason'>
 
+/**
+ * Let real macrotasks run: a run's fs writes and child-process callbacks settle
+ * there, not on faked clock ticks. Safe to call with fake timers installed.
+ */
+async function drainRealTasks(rounds = 8): Promise<void> {
+  for (let index = 0; index < rounds; index += 1) {
+    await new Promise<void>(resolvePromise => { setImmediate(resolvePromise) })
+  }
+}
+
+/** Real wall-clock sleep that still works while vitest has fake timers installed. */
+const realSetTimeout = setTimeout
+async function realSleep(ms: number): Promise<void> {
+  await new Promise<void>(resolvePromise => { realSetTimeout(resolvePromise, ms) })
+}
+
 function fixture(overrides: Partial<EffectiveConfig> & { minTaskDifficulty?: EffectiveConfig['claude']['minTaskDifficulty'] } = {}): EffectiveConfig {
   const { minTaskDifficulty, ...effectiveOverrides } = overrides
-  const base = effectiveOf({ claudeCliPath: process.execPath, codexCliPath: process.execPath, ...(minTaskDifficulty === undefined ? {} : { minTaskDifficulty }) })
+  const base = withTestDshRoutes(effectiveOf({ claudeCliPath: process.execPath, codexCliPath: process.execPath, ...(minTaskDifficulty === undefined ? {} : { minTaskDifficulty }) }))
   return { ...base, ...effectiveOverrides }
 }
 
@@ -42,7 +60,7 @@ function fakeCliSpawn(ok = true): ReturnType<typeof scriptedSpawn> {
 function makeDeps(
   config: EffectiveConfig,
   spawnFn: ReturnType<typeof scriptedSpawn>['spawnFn'],
-  resolveDshModel?: (selection: string) => Promise<DshModelEndpoint>,
+  resolveDshModel: (selection: string) => Promise<DshModelEndpoint> = resolveTestDshModel,
 ) {
   const registry = new TaskRegistry()
   const controllers = new Map<string, AbortController>()
@@ -60,6 +78,15 @@ function makeDeps(
     controllers,
   }
 }
+
+function usageFixture(sessionId = 'dispatch-owner') {
+  const session = { id: sessionId, append: vi.fn() }
+  const definition = cliUsageProjectionDefinition()
+  const state = definition.init({ id: sessionId }, 0)
+  return { session, state, view: () => definition.wire.view(state) }
+}
+
+beforeEach(() => { clearCliUsageMirrors() })
 
 describe('parseDispatchParams', () => {
   it.each(TASK_DIFFICULTIES)('parses the %s assessment and normalizes the reason', difficulty => {
@@ -105,6 +132,30 @@ describe('parseDispatchParams', () => {
       expect(parsed.timeoutMinutes).toBe(5)
     }
   })
+
+  it('carries an explicit task name and drops blank ones', () => {
+    expect(parseDispatchParams({ task: 'x', task_name: '  修复登录页  ', task_difficulty: 'low', difficulty_reason: 'x' }))
+      .toMatchObject({ taskName: '修复登录页' })
+    expect(parseDispatchParams({ task: 'x', task_name: '   ', task_difficulty: 'low', difficulty_reason: 'x' }))
+      .not.toHaveProperty('taskName')
+  })
+})
+
+describe('taskNameOf', () => {
+  it('prefers the explicit name, blank falls back to derivation, both capped', () => {
+    expect(taskNameOf('task', '修复登录页')).toBe('修复登录页')
+    expect(taskNameOf('首行目标', '   ')).toBe('首行目标')
+    expect(taskNameOf('task', '名'.repeat(50))).toBe(`${'名'.repeat(40)}…`)
+  })
+
+  it('derives the name from the first meaningful task line', () => {
+    expect(taskNameOf('修复登录页\n在 iOS Safari 上点击登录按钮没有反应。')).toBe('修复登录页')
+    expect(taskNameOf('- 修复登录页的表单校验\n2. 回归主流程')).toBe('修复登录页的表单校验')
+    expect(taskNameOf('# 标题\n正文')).toBe('标题')
+    expect(taskNameOf('   \n\n第二行才是内容')).toBe('第二行才是内容')
+    expect(taskNameOf('一行'.repeat(30))).toBe(`${'一行'.repeat(20)}…`)
+    expect(taskNameOf('   ')).toBe('CLI 任务')
+  })
 })
 
 describe('runDispatch', () => {
@@ -120,6 +171,18 @@ describe('runDispatch', () => {
     expect(record?.cli).toBe('claude')
   })
 
+  it('hands the model and the operator a resume hint on success', async () => {
+    const cli = fakeCliSpawn(true)
+    const { deps } = makeDeps(fixture(), cli.spawnFn)
+    const value = await runDispatch(deps, { ...assessment, cli: 'claude', task: '做个分析' }, new AbortController().signal)
+    // notes 面向人工/看板侧。
+    expect(value.notes.some(note => note.includes(`resume="${value.sessionRef}"`))).toBe(true)
+    // 模型侧提示在 renderSummary 的结果文本里（notes 不进对话文本）。
+    const rendered = renderSummary(value)
+    expect(rendered).toContain(`resume="${value.sessionRef}"`)
+    expect(rendered).toContain('带着完整上下文继续')
+  })
+
   it('streams running usage onto the task list before the run settles', async () => {
     const spawn = scriptedSpawn(child => {
       if (child.spawnArgs[0] === '--version') {
@@ -132,13 +195,13 @@ describe('runDispatch', () => {
       setTimeout(() => {
         child.stdout.emit('data', Buffer.from(`${JSON.stringify({
           type: 'assistant',
-          message: { content: [{ type: 'text', text: '写' }], usage: { input_tokens: 640, output_tokens: 12 } },
+          message: { content: [{ type: 'text', text: '写' }], usage: { input_tokens: 640, output_tokens: 12, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 } },
         })}\n`))
       }, 5)
       setTimeout(() => {
         child.finish(JSON.stringify({
           type: 'result', subtype: 'success', result: 'claude 完成',
-          usage: { input_tokens: 900, output_tokens: 30, cache_read_input_tokens: 100 },
+          usage: { input_tokens: 900, output_tokens: 30, cache_read_input_tokens: 100, cache_creation_input_tokens: 0 },
         }))
       }, 800)
     })
@@ -232,20 +295,22 @@ describe('runDispatch', () => {
   })
 
   it('cancels through the controllers map: child killed, phase cancelled', async () => {
-    // A --version probe answers; the task child itself never finishes.
+    // Version and git probes answer; only the actual CLI child stays running.
     const cli = scriptedSpawn(child => {
       if (child.spawnArgs[0] === '--version') child.finish('claude version 1.0')
+      else if (child.spawnFile === 'git') child.finish('## controlled-test-branch')
     })
     const { deps, registry, controllers } = makeDeps(fixture(), cli.spawnFn)
     const outer = new AbortController()
     const runPromise = runDispatch(deps, { ...assessment, cli: 'claude', task: '长任务' }, outer.signal)
-    // Wait for the task to be running, then cancel via the registry id map.
-    await new Promise(resolvePromise => setTimeout(resolvePromise, 50))
+    // Wait for the actual task child, not the earlier running phase.
+    await vi.waitFor(() => expect(cli.launches.some(child => child.spawnArgs.includes('-p'))).toBe(true))
     const record = registry.list()[0]
     expect(record?.phase).toBe('running')
     const taskId = record?.id ?? ''
     controllers.get(taskId)?.abort(new Error('用户取消'))
     await expect(runPromise).rejects.toThrow(/任务已取消/)
+    expect(cli.launches.find(child => child.spawnArgs.includes('-p'))?.killed).toBe(true)
     expect(registry.get(taskId)?.phase).toBe('cancelled')
   })
 })
@@ -340,7 +405,7 @@ describe('runtime difficulty gate', () => {
       claudeCliPath: process.execPath, codexCliPath: process.execPath,
     } as unknown as Parameters<typeof effectiveOf>[0]
     const { deps, registry } = makeDeps(effectiveOf(config), cli.spawnFn)
-    deps.readConfig = () => effectiveOf(config)
+    deps.readConfig = () => withTestDshRoutes(effectiveOf(config))
     const params: DispatchParams = { ...assessment, cli: 'claude', task: '多步任务' }
     await expect(runDispatch(deps, params, new AbortController().signal)).rejects.toThrow(/最低难度 高.*claude/)
     expect(cli.launches).toEqual([])
@@ -404,10 +469,10 @@ describe('runtime difficulty gate', () => {
     const addAbortListener = vi.spyOn(AbortSignal.prototype, 'addEventListener')
     const listMcpServers = vi.fn(() => [])
     const onTaskId = vi.fn()
-    const appendUsage = vi.fn()
+    const usage = usageFixture()
     const params: DispatchParams = {
       ...assessment, cli: scenario.requested, task: scenario.task,
-      usageSession: { append: appendUsage },
+      sessionId: usage.session.id, usageSession: usage.session,
     }
     try {
       if (scenario.allowed) {
@@ -427,7 +492,8 @@ describe('runtime difficulty gate', () => {
         expect(onTaskId).not.toHaveBeenCalled()
         expect(resolveDshModel).not.toHaveBeenCalled()
         expect(listMcpServers).not.toHaveBeenCalled()
-        expect(appendUsage).not.toHaveBeenCalled()
+        expect(usage.session.append).not.toHaveBeenCalled()
+        expect(usage.view().totals.requests).toBe(0)
         expect(cli.launches).toEqual([])
         expect(registry.list()).toEqual([])
       }
@@ -503,11 +569,15 @@ describe('model resolution order', () => {
     expect(registry.list()[0]?.phase).toBe('failed')
   })
 
-  it('never resolves a model when the tool arg names one', async () => {
+  it('resolves and preflights an explicit bare model on the configured DSH provider', async () => {
     const cli = fakeCliSpawn(true)
-    const { deps } = makeDeps(fixture(), cli.spawnFn, async () => { throw new Error('不该被调用') })
-    const value = await runDispatch(deps, { ...assessment, cli: 'claude', task: 'x', model: 'explicit' }, new AbortController().signal)
+    const resolveDshModel = vi.fn(resolveTestDshModel)
+    const preflightDshModel = vi.fn(async () => ({ status: 'ok' as const, detail: 'test-only' }))
+    const { deps } = makeDeps(fixture(), cli.spawnFn, resolveDshModel)
+    const value = await runDispatch({ ...deps, preflightDshModel }, { ...assessment, cli: 'claude', task: 'x', model: 'explicit' }, new AbortController().signal)
     expect(value.model).toBe('explicit')
+    expect(resolveDshModel).toHaveBeenCalledWith('test-claude::explicit')
+    expect(preflightDshModel).toHaveBeenCalledWith(expect.objectContaining({ provider: 'test-claude', model: 'explicit' }), 'claude', expect.any(AbortSignal))
   })
 
   it('codex falls back when the agent route speaks anthropic-messages (codex cannot use it)', async () => {
@@ -564,7 +634,9 @@ describe('model resolution order', () => {
     // ran an unrelated private router and 503'd, so the dispatch has to stop and
     // say which routes it tried rather than spawn the child unequipped.
     const cli = fakeCliSpawn(true)
-    const { deps, registry } = makeDeps(fixture(), cli.spawnFn, async () => endpoint('anthropic-messages', 'agent-model'))
+    const config = fixture()
+    config.codex.dshModel = ''
+    const { deps, registry } = makeDeps(config, cli.spawnFn, async () => endpoint('anthropic-messages', 'agent-model'))
     const run = runDispatch(deps, {
       ...assessment,
       cli: 'codex',
@@ -578,11 +650,13 @@ describe('model resolution order', () => {
     expect(cli.launches.some(child => child.spawnArgs[0] === 'exec')).toBe(false)
   })
 
-  it('names the CLI default only when the host exposes no model resolver', async () => {
+  it('fails closed when the host exposes no model resolver', async () => {
     const cli = fakeCliSpawn(true)
-    const { deps } = makeDeps(fixture(), cli.spawnFn)
-    const value = await runDispatch(deps, { ...assessment, cli: 'codex', task: 'x' }, new AbortController().signal)
-    expect(value.notes.some(note => note.includes('读不到 dsh 模型目录'))).toBe(true)
+    const { deps, registry } = makeDeps(fixture(), cli.spawnFn)
+    await expect(runDispatch({ ...deps, resolveDshModel: undefined }, { ...assessment, cli: 'codex', task: 'x' }, new AbortController().signal))
+      .rejects.toThrow('读不到 dsh 模型目录')
+    expect(registry.list()[0]?.phase).toBe('failed')
+    expect(cli.launches.some(child => child.spawnArgs[0] === 'exec')).toBe(false)
   })
 })
 
@@ -591,7 +665,10 @@ describe('usage reporting', () => {
     ['codex', 'failed'], ['codex', 'timeout'], ['codex', 'cancelled'],
     ['claude', 'failed'], ['claude', 'timeout'], ['claude', 'cancelled'],
   ] as const)('preserves received %s usage and recovery ref after %s', async (channel, ending) => {
-    vi.useFakeTimers()
+    // Only fake the clock APIs: the run touches real fs (the one-shot claude
+    // settings file) and real child-process events, whose promises settle on
+    // real macrotasks. Faking nextTick/queueMicrotask too would starve them.
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'setInterval', 'clearInterval', 'Date'] })
     try {
       const cli = scriptedSpawn(child => {
         child.pid = undefined as unknown as number
@@ -612,27 +689,44 @@ describe('usage reporting', () => {
         }
       })
       const { deps, registry } = makeDeps(fixture({ injectGitContext: false }), cli.spawnFn)
-      const append = vi.fn()
+      const usage = usageFixture()
       const persist = vi.fn()
       deps.persist = persist
       const controller = new AbortController()
       const run = runDispatch(deps, {
-        ...assessment, cli: channel, task: 'x', timeoutMinutes: 1, usageSession: { append },
+        ...assessment, cli: channel, task: 'x', timeoutMinutes: 1, sessionId: usage.session.id, usageSession: usage.session,
       }, controller.signal)
       // Attach rejection handling before advancing the fake clock.
       const settled = run.then(value => value, error => error)
-      await vi.advanceTimersByTimeAsync(0)
-      if (ending === 'timeout') await vi.advanceTimersByTimeAsync(60_000)
-      if (ending === 'cancelled') { controller.abort(); await vi.advanceTimersByTimeAsync(0) }
+      // The prologue probes --version, writes the one-shot settings file on real
+      // fs and only then spawns the CLI and arms the idle timer. Wait until the
+      // real CLI process is launched before injecting the ending; advancing the
+      // fake clock first would race a timer that is not armed yet.
+      for (let waited = 0; waited < 200; waited += 1) {
+        if (cli.launches.some(launch => launch.spawnArgs[0] !== '--version')) break
+        await realSleep(10)
+      }
+      expect(cli.launches.some(launch => launch.spawnArgs[0] !== '--version')).toBe(true)
+      if (ending === 'timeout') { await vi.advanceTimersByTimeAsync(60_000); await drainRealTasks() }
+      if (ending === 'cancelled') { controller.abort(); await vi.advanceTimersByTimeAsync(0); await drainRealTasks() }
+      // Let real fs/child-process callbacks run before observing the result.
+      await drainRealTasks()
       expect(await settled).toBeInstanceOf(Error)
       const phase = ending === 'cancelled' ? 'cancelled' : ending === 'timeout' ? 'timeout' : 'failed'
       const stats = { inputTokens: 11, cachedInputTokens: 7, outputTokens: 5, sessionRef: 'recover-1' }
       expect(registry.get(registry.list()[0]!.id)).toMatchObject({ phase, stats })
       if (ending === 'timeout') expect(registry.get(registry.list()[0]!.id)?.stats?.['timedOut']).toBe(true)
-      expect(append).toHaveBeenCalledTimes(1)
-      expect(append).toHaveBeenCalledWith(CLI_USAGE_EVENT, expect.objectContaining({ phase, inputTokens: 11, cachedInputTokens: 7, outputTokens: 5 }))
+      expect(usage.session.append).not.toHaveBeenCalled()
+      const projected = usage.view()
+      const tokens = { inputTokens: 11, cachedInputTokens: 7, outputTokens: 5, cacheWriteTokens: channel === 'claude' ? 3 : null }
+      expect(projected.recent).toHaveLength(1)
+      expect(projected.recent[0]).toMatchObject({ taskId: registry.list()[0]!.id, sessionId: usage.session.id, cli: channel, phase, ...tokens })
+      expect(projected.totals).toMatchObject({ requests: 1, ...tokens })
+      expect(usage.state.totals.requests).toBe(0)
+      expect(usage.view()).toEqual(projected)
       expect(persist).toHaveBeenCalledTimes(1)
       expect(persist).toHaveBeenCalledWith(expect.objectContaining({ phase, stats: expect.objectContaining(stats) }))
+      // A settled run must leave no armed idle-timeout or warning timer behind.
       expect(vi.getTimerCount()).toBe(0)
     } finally { vi.useRealTimers() }
   })
@@ -650,8 +744,8 @@ describe('usage reporting', () => {
       }), ok ? 0 : 1)
     })
     const { deps, registry } = makeDeps(fixture({ failureRetries: 1, injectGitContext: false }), cli.spawnFn)
-    const append = vi.fn()
-    const run = runDispatch(deps, { ...assessment, cli: 'claude', task: 'x', usageSession: { append } }, new AbortController().signal)
+    const usage = usageFixture()
+    const run = runDispatch(deps, { ...assessment, cli: 'claude', task: 'x', sessionId: usage.session.id, usageSession: usage.session }, new AbortController().signal)
     if (succeeds) expect((await run).ok).toBe(true)
     else await expect(run).rejects.toThrow()
     expect(attempt).toBe(2)
@@ -660,33 +754,65 @@ describe('usage reporting', () => {
       sessionId: 's2', sessionRef: 's2', turns: 2, cliDurationMs: 20,
     })
     expect(registry.get(registry.list()[0]!.id)?.stats?.['costUsd']).toBeCloseTo(0.3)
-    expect(append).toHaveBeenCalledWith(CLI_USAGE_EVENT, expect.objectContaining({ inputTokens: 33, outputTokens: 15, cachedInputTokens: 21, cacheWriteTokens: 9 }))
+    expect(usage.session.append).not.toHaveBeenCalled()
+    const projected = usage.view()
+    const tokens = { inputTokens: 33, outputTokens: 15, cachedInputTokens: 21, cacheWriteTokens: 9 }
+    expect(projected.recent).toHaveLength(1)
+    expect(projected.recent[0]).toMatchObject({ taskId: registry.list()[0]!.id, sessionId: usage.session.id, cli: 'claude', phase: succeeds ? 'done' : 'failed', ...tokens })
+    expect(projected.totals).toMatchObject({ requests: 1, ...tokens })
+    expect(usage.state.totals.requests).toBe(0)
+    expect(usage.view()).toEqual(projected)
   })
 
-  it('appends one usage event with the settled stats', async () => {
+  it('publishes settled usage through the scoped wire view without appending private history', async () => {
     const cli = fakeCliSpawn(true)
-    const { deps } = makeDeps(fixture(), cli.spawnFn)
-    const appended: Array<{ type: string; data: unknown }> = []
+    const { deps, registry } = makeDeps(fixture(), cli.spawnFn)
+    const usage = usageFixture()
     const value = await runDispatch(deps, {
-      ...assessment, cli: 'codex', task: 'x',
-      usageSession: { append: (type: string, data: unknown) => { appended.push({ type, data }) } },
+      ...assessment, cli: 'codex', task: 'x', sessionId: usage.session.id, usageSession: usage.session,
     }, new AbortController().signal)
     expect(value.ok).toBe(true)
-    expect(appended).toHaveLength(1)
-    expect(appended[0]?.type).toBe(CLI_USAGE_EVENT)
-    expect(appended[0]?.data).toMatchObject({ cli: 'codex', phase: 'done', exitCode: 0 })
+    expect(usage.session.append).not.toHaveBeenCalled()
+    const projected = usage.view()
+    const tokens = { inputTokens: null, outputTokens: 7, cachedInputTokens: null, cacheWriteTokens: null }
+    expect(projected.recent).toHaveLength(1)
+    expect(projected.recent[0]).toMatchObject({ taskId: registry.list()[0]!.id, sessionId: usage.session.id, cli: 'codex', phase: 'done', exitCode: 0, ...tokens })
+    expect(projected.totals).toMatchObject({ requests: 1, ...tokens })
+    expect(projected.knownTotals).toMatchObject({ requests: 1, inputTokens: 0, outputTokens: 7, cachedInputTokens: 0, cacheWriteTokens: 0 })
+    expect(usage.state.totals.requests).toBe(0)
+    expect(usage.view()).toEqual(projected)
+    expect(usageFixture('other-parent').view().totals.requests).toBe(0)
+    clearCliUsageMirrors()
+    expect(usage.view().totals.requests).toBe(0)
   })
 
-  it('reports failed runs too', async () => {
+  it('publishes failed runs with unknown token counters rather than fabricated zeroes', async () => {
     const cli = fakeCliSpawn(false)
-    const { deps } = makeDeps(fixture(), cli.spawnFn)
-    const appended: Array<{ type: string; data: unknown }> = []
+    const { deps, registry } = makeDeps(fixture(), cli.spawnFn)
+    const usage = usageFixture()
     await expect(runDispatch(deps, {
-      ...assessment, cli: 'codex', task: 'x',
-      usageSession: { append: (type: string, data: unknown) => { appended.push({ type, data }) } },
+      ...assessment, cli: 'codex', task: 'x', sessionId: usage.session.id, usageSession: usage.session,
     }, new AbortController().signal)).rejects.toThrow()
-    expect(appended).toHaveLength(1)
-    expect(appended[0]?.data).toMatchObject({ cli: 'codex', phase: 'failed' })
+    expect(usage.session.append).not.toHaveBeenCalled()
+    const projected = usage.view()
+    const tokens = { inputTokens: null, outputTokens: null, cachedInputTokens: null, cacheWriteTokens: null }
+    expect(projected.recent).toHaveLength(1)
+    expect(projected.recent[0]).toMatchObject({ taskId: registry.list()[0]!.id, sessionId: usage.session.id, cli: 'codex', phase: 'failed', ...tokens })
+    expect(projected.totals).toMatchObject({ requests: 1, ...tokens })
+    expect(usage.state.totals.requests).toBe(0)
+    expect(usage.view()).toEqual(projected)
+  })
+
+  it('does not infer a usage owner from the append handle when task scope is absent', async () => {
+    const { deps, registry } = makeDeps(fixture(), fakeCliSpawn(true).spawnFn)
+    const usage = usageFixture()
+    const value = await runDispatch(deps, { ...assessment, cli: 'codex', task: 'x', usageSession: usage.session }, new AbortController().signal)
+    expect(value.ok).toBe(true)
+    expect(registry.list()).toHaveLength(1)
+    expect(registry.get(registry.list()[0]!.id)!.sessionId).toBeUndefined()
+    expect(usage.session.append).not.toHaveBeenCalled()
+    expect(usage.view().recent).toEqual([])
+    expect(usage.view().totals.requests).toBe(0)
   })
 
   it('runs unchanged without a session', async () => {

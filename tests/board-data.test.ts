@@ -3,11 +3,10 @@ import { createElement } from 'react'
 import { renderToStaticMarkup } from 'react-dom/server'
 import { describe, expect, it, vi } from 'vitest'
 import {
-  cliDetailSnapshot, jobsFaceOf, killJob, sessionsFaceOf, useBoardJobs, useSessionList,
+  jobsFaceOf, killJob, sessionsFaceOf, useBoardJobs, useSessionList,
   type BoardHost, type BoardJobsFace, type BoardSessionList, type BoardSessionsFace,
 } from '../src/client/board/data.js'
 import { BoardTab } from '../src/client/board/Board.js'
-import type { MaestroTaskDetail, MaestroTaskEvent } from '../src/wire.js'
 
 const list: BoardSessionList = {
   byId: { root: { id: 'root', displayTitle: 'Native root', running: true } },
@@ -138,47 +137,45 @@ describe('native Board context service properties', () => {
     expect(await killJob(ctx, 'root', 'native-job')).toBeUndefined()
     expect(service.kill).toHaveBeenCalledWith('root', 'native-job')
   })
-})
 
-const detail: MaestroTaskDetail = {
-  summary: { id: 'task', cli: 'codex', title: 'Native CLI', phase: 'done', model: 'model', startedAt: 1, endedAt: 2 },
-  cwd: '/work/native', finalText: 'Genuine final result', stats: { inputTokens: 15, verified: true, provider: 'native' },
-  events: [], nextCursor: 3,
-}
-
-describe('genuine CLI detail snapshots', () => {
-  it('retains finalText, cwd and statistics even when no result event exists', () => {
-    const state = cliDetailSnapshot(detail, [])
-    expect(state.summary).toBe(detail.summary)
-    expect(state.finalText).toBe('Genuine final result')
-    expect(state.cwd).toBe('/work/native')
-    expect(state.stats).toBe(detail.stats)
-    expect(state.events).toEqual([])
-    expect(state.error).toBeUndefined()
-  })
-
-  it('keeps outcome metadata across sparse cursor pages and uses the supplied event ring', () => {
-    const first = cliDetailSnapshot(detail, [])
-    const events: MaestroTaskEvent[] = [{ seq: 4, at: 4, kind: 'note', text: 'tail' }]
-    const next = cliDetailSnapshot({ summary: detail.summary, events, nextCursor: 4 }, events, first)
-    expect(next.finalText).toBe(detail.finalText)
-    expect(next.cwd).toBe(detail.cwd)
-    expect(next.stats).toBe(detail.stats)
-    expect(next.events).toBe(events)
-  })
-
-  it('accepts empty final output and replacement stats without losing task failures', () => {
-    const previous = cliDetailSnapshot(detail, [])
-    const next = cliDetailSnapshot({ ...detail, finalText: '', stats: {}, error: 'CLI failed' }, [], previous)
-    expect(next.finalText).toBe('')
-    expect(next.stats).toEqual({})
-    expect(next.failure).toBe('CLI failed')
-  })
-
-  it('does not carry metadata into a fresh task snapshot', () => {
-    const fresh = cliDetailSnapshot({ summary: { ...detail.summary, id: 'other' }, events: [], nextCursor: 0 }, [])
-    expect(fresh.finalText).toBeUndefined()
-    expect(fresh.cwd).toBeUndefined()
-    expect(fresh.stats).toBeUndefined()
+  it('counts only the main session background jobs, not subagent session rosters', () => {
+    const tree: BoardSessionList = {
+      byId: {
+        root: { id: 'root', displayTitle: 'Root session', running: true },
+        child: { id: 'child', parentId: 'root', displayTitle: 'Child session' },
+      },
+      projectionsBySession: {
+        root: { state: 'ready', error: null, values: {
+          subagentCatalog: [{ id: 'child', createdAt: 1, mode: 'one-shot', label: 'Child session' }],
+        } },
+        child: { state: 'ready', error: null, values: {} },
+      },
+    }
+    const jobService: BoardJobsFace = {
+      state: {
+        getSnapshot: () => ({
+          rows: {
+            root: [{ id: 'job-root', kind: 'bash', label: 'Root job', owner: 'root', status: 'completed', startedAt: 2 }],
+            child: [{ id: 'job-child', kind: 'bash', label: 'Child job', owner: 'child', status: 'completed', startedAt: 1 }],
+          },
+          observed: {},
+        }),
+        subscribe: () => () => {},
+      },
+      watchRows: vi.fn(() => () => {}), observe: vi.fn(() => () => {}), kill: vi.fn(async () => {}),
+    }
+    const ctx: BoardHost = {
+      sessions: { list: { getSnapshot: () => tree, subscribe: () => () => {} } },
+      jobs: jobService,
+      get: () => undefined,
+    }
+    const html = renderToStaticMarkup(createElement(BoardTab, {
+      ctx, scope: { sessionId: 'root' }, visible: false,
+    }))
+    // 子会话那条作业不进看板的后台任务抽屉，计数与宿主页头保持同一口径。
+    expect(html).toContain('1 个后台任务')
+    expect(html).not.toContain('2 个后台任务')
+    expect(html).toContain('Root job')
+    expect(html).not.toContain('Child job')
   })
 })

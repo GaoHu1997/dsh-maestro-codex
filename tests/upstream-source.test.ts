@@ -22,9 +22,24 @@ describe('upstream source fidelity', () => {
       'tasks-graph-layout.ts',
       'tasks-layout-tween.ts', 'tasks-view-glide.ts', 'frame-batcher.ts',
       'tasks-graph.module.css', 'tasks-canvas.module.css', 'tasks-shared.tsx',
-      'AnchoredPopover.tsx', 'TasksPopovers.tsx',
+      'AnchoredPopover.tsx',
       'JobsDrawer.tsx', 'FloatingWindow.tsx', 'FloatingWindow.module.css',
     ]) expect(manifest.files.find(entry => entry.path === `client/${file}`)?.mode, file).toBe('verbatim')
+  })
+
+  it('keeps the popover transcript jump side-only (upstream main-window caret removed)', () => {
+    const entry = manifest.files.find(row => row.path === 'client/TasksPopovers.tsx')
+    expect(entry?.mode).toBe('adapted-side-only-jump')
+    const source = readFileSync(new URL('client/TasksPopovers.tsx', root), 'utf8')
+    // 主窗口跳转的全部痕迹都不在：caret、菜单面、宿主词条与打开兜底。
+    for (const absent of ['tasksNodeOpenMain', 'MenuSurface', 'useDismissOnOutsidePointer', "'main'", 'jumpMore', 'jumpMenu']) {
+      expect(source.includes(absent), `TasksPopovers must not reference ${absent}`).toBe(false)
+    }
+    // 侧边跳转语义仍在：primary 按钮只发 'side'，宿主没有 subagentchat 时收起。
+    expect(source).toContain("onJump(node, 'side')")
+    expect(source).toContain('asideAvailable && node.childAddress !== undefined')
+    // sourceSha256 记录它偏离的上游原版（0.28.2 verbatim）。
+    expect(entry?.sourceSha256).toMatch(/^[0-9a-f]{64}$/)
   })
 
   it('allows only the isolated CLI executor badge additions to the original renderer', () => {

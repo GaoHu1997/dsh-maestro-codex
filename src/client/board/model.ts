@@ -421,8 +421,10 @@ export interface AttachInput {
   /**
    * 任务 id → 已结算的 token 用量。
    *
-   * CLI 不是本地会话，宿主的 `tokenUsage` 投影里没有它；这些数字来自本插件
+   * CLI 子代理的用量不在派发会话的 `tokenUsage` 投影里；这些数字来自本插件
    * 自己的 `maestroCliUsage` 投影（`src/usage.ts`），由看板按 taskId 挂上来。
+   * （每个派发的原生子会话另有一份标准 `tokenUsage`，那是统计类插件的读数，
+   * 看板的 CLI 行仍然用本插件自己的账，见 `src/child-session.ts`。）
    * 只覆盖已经结束并上报过用量的任务，运行中的行没有这一项。
    */
   readonly usage?: Readonly<Record<string, BoardTokenUsage | undefined>>
@@ -459,17 +461,20 @@ export function attachRows(root: BoardNode, input: AttachInput): BoardNode {
 
   const walk = (node: BoardNode): BoardNode => {
     const extra = taskNodes.get(node.id)
-    // Native catalog mirrors use cli-${taskId}; older rows used taskId itself.
-    // Match only this owner's direct, session-less external rows, never sessions.
+    // Catalog/session mirrors of this owner's own CLI tasks collapse into the
+    // rich CLI row: the retired session-less external ghosts (`cli-${taskId}`)
+    // and the native record sessions (same id scheme, real session behind).
+    // A non-cli id (legacy bare-taskId mirrors) never hides a real session.
     const mirroredIds = new Set<string>()
     for (const row of extra ?? []) {
       if (row.task === undefined) continue
       mirroredIds.add(row.task.id)
       mirroredIds.add(`cli-${row.task.id}`)
     }
-    const children = node.children.filter(child =>
-      child.mode !== 'external' || child.hasSession || !mirroredIds.has(child.id),
-    ).map(walk)
+    const children = node.children.filter(child => {
+      if (!mirroredIds.has(child.id)) return true
+      return child.mode !== 'external' && !child.id.startsWith('cli-')
+    }).map(walk)
     if (extra === undefined && children.every((child, index) => child === node.children[index])) return node
     return { ...node, children: [...children, ...(extra ?? [])] }
   }
@@ -479,10 +484,17 @@ export function attachRows(root: BoardNode, input: AttachInput): BoardNode {
 /** 一个 CLI 子代理任务节点（叶子：它的日志在行内展开）。 */
 export function cliNode(task: MaestroTaskSummary, tokens?: BoardTokenUsage): BoardNode {
   tokens = task.usage ?? tokens
+  // 节点名是简短任务名（task_name 参数或 task 首行）；截断的完整输入降为
+  // 描述行，画在卡片名称下方——与原生子代理「目录 label 做标题、displayTitle
+  // 降为描述」同一条规则。
+  const subtitle = task.inputPreview !== undefined && task.inputPreview !== task.title
+    ? task.inputPreview
+    : undefined
   return {
     kind: 'cli',
     id: `${CLI_NODE_PREFIX}${task.id}`,
     title: task.title,
+    ...(subtitle === undefined ? {} : { subtitle }),
     depth: 0,
     running: task.phase === 'running' || task.phase === 'queued',
     hasSession: false,
@@ -522,6 +534,8 @@ export function cliStatusOf(phase: MaestroPhase): BoardStatus {
     case 'failed':
     case 'timeout': return 'failed'
     case 'cancelled': return 'cancelled'
+    // 中断：没有结论也没失败原因，看板上仍按「需要人处理」的待办显示。
+    case 'interrupted': return 'queued'
   }
 }
 

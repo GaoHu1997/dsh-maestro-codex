@@ -50,6 +50,21 @@ describe('CLI settings and header style isolation', () => {
     expect(declarations(cardCss, '.dmc-body')).toMatchObject({ display: 'flex', 'flex-direction': 'column' })
   })
 
+  it('keeps the per-CLI enable switch on the collapsed row instead of the body', () => {
+    // One strip carries the expand button and, at its end, the enable switch.
+    expect(declarations(cardCss, '.dmc-rowhead')).toMatchObject({
+      display: 'flex', 'align-items': 'center', padding: '0 14px',
+    })
+    expect(declarations(cardCss, '.dmc-rowbtn')).toMatchObject({ flex: '1', padding: '11px 0' })
+    expect(declarations(cardCss, '.dmc-rowsw')).toMatchObject({ flex: 'none' })
+    // The switch is a sibling of the button: a checkbox nested in a button is
+    // invalid HTML, and its clicks would collapse the row as well.
+    expect(cardSource).toMatch(/<\/button>\s*\{\/\*[\s\S]{0,300}?className="dmc-rowsw"/)
+    expect(cardSource).toMatch(/className="dmc-rowsw"[\s\S]{0,500}?ariaLabel=/)
+    // Moving it out of the body means the body no longer repeats the field.
+    expect(cardSource).not.toContain('启用此 CLI')
+  })
+
   it('puts the dsh model picker and the thinking level on one row', () => {
     const pair = declarations(cardCss, '.dmc-pair')
     expect(pair).toMatchObject({ display: 'grid' })

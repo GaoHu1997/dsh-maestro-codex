@@ -11,6 +11,11 @@
  * - CLI 子代理合并显示阶段、耗时、token（`maestroCliUsage` 投影）；
  * - 计数把两类合在一起，页头因此看得到“现在总共几个子智能体、谁在跑”。
  *
+ * 每行行头统一挂**执行者徽标**（`data-cli-executor`）：dsh 原生行标 DSH，
+ * CLI 行标它真正的执行者 claude / codex。样式复用看板节点右上角的同一份
+ * 品牌色与 logo（board/accent.ts 按 id 注入），两处一个词汇表。
+ * 「可续接 / 一次性」这类模式词不在这里出现——行头已经说明是谁在执行。
+ *
  * 内核 DOM 一旦改结构，`:has(...)` 选择器会失效——失效的后果是两颗 chip 同时
  * 出现，而不是丢信息，所以不做更深的 DOM 改写。
  *
@@ -18,15 +23,20 @@
  */
 
 import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from 'react'
+import { useCliAccess } from '../access.js'
 import { createPortal } from 'react-dom'
+import { SessionPage } from '../board/Session.js'
+import { hasBoardTranscriptAside, jumpBoardAddress, jumpBoardCliSession } from '../board/bridge.js'
+import type { SidebarSubagentAddress } from '../board/upstream/context-types.js'
 
-import { CLI_LABELS, type MaestroTaskSummary } from '../../wire.js'
+import { type MaestroTaskSummary } from '../../wire.js'
 import {
-  formatDuration, formatTokens, taskDuration, timingSummary, tokenSummary,
+  formatDuration, formatTokens, taskDuration, timingSummary,
   type BoardCatalogEntry, type BoardTokenUsage,
 } from '../board/model.js'
+import { injectBoardAccent, DSH_BADGE_TITLE } from '../board/accent.js'
 import {
-  sessionOpener, useCliTasks, useNow, useSessionList, type BoardHost,
+  useCliTasks, useNow, useSessionList, type BoardHost,
 } from '../board/data.js'
 
 /** 页头 chip 的样式表 id（幂等注入）。 */
@@ -79,10 +89,12 @@ const HEADER_CSS = `
 .dmch-line { display: flex; align-items: center; gap: 5px; min-width: 0; }
 .dmch-label { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 12px; line-height: 17px; }
 .dmch-badge {
-  flex: none; padding: 0 4px; border-radius: 3px; border: 1px solid var(--dsw-alias-border-l2, #dce0e8);
+  flex: none; display: inline-flex; align-items: center; gap: 3px;
+  padding: 0 4px; border-radius: 3px; border: 1px solid var(--dsw-alias-border-l2, #dce0e8);
   font-size: 9.5px; line-height: 14px; font-weight: 600; color: var(--dsw-alias-label-tertiary, #646d80);
 }
-.dmch-badge-cli { color: #10a37f; border-color: color-mix(in srgb, #10a37f 45%, transparent); }
+/* 执行者徽标的品牌色与 logo 由 accent.ts 的样式表按 data-cli-executor 分配
+ * （看板节点右上角同款），这里只保留无执行者时的中性底。 */
 .dmch-sub { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 10px; line-height: 15px; color: var(--dsw-alias-label-tertiary, #646d80); }
 .dmch-metrics {
   flex: none; display: flex; flex-direction: column; align-items: flex-end; gap: 1px;
@@ -108,6 +120,9 @@ let bodyFlagUsers = 0
 
 function useHeaderStyles(): void {
   useEffect(() => {
+    // 行头执行者徽标的品牌色/logo 来自看板的注入式样式表（accent.ts），
+    // 与看板节点右上角同一个词汇表、同一份配色。
+    injectBoardAccent()
     if (headerStyleInjected) return
     headerStyleInjected = true
     if (document.querySelector(`style[data-maestro-header=${JSON.stringify(HEADER_STYLE_ID)}]`) === null) {
@@ -138,11 +153,18 @@ interface HeaderRow {
   readonly sub: string
   readonly running: boolean
   readonly failed: boolean
-  readonly tokens?: BoardTokenUsage
+  readonly tokens?: HeaderTokenUsage
   readonly usageMeasured?: boolean
   readonly durationMs?: number
   readonly target?: string
+  readonly childAddress?: SidebarSubagentAddress
   readonly cli?: boolean
+  readonly cliTask?: MaestroTaskSummary
+  /**
+   * 行头执行者徽标（看板节点右上角同款词汇表）：claude/codex = CLI 子代理，
+   * DSH = dsh 原生子智能体；external 行不知道执行者，不给徽标。
+   */
+  readonly executor?: string
 }
 
 /** 一颗点。 */
@@ -151,14 +173,18 @@ function RowDot({ row }: { readonly row: HeaderRow }): ReactNode {
   return <span className={`dmch-dot dmch-row-dot dmch-dot-${state}`} />
 }
 
-function totalOf(tokens: BoardTokenUsage | undefined): number {
-  if (tokens === undefined) return 0
-  return tokens.uncachedInputTokens + tokens.outputTokens + tokens.cacheReadTokens + tokens.cacheWriteTokens
+/** CLI 桶可未知；native tokenUsage 仍是数字。 */
+type HeaderTokenUsage = { readonly [Key in keyof BoardTokenUsage]: number | null }
+function totalOf(tokens: HeaderTokenUsage | undefined): { known: number; partial: boolean } {
+  if (tokens === undefined) return { known: 0, partial: true }
+  const values = [tokens.uncachedInputTokens, tokens.outputTokens, tokens.cacheReadTokens, tokens.cacheWriteTokens]
+  return { known: values.reduce<number>((sum, value) => sum + (value ?? 0), 0), partial: values.some(value => value === null) }
 }
 
-export function headerTokenText(tokens: BoardTokenUsage | undefined, options: { readonly cli?: boolean; readonly running?: boolean; readonly usageMeasured?: boolean } = {}): string {
+export function headerTokenText(tokens: HeaderTokenUsage | undefined, options: { readonly cli?: boolean; readonly running?: boolean; readonly usageMeasured?: boolean } = {}): string {
   const total = totalOf(tokens)
-  if (total > 0 || options.usageMeasured === true) return `${formatTokens(total)} tok`
+  if (tokens !== undefined && total.partial) return total.known > 0 ? `已知 ${formatTokens(total.known)} tok · 部分未知` : '用量未知'
+  if (total.known > 0 || (tokens !== undefined && options.usageMeasured === true)) return `${formatTokens(total.known)} tok`
   if (options.cli === true) return options.running === true ? '尚未收到用量' : '用量未采集'
   return ''
 }
@@ -172,13 +198,17 @@ export function CliCatalogChip(props: { readonly sessionId?: string; readonly ho
   useHeaderStyles()
   const { sessionId, host } = props
   const [open, setOpen] = useState(false)
+  const [openError, setOpenError] = useState<string>()
   const [menuAt, setMenuAt] = useState<{ left: number; top: number }>()
   const rootRef = useRef<HTMLSpanElement>(null)
   const menuRef = useRef<HTMLDivElement>(null)
   const list = useSessionList(host ?? EMPTY_HOST)
+  const access = useCliAccess(list, sessionId)
+  const [sessionTask, setSessionTask] = useState<HeaderRow | undefined>(undefined)
+  useEffect(() => { setSessionTask(undefined); setOpen(false); setOpenError(undefined) }, [sessionId, access?.token])
   const now = useNow(true)
-  const tasks = useCliTasks(true, sessionId === undefined ? undefined : [sessionId])
-  const opener = useMemo(() => (host === undefined ? undefined : sessionOpener(host)), [host])
+  const tasks = useCliTasks(true, sessionId === undefined ? undefined : [sessionId], access)
+  const nativeAside = hasBoardTranscriptAside(host ?? EMPTY_HOST)
 
   const session = sessionId === undefined ? undefined : list.byId[sessionId]
   const isChild = session?.origin === 'subagent'
@@ -189,7 +219,7 @@ export function CliCatalogChip(props: { readonly sessionId?: string; readonly ho
     const catalog: readonly BoardCatalogEntry[] = projections[sessionId]?.values.subagentCatalog ?? []
 
     // CLI 任务的用量按 taskId 摊平（最近 20 次已结算的）。
-    const usage: Record<string, BoardTokenUsage | undefined> = {}
+    const usage: Record<string, HeaderTokenUsage | undefined> = {}
     for (const projection of Object.values(projections)) {
       for (const run of projection?.values.maestroCliUsage?.recent ?? []) {
         usage[run.taskId] = {
@@ -207,6 +237,12 @@ export function CliCatalogChip(props: { readonly sessionId?: string; readonly ho
 
     for (const entry of catalog) {
       if (entry.mode === 'external') continue
+      const mirroredTaskId = entry.id.startsWith('cli-') ? entry.id.slice(4) : entry.id
+      if (cliIds.has(mirroredTaskId)) continue
+      if (entry.id.startsWith('cli-task-')) {
+        out.push({ key: `cli:${mirroredTaskId}`, target: mirroredTaskId, cli: true, executor: 'CLI', label: entry.label ?? mirroredTaskId, sub: 'CLI 任务详情', running: false, failed: false })
+        continue
+      }
       const child = list.byId[entry.id]
       const timing = projections[entry.id]?.values.subagentTiming
       const running = child?.running === true
@@ -217,13 +253,20 @@ export function CliCatalogChip(props: { readonly sessionId?: string; readonly ho
       out.push({
         key: `agent:${entry.id}`,
         label: entry.label ?? child?.displayTitle ?? entry.id,
-        sub: [entry.mode === 'continuable' ? '可续接' : entry.mode === 'one-shot' ? '一次性' : entry.mode,
-          timingSummary(timing, now)].filter((part): part is string => part !== undefined && part !== '').join(' · '),
+        // 模式词（可续接/一次性）按要求去掉：行头徽标已说明执行者，副行只留
+        // 耗时——没采到 timing 就是空副行。
+        sub: timingSummary(timing, now) ?? '',
         running,
         failed: false,
         ...(tokens === undefined ? {} : { tokens }),
         ...(durationMs === undefined ? {} : { durationMs }),
         target: entry.id,
+        childAddress: {
+          parentSessionId: sessionId,
+          childSessionId: entry.id,
+          mode: entry.mode === 'one-shot' || entry.mode === 'continuable' ? entry.mode : 'unknown',
+        },
+        executor: 'DSH',
       })
     }
 
@@ -232,7 +275,8 @@ export function CliCatalogChip(props: { readonly sessionId?: string; readonly ho
       out.push({
         key: `cli:${task.id}`,
         label: task.title,
-        sub: [CLI_LABELS[task.cli], statusTextOf(task.phase), task.model === '' ? undefined : task.model]
+        // 执行者已在行头徽标里（claude/codex），副行不再重复 CLI 名。
+        sub: [statusTextOf(task.phase), task.model === '' ? undefined : task.model]
           .filter((part): part is string => part !== undefined).join(' · '),
         running: task.phase === 'running' || task.phase === 'queued',
         failed: task.phase === 'failed' || task.phase === 'timeout',
@@ -240,6 +284,9 @@ export function CliCatalogChip(props: { readonly sessionId?: string; readonly ho
         durationMs: taskDuration(task, now),
         usageMeasured: task.usage !== undefined,
         cli: true,
+        cliTask: task,
+        target: task.id,
+        executor: task.cli,
       })
     }
 
@@ -322,6 +369,7 @@ export function CliCatalogChip(props: { readonly sessionId?: string; readonly ho
 
   const toggle = (): void => {
     if (open) { setOpen(false); return }
+    setOpenError(undefined)
     const trigger = rootRef.current?.querySelector('button')
     if (trigger === null || trigger === undefined) return
     const rect = trigger.getBoundingClientRect()
@@ -357,6 +405,9 @@ export function CliCatalogChip(props: { readonly sessionId?: string; readonly ho
             style={{ left: menuAt.left, top: menuAt.top }}
             role="tree"
             aria-label="子智能体"
+            // 菜单 portal 到 body，脱离 wrap 的 data-dmc-chip 作用域；行头
+            // 执行者徽标要靠这个属性拿到 accent.ts 的品牌色/logo。
+            data-dmc-chip=""
           >
             <div className="dmch-menu-head">
               <span>{runningCount > 0 ? `${String(runningCount)} 个运行中` : '全部已结束'}</span>
@@ -364,22 +415,37 @@ export function CliCatalogChip(props: { readonly sessionId?: string; readonly ho
             </div>
             <div className="dmch-menu-body">
               {rows.map((row) => {
-                const tokens = tokenSummary(row.tokens)
+                const tokens = headerTokenText(row.tokens, row)
+                const missingNativeSeat = row.childAddress !== undefined && !nativeAside
+                const canOpen = row.target !== undefined && !missingNativeSeat
                 return (
                   <button
                     key={row.key}
                     type="button"
                     role="treeitem"
-                    className={`dmch-row${row.target === undefined ? '' : ' dmch-row-open'}`}
-                    disabled={row.target === undefined}
-                    onClick={row.target === undefined || opener === undefined ? undefined : () => { opener(row.target as string); close() }}
-                    title={[row.label, tokens, row.durationMs === undefined ? undefined : formatDuration(row.durationMs)]
+                    className={`dmch-row${canOpen ? ' dmch-row-open' : ''}`}
+                    disabled={!canOpen}
+                    onClick={!canOpen ? undefined : () => {
+                      if (row.cli === true) {
+                        if (row.cliTask === undefined || !jumpBoardCliSession(host ?? EMPTY_HOST, row.cliTask, sessionId === undefined ? undefined : [sessionId])) setSessionTask(row)
+                      } else if (row.childAddress === undefined || !jumpBoardAddress(host ?? EMPTY_HOST, row.childAddress)) {
+                        setOpenError('无法打开 DSH 子会话，请确认右侧会话栏已加载后重试。')
+                        return
+                      }
+                      close()
+                    }}
+                    title={[row.label, tokens, row.durationMs === undefined ? undefined : formatDuration(row.durationMs), missingNativeSeat ? '右侧 DSH 会话栏尚未加载' : undefined]
                       .filter((part): part is string => part !== undefined).join(' · ')}
                   >
                     <RowDot row={row} />
                     <span className="dmch-main">
                       <span className="dmch-line">
-                        {row.cli === true ? <span className="dmch-badge dmch-badge-cli">CLI</span> : undefined}
+                        {row.executor === undefined ? undefined : (
+                          <span className="dmch-badge" data-cli-executor={row.executor}
+                            title={row.executor === 'DSH' ? DSH_BADGE_TITLE : `CLI · ${row.executor}`}>
+                            {row.executor}
+                          </span>
+                        )}
                         <span className="dmch-label">{row.label}</span>
                       </span>
                       {row.sub === '' ? undefined : <span className="dmch-sub">{row.sub}</span>}
@@ -392,11 +458,16 @@ export function CliCatalogChip(props: { readonly sessionId?: string; readonly ho
                 )
               })}
             </div>
+            {openError === undefined ? null : <div className="dmch-foot" role="alert">{openError}</div>}
             <div className="dmch-foot">显示已采集的 CLI 用量；未采集不代表零消耗</div>
           </div>,
           document.body,
         )
         : undefined}
+      {sessionTask?.target === undefined ? null : createPortal(
+        <div style={{ position: 'fixed', inset: 24, zIndex: 121 }}>
+          <SessionPage taskId={sessionTask.target} {...(sessionTask.cliTask === undefined ? {} : { cli: sessionTask.cliTask.cli })} {...(sessionId === undefined ? {} : { sessionIds: [sessionId] })} {...(access === undefined ? {} : { access })} onClose={() => { setSessionTask(undefined) }} />
+        </div>, document.body)}
     </span>
   )
 }
@@ -409,5 +480,6 @@ function statusTextOf(phase: MaestroTaskSummary['phase']): string {
     case 'failed': return '失败'
     case 'timeout': return '超时'
     case 'cancelled': return '已取消'
+    case 'interrupted': return '已中断'
   }
 }

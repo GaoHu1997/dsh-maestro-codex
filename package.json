@@ -1,6 +1,6 @@
 {
   "name": "dsh-maestro-codex",
-  "version": "0.1.4",
+  "version": "0.1.5",
   "description": "dsh 的 CLI 子代理编排：把任务按类型派发给 codex cli 或 claude cli（headless），取回执行结果回填主会话；配置页管理路由表、每个 CLI 的权限与模型，以及 CLI 本身的安装/更新/卸载。",
   "keywords": [
     "dsh",
@@ -34,7 +34,7 @@
       "default": "./lib/index.js"
     },
     "./client": {
-      "types": "./lib/client/index.d.ts",
+      "types": "./lib/client.d.cts",
       "default": "./lib/client.js"
     },
     "./locale/*.json": "./locale/*.json",
@@ -48,6 +48,11 @@
     "LICENSE",
     "icon.svg",
     "locale/*.json",
+    "docs/cli-safety.md",
+    "docs/task-board.md",
+    "docs/session-history-recovery-guide.md",
+    "docs/reliability.md",
+    "scripts/maestro-status.mjs",
     "THIRD_PARTY_NOTICES"
   ],
   "icon": "./icon.svg",
@@ -60,7 +65,7 @@
     }
   },
   "scripts": {
-    "build": "tsc -p tsconfig.json && tsdown",
+    "build": "node scripts/clean-build.mjs && tsc -p tsconfig.json && tsdown",
     "typecheck": "tsc -p tsconfig.json --noEmit && tsc -p tsconfig.client.json --noEmit",
     "test": "vitest run",
     "prepublishOnly": "npm run typecheck && npm test && npm run build",
@@ -83,13 +88,14 @@
     "@types/node": "^24.13.3",
     "@types/react": "~18.3.1",
     "@types/react-dom": "~18.3.1",
+    "esbuild": "^0.28.2",
+    "jsdom": "^29.1.1",
+    "postcss": "^8.5.32",
     "react": "^18.2.0",
     "react-dom": "^18.3.1",
     "tsdown": "^0.14.0",
     "typescript": "^5.9.3",
-    "vitest": "^3.2.4",
-    "esbuild": "^0.28.2",
-    "postcss": "^8.5.32"
+    "vitest": "^3.2.4"
   },
   "engines": {
     "node": ">=22.19"

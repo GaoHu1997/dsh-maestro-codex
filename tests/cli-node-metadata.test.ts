@@ -54,7 +54,8 @@ describe('CLI executor identity and measured usage', () => {
     expect(tokenUsageOfStats(undefined)).toBeUndefined()
     expect(tokenUsageOfStats({ threadId: 'known', timedOut: true, items: 38 })).toBeUndefined()
     expect(tokenUsageOfStats({ inputTokens: Number.NaN, outputTokens: -1 })).toBeUndefined()
-    expect(tokenUsageOfStats({ inputTokens: 0, outputTokens: 0 })).toEqual({
+    expect(tokenUsageOfStats({ inputTokens: 0, outputTokens: 0 })).toBeUndefined()
+    expect(tokenUsageOfStats({ inputTokens: 0, outputTokens: 0, cachedInputTokens: 0, cacheWriteTokens: 0 })).toEqual({
       uncachedInputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0,
     })
   })
@@ -80,10 +81,20 @@ describe('CLI executor identity and measured usage', () => {
     expect(headerTokenText(undefined)).toBe('')
   })
 
-  it('tells the user missing settled telemetry does not mean zero spend', () => {
-    const row = cliNode({ ...task('codex'), phase: 'timeout', endedAt: 100 })
-    const html = renderToStaticMarkup(createElement(CliNodePopover, { node: row, now: 100, onOutput() {}, onCancel: async () => undefined }))
-    expect(html).toContain('未采集（不代表零消耗）')
-    expect(html).not.toContain('任务结束后上报')
+  it('keeps the detail fields identical to the native popover and omits unmeasured tokens', () => {
+    const usage = { uncachedInputTokens: 10, outputTokens: 20, cacheReadTokens: 30, cacheWriteTokens: 40 }
+    const measured = cliNode({ ...task('codex'), phase: 'timeout', endedAt: 100, usage })
+    const html = renderToStaticMarkup(createElement(CliNodePopover, { node: measured, now: 100, onOpenSession() {}, onCancel: async () => undefined }))
+    // 与原生子代理详情同一套字段：状态 / Token 用量 / 耗时；模型等 CLI 专属
+    // 字段不再出现（节点卡片上的 executor 徽标已经标识 CLI）。
+    for (const text of ['节点详情', '状态', '出错', 'Token 用量', '100', '耗时']) expect(html).toContain(text)
+    expect(html).not.toContain('provider::model')
+    expect(html).not.toContain('模型')
+    expect(html).not.toContain('退出码')
+    // 用量未采集时不制造零：整行省略（原生子代理详情同一条规则）。
+    const bare = cliNode({ ...task('codex'), phase: 'timeout', endedAt: 100 })
+    const bareHtml = renderToStaticMarkup(createElement(CliNodePopover, { node: bare, now: 100, onOpenSession() {}, onCancel: async () => undefined }))
+    expect(bareHtml).not.toContain('Token 用量')
+    expect(bareHtml).toContain('出错')
   })
 })

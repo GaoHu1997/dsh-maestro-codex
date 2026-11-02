@@ -7,11 +7,12 @@
  * tests pin both the schema shape and the registration behaviour.
  */
 
-import { describe, expect, it, vi } from 'vitest'
+import { beforeEach, describe, expect, it, vi } from 'vitest'
 import type { Context } from '@deepseek-ai/cordis'
 import { CONFIG_DEFAULTS, TASK_DIFFICULTIES, effectiveOf } from '../src/config.js'
 import type { DispatchValue } from '../src/dispatch.js'
 import { scriptedSpawn } from './fake-child.js'
+import { resolveTestDshModel, withTestDshRoutes } from './dsh-route-fixture.js'
 import { CliPathCache } from '../src/dispatch.js'
 import { Limiter, TaskRegistry } from '../src/task-registry.js'
 import {
@@ -28,7 +29,16 @@ import {
   type MaestroToolDeps,
   type ToolExec,
 } from '../src/tool.js'
-import { CLI_USAGE_EVENT } from '../src/usage.js'
+import { clearCliUsageMirrors, cliUsageProjectionDefinition } from '../src/usage.js'
+import { Session } from '@deepseek-ai/dsh-session'
+import { SessionAccessRegistry } from '../src/session-access.js'
+import { createChildSessionRecorder } from '../src/child-session.js'
+
+beforeEach(() => clearCliUsageMirrors())
+const visibleUsage = (sessionId: string) => {
+  const definition = cliUsageProjectionDefinition()
+  return definition.wire.view(definition.init({ id: sessionId }, 0))
+}
 
 /**
  * A strict stand-in for dsh-tools' `assertSupportedJsonSchema`: `required` is a
@@ -70,14 +80,15 @@ export function assertSupportedJsonSchema(schema: unknown, at = 'schema'): void 
 }
 
 function deps(overrides: Partial<MaestroToolDeps> = {}): MaestroToolDeps {
-  const readConfig = () => effectiveOf({})
+  const readConfig = overrides.readConfig ?? (() => effectiveOf({}))
   return {
-    readConfig,
     registry: new TaskRegistry(),
     limiter: new Limiter(() => 2),
     controllers: new Map(),
     pathCache: new CliPathCache(readConfig),
+    resolveDshModel: resolveTestDshModel,
     ...overrides,
+    readConfig: () => withTestDshRoutes(readConfig()),
   }
 }
 
@@ -121,6 +132,14 @@ describe('tool schemas', () => {
     expect(description).toContain('非空输出分片重置')
     expect(description).toContain('不代表任务语义进展')
     expect(description).toContain('1–240')
+  })
+
+  it('offers an optional dedupe key that resumes opt out of', () => {
+    const property = TOOL_PARAMETER_SCHEMA.properties.dedupe_key
+    expect(property.type).toBe('string')
+    expect(property.description).toContain('10 分钟')
+    expect(property.description).toContain('续接')
+    expect(TOOL_PARAMETER_SCHEMA.required).not.toContain('dedupe_key')
   })
 
   it('rejects the legacy per-property `required: true` form', () => {
@@ -288,6 +307,31 @@ describe('registered tool difficulty gate', () => {
   })
 })
 
+describe('registered tool trusted execution bridge seam', () => {
+  it('captures only exec identity and carries the original Agent/token into dispatch despite forged model fields', async () => {
+    const readConfig = () => effectiveOf({ claudeCliPath: process.execPath })
+    const child = scriptedSpawn(process => {
+      if (process.spawnArgs[0] === '--version') process.finish('claude version 9.9.9')
+      else process.finish(JSON.stringify({ type: 'result', subtype: 'success', result: 'fixture done', is_error: false, num_turns: 1 }))
+    })
+    const runServerEntry = vi.fn(() => undefined)
+    const bridge = { skillsFor: async () => [], runServerEntry } as unknown as NonNullable<MaestroToolDeps['bridge']>
+    const toolDeps = deps({ readConfig, spawnFn: child.spawnFn, pathCache: new CliPathCache(readConfig, child.spawnFn), bridge })
+    const agent = { id: 'trusted-owner' }
+    const token = Symbol('unit-fixture-not-live-authority')
+    const value = await registeredTool(toolDeps).execute({ task: 'fixture multistep', cli: 'claude', task_difficulty: 'medium', difficulty_reason: 'fixture validation',
+      executionAgent: { id: 'forged' }, executionContext: { token: 'forged' }, callId: 'forged' },
+    { signal: new AbortController().signal, agent, token, callId: 'native-call', rootCallId: 'native-root' })
+    expect(value.ok).toBe(true)
+    expect(runServerEntry).toHaveBeenCalledOnce()
+    expect(runServerEntry).toHaveBeenCalledWith(undefined, expect.objectContaining({ agent, parent: token, callId: 'native-call', rootCallId: 'native-root', sessionId: agent.id }))
+    const context = runServerEntry.mock.calls[0]![1] as unknown as { agent: unknown; parent: unknown; signal: AbortSignal }
+    expect(context.agent).toBe(agent)
+    expect(context.parent).toBe(token)
+    expect(context.signal).toBeInstanceOf(AbortSignal)
+  })
+})
+
 describe('parseToolArgs', () => {
   it.each(TASK_DIFFICULTIES)('maps %s and its trimmed semantic reason to shared dispatch fields', difficulty => {
     expect(parseToolArgs({ task: 'do it', task_difficulty: difficulty, difficulty_reason: '  多步实现并验证  ' }))
@@ -368,18 +412,53 @@ describe('usage reporting seam', () => {
     })
     const toolDeps = deps({ readConfig, spawnFn: child.spawnFn, pathCache: new CliPathCache(readConfig, child.spawnFn) })
     const appended: Array<{ type: string; data: unknown }> = []
-    const session = { append: (type: string, data: unknown) => { appended.push({ type, data }) } }
+    const session = { id: 'session-1', append: (type: string, data: unknown) => { appended.push({ type, data }) } }
     const value = await registeredTool(toolDeps).execute(
       { task: '多步任务', cli: 'claude', task_difficulty: 'medium', difficulty_reason: '需要实现、测试与回归验证' },
       { signal: new AbortController().signal, agent: { id: 'session-1', session } },
     )
     expect(value.ok).toBe(true)
-    // 派发一创建就写 external 目录行，结算时再写用量记录。
-    expect(appended).toHaveLength(2)
-    expect(appended[0]?.type).toBe('subagent/catalog')
-    expect(appended[0]?.data).toMatchObject({ version: 2, mode: 'external' })
-    expect(appended[1]?.type).toBe(CLI_USAGE_EVENT)
-    expect(appended[1]?.data).toMatchObject({ cli: 'claude', phase: 'done', sessionId: 'session-1' })
+    // Usage is visible through the trusted parent projection, not a required
+    // private event that would make the next cold read fail.
+    expect(appended).toEqual([])
+    expect(visibleUsage('session-1').recent).toHaveLength(1)
+    expect(visibleUsage('session-1').recent[0]).toMatchObject({ cli: 'claude', phase: 'done', sessionId: 'session-1' })
+  })
+
+  it('keeps the real parent identity for capabilities and immediate native catalog publication', async () => {
+    const parent = Session.create('tool-identity-parent')
+    const access = new SessionAccessRegistry()
+    access.publish(parent.id, parent)
+    const token = access.accessForProjection(parent.id)?.token
+    const ensureSessionAccess = vi.fn((id: string, session: typeof parent) => access.publish(id, session))
+    const warn = vi.fn()
+    const readConfig = () => effectiveOf({ claudeCliPath: process.execPath, recordChildSessions: true })
+    const child = scriptedSpawn(process => {
+      if (process.spawnArgs[0] === '--version') process.finish('claude version 9.9.9')
+      else process.finish(JSON.stringify({ type: 'result', subtype: 'success', result: 'done', is_error: false, num_turns: 1 }))
+    })
+    const childSessions = createChildSessionRecorder({
+      readConfig,
+      logger: { warn },
+      // No get/retry fallback: the first catalog write must use the true parent.
+      store: () => ({ create: (id, options) => Session.create(id, options?.seed, undefined, options?.inheritedEventCount) }),
+    })
+    const toolDeps = deps({ readConfig, spawnFn: child.spawnFn, pathCache: new CliPathCache(readConfig, child.spawnFn),
+      childSessions, ensureSessionAccess })
+    expect(usageSessionOf({ signal, agent: { id: parent.id, session: parent } })).toBe(parent)
+    const result = await registeredTool(toolDeps).execute(
+      { task: 'identity integration task', cli: 'claude', task_difficulty: 'medium', difficulty_reason: 'Exercise dispatch and recording contracts' },
+      { signal, agent: { id: parent.id, session: parent } },
+    )
+    expect(result.ok).toBe(true)
+    expect(ensureSessionAccess).toHaveBeenCalledWith(parent.id, parent)
+    expect(access.authorize(token)).toEqual({ sessionId: parent.id })
+    // The periodic live-session refresh must not rotate an already delivered token.
+    access.publish(parent.id, parent)
+    expect(access.authorize(token)).toEqual({ sessionId: parent.id })
+    expect(parent.snapshotEvents().map(event => event.type)).toEqual(['subagent/catalog'])
+    expect(warn).not.toHaveBeenCalled()
+    expect(visibleUsage(parent.id).recent).toHaveLength(1)
   })
 
   it('never registers the dispatch as a background job', async () => {
@@ -413,7 +492,7 @@ describe('usage reporting seam', () => {
     expect(services).not.toContain('jobs')
   })
 
-  it('writes the catalog row even when the dispatch later fails', async () => {
+  it('reports the settled run through the parent session even when the dispatch fails', async () => {
     const readConfig = () => effectiveOf({ claudeCliPath: process.execPath })
     const child = scriptedSpawn(process => {
       if (process.spawnArgs[0] === '--version') process.finish('claude version 9.9.9')
@@ -421,30 +500,44 @@ describe('usage reporting seam', () => {
     })
     const toolDeps = deps({ readConfig, spawnFn: child.spawnFn, pathCache: new CliPathCache(readConfig, child.spawnFn) })
     const appended: Array<{ type: string; data: unknown }> = []
-    const session = { append: (type: string, data: unknown) => { appended.push({ type, data }) } }
+    const session = { id: 'session-1', append: (type: string, data: unknown) => { appended.push({ type, data }) } }
     const tool = registeredTool(toolDeps)
     await expect(tool.execute(
       { task: '会失败的任务', cli: 'claude', task_difficulty: 'medium', difficulty_reason: '需要实现、测试与回归验证' },
       { signal: new AbortController().signal, agent: { id: 'session-1', session } },
-    )).rejects.toThrow()
-    // 任务确实跑过：会话顶部的子智能体下拉框要留下这条记录，即便结果是失败。
-    expect(appended.filter(entry => entry.type === 'subagent/catalog')).toHaveLength(1)
+    )).resolves.toMatchObject({ ok: false, phase: 'failed', error: expect.any(String), taskId: expect.any(String) })
+    // Failed execution still has a parent-scoped settlement, without writing
+    // a private required event (or the retired external catalog row).
+    expect(appended).toEqual([])
+    expect(visibleUsage('session-1').recent).toHaveLength(1)
+    expect(visibleUsage('session-1').recent[0]).toMatchObject({ cli: 'claude', phase: 'failed', sessionId: 'session-1' })
   })
 })
 
 describe('renderSummary', () => {
   it('never renders an empty body', () => {
     const text = renderSummary({
-      ok: true, cli: 'codex', model: '', cwd: 'C:\\x', durationMs: 1_500,
+      ok: true, taskId: 'task-1', phase: 'done', cli: 'codex', model: '', cwd: 'C:\\x', durationMs: 1_500,
       exitCode: 0, sessionRef: '', finalText: '', notes: [],
     })
     expect(text).toContain('（CLI 未返回文本）')
+    // 没拿到会话引用就没有续接提示，不渲染空 resume。
+    expect(text).not.toContain('resume=')
+  })
+
+  it('hands the model a resume hint for rework on the same CLI session', () => {
+    const text = renderSummary({
+      ok: true, taskId: 'task-2', phase: 'done', cli: 'claude', model: '', cwd: 'C:/x', durationMs: 1_000,
+      exitCode: 0, sessionRef: 's1', finalText: '完成', notes: [],
+    })
+    expect(text).toContain('resume="s1"')
+    expect(text).toContain('带着完整上下文继续')
   })
 
   it('caps an oversized answer in the rendered text and says by how much', () => {
     const finalText = `结论：${'x'.repeat(60_000)}`
     const text = renderSummary({
-      ok: true, cli: 'claude', model: 'm', cwd: 'C:\\x', durationMs: 1_000,
+      ok: true, taskId: 'task-3', phase: 'done', cli: 'claude', model: 'm', cwd: 'C:\\x', durationMs: 1_000,
       exitCode: 0, sessionRef: 's', finalText, notes: [],
     })
     expect(text.length).toBeLessThan(21_500)

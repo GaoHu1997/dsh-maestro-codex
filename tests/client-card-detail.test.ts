@@ -1,6 +1,23 @@
 import { describe, expect, it } from 'vitest'
-import { mergeTaskDetail } from '../src/client/MaestroCard.js'
+import { cliStatusLabel, mergeTaskDetail, stageChipLabel } from '../src/client/MaestroCard.js'
 import type { MaestroTaskDetail, MaestroTaskEvent, MaestroTaskSummary } from '../src/wire.js'
+
+describe('CLI installation labels', () => {
+  const missing = { installed: false, version: '', path: '' }
+  it('does not call the initial/in-flight status uninstalled', () => {
+    expect(cliStatusLabel(undefined)).toBe('检测中…')
+    expect(cliStatusLabel({ ...missing, checking: true })).toBe('检测中…')
+    expect(cliStatusLabel({ ...missing, error: '尚未检测' })).toBe('检测中…')
+  })
+  it('keeps installed-without-version distinct from uninstalled', () => {
+    expect(cliStatusLabel({ installed: true, version: '', path: '/cli', error: '--version 查询超时' })).toBe('已安装（版本未知）')
+    expect(cliStatusLabel(missing)).toBe('未安装')
+    expect(cliStatusLabel({ ...missing, error: 'CLI 路径检测失败：PATH 查找超时' })).toBe('检测失败')
+  })
+  it('keeps the known version visible while a refresh runs', () => {
+    expect(cliStatusLabel({ installed: true, version: '1.2.3', path: '/cli', checking: true })).toBe('v1.2.3')
+  })
+})
 
 function summary(phase: MaestroTaskSummary['phase']): MaestroTaskSummary {
   return { id: 'task-1', cli: 'codex', title: '任务', phase, model: '', startedAt: 1 }
@@ -40,5 +57,21 @@ describe('mergeTaskDetail', () => {
     expect(view.events).toHaveLength(400)
     expect(view.events[0]?.text).toBe('行 40')
     expect(view.events.at(-1)?.text).toBe('尾 59')
+  })
+})
+
+describe('stageChipLabel', () => {
+  it('only chips the stages that ask for a person', () => {
+    expect(stageChipLabel('person/answer')).toBe('等你回话')
+    expect(stageChipLabel('person/review')).toBe('等你验收')
+    expect(stageChipLabel('person/blocked')).toBe('等你处理阻塞')
+    expect(stageChipLabel('person/failed')).toBe('等你决定重试')
+  })
+
+  it('stays quiet while working and after it ends', () => {
+    expect(stageChipLabel('working')).toBeUndefined()
+    expect(stageChipLabel('working/queued')).toBeUndefined()
+    expect(stageChipLabel('idle')).toBeUndefined()
+    expect(stageChipLabel(undefined)).toBeUndefined()
   })
 })

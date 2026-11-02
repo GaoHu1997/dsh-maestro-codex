@@ -24,11 +24,10 @@
  * The team board is NOT here: it is always visible as a strip above the
  * canvas (TeamBoard.tsx).
  */
-import { useRef, useState, type ReactNode } from 'react'
+import { type ReactNode } from 'react'
 import clsx from 'clsx'
 import {
-  Button, IconChevronDownOutlineRegular, IconRightUpOutlineRegular, MenuSurface, StateDot, Tag,
-  useDismissOnOutsidePointer,
+  Button, IconRightUpOutlineRegular, StateDot, Tag,
 } from '@deepseek-ai/dsh-client-ui-primitives'
 import type { SidebarSubagentAddress, SidebarTokenUsage } from '../context-types.ts'
 import type { TasksAgentNode, TasksWorkflowNode } from './tasks-model.ts'
@@ -98,77 +97,38 @@ function PopTitleRow(props: { glyph: ReactNode; title: string }): ReactNode {
 }
 
 /**
- * The transcript jump, offered the way the host's own subagent list offers it:
- * the primary action opens the child's transcript in the NATIVE right sidebar
- * (the `subagentchat` tab type — the page never re-implements a transcript
- * pane), and the caret beside it opens the main window instead.
+ * The transcript jump, side-only by policy: the action opens the child's
+ * transcript in the NATIVE right sidebar (the `subagentchat` tab type — the
+ * page never re-implements a transcript pane). No board affordance navigates
+ * the main window away from the user's conversation.
  *
- * The ROOT node has no child to embed — it IS the main session — and a host
- * without the `subagentchat` type has no sidebar to open into, so both keep the
- * single button.
+ * The ROOT node has no child to embed — it IS the main session — so it renders
+ * no jump button (its footer keeps the other controls only). A host without
+ * the `subagentchat` type has no sidebar to open into, so the button is
+ * suppressed there too rather than falling back to the main window.
  *
  * The optional `children` slot carries the card's OTHER footer control (the
  * diagnostics jump): the two live in one row so the card still has exactly one
- * action band, and the split's own box stays fixed-width beside it.
+ * action band.
  */
 function JumpActions(props: {
   node: TasksAgentNode
   asideAvailable: boolean
-  onJump(node: TasksAgentNode, place: 'side' | 'main'): void
+  onJump(node: TasksAgentNode, place: 'side'): void
   children?: ReactNode
 }): ReactNode {
   const { node, asideAvailable, onJump } = props
-  const [open, setOpen] = useState(false)
-  const rootRef = useRef<HTMLSpanElement>(null)
-  useDismissOnOutsidePointer(rootRef, open, setOpen)
-  const split = asideAvailable && node.childAddress !== undefined
-  const primaryPlace = split ? 'side' : 'main'
   return (
     <>
-      <Button
-        variant="primary"
-        size="sm"
-        icon={<IconRightUpOutlineRegular size={12} />}
-        onClick={() => { onJump(node, primaryPlace) }}
-      >
-        {t('tasksNodeJump')}
-      </Button>
-      {split && (
-        <span className={css.jumpMore} ref={rootRef}>
-          <Button
-            variant="primary"
-            size="sm"
-            className={css.jumpMoreButton}
-            aria-label={t('tasksNodeOpenMain')}
-            aria-haspopup="menu"
-            aria-expanded={open}
-            title={t('tasksNodeOpenMain')}
-            onClick={() => { setOpen(current => !current) }}
-          >
-            {/*
-              The split's caret, the same split the host's own jump control
-              shows: the glyph names the MENU it opens, never the primary
-              action beside it.
-            */}
-            <IconChevronDownOutlineRegular size={12} />
-          </Button>
-          {open && (
-            <MenuSurface compact className={css.jumpMenu} role="menu">
-              <Button
-                variant="ghost"
-                size="sm"
-                role="menuitem"
-                className={css.jumpMenuItem}
-                onClick={() => {
-                  setOpen(false)
-                  onJump(node, 'main')
-                }}
-              >
-                {t('tasksNodeOpenMain')}
-              </Button>
-            </MenuSurface>
-          )}
-        </span>
+      {asideAvailable && node.childAddress !== undefined && (
+        <Button
+          variant="primary"
+          size="sm"
+          icon={<IconRightUpOutlineRegular size={12} />}
+          onClick={() => { onJump(node, 'side') }}
+        >
+          {t('tasksNodeJump')}
+        </Button>
       )}
       {props.children}
     </>
@@ -189,11 +149,11 @@ export function AgentNodePopover(props: {
   node: TasksAgentNode
   /**
    * Whether the host can host a child transcript in its right column. Without
-   * it (no `subagentchat` tab type, no right column) the footer is a single
-   * main-view button — the choice simply does not exist.
+   * it (no `subagentchat` tab type, no right column) the jump button is
+   * suppressed — a side-only policy has no other place to open into.
    */
   asideAvailable: boolean
-  onJump(node: TasksAgentNode, place: 'side' | 'main'): void
+  onJump(node: TasksAgentNode, place: 'side'): void
   /** Open the shared task window for one of the node's tasks. */
   onOpenTask(taskId: string, anchor: HTMLElement): void
   onClose(): void

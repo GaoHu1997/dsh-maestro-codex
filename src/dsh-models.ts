@@ -15,6 +15,7 @@ import { homedir } from 'node:os'
 import { join } from 'node:path'
 import type { Context } from '@deepseek-ai/cordis'
 import { parse } from 'yaml'
+import { publicEndpointUrl } from './public-diagnostics.js'
 
 /** Wire protocols a CLI subprocess can speak directly. */
 export type MappableApi = 'anthropic-messages' | 'openai-completions' | 'openai-responses'
@@ -143,7 +144,7 @@ export async function listDshModels(_ctx: Context, settings: SettingsDescribeFac
       id: route,
       displayName,
       api,
-      baseURL,
+      baseURL: publicEndpointUrl(baseURL),
       hasKeyRef: apiKeyEnv !== '',
       mappable,
       models: declaredModels(profile),

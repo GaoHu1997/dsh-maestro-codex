@@ -8,9 +8,8 @@
 
 import type { Context } from '@deepseek-ai/cordis'
 import { TASK_DIFFICULTIES } from './config.js'
-import { parseDispatchParams, runDispatch, type DispatchDeps, type DispatchParams, type DispatchValue } from './dispatch.js'
-import { externalCatalogRow } from './subagent-catalog.js'
-import { sessionUsageAppendOf, type CliUsageSession } from './usage.js'
+import { DispatchError, parseDispatchParams, runDispatch, type DispatchDeps, type DispatchParams, type DispatchValue } from './dispatch.js'
+import type { CliUsageSession } from './usage.js'
 
 export const TOOL_NAME = 'dispatch_cli_task'
 
@@ -29,16 +28,19 @@ export const TOOL_OUTPUT_SCHEMA = {
   additionalProperties: false,
   properties: {
     ok: { type: 'boolean' },
+    taskId: { type: 'string' },
+    phase: { type: 'string' },
+    error: { type: 'string' },
     cli: { type: 'string' },
     model: { type: 'string' },
     cwd: { type: 'string' },
     durationMs: { type: 'integer' },
-    exitCode: { type: 'integer' },
+    exitCode: { oneOf: [{ type: 'integer' }, { type: 'null' }] },
     sessionRef: { type: 'string' },
     finalText: { type: 'string' },
     notes: { type: 'array', items: { type: 'string' } },
   },
-  required: ['ok', 'cli', 'model', 'cwd', 'durationMs', 'sessionRef', 'finalText', 'notes'],
+  required: ['ok', 'taskId', 'phase', 'cli', 'model', 'cwd', 'durationMs', 'sessionRef', 'finalText', 'notes'],
 } as const
 
 /**
@@ -51,13 +53,15 @@ export const TOOL_PARAMETER_SCHEMA = {
   additionalProperties: false,
   properties: {
     task: { type: 'string', description: '完整、自包含的任务描述。CLI 子代理看不到本会话上下文：目标、涉及的文件路径、验收标准、输出格式都要写全。' },
+    task_name: { type: 'string', description: '简短任务名（任务看板节点标题，一句话概括这个子代理要做什么，40 字以内）；省略时自动取 task 的首行作为任务名。' },
     cli: { type: 'string', description: '"claude" / "codex" / 缺省 auto。auto 按任务类型和默认配置路由，然后检查实际选定 CLI 的独立最低难度（停用请求回落时检查回落 CLI）；指定 CLI 或用户点名均不能绕过，也不会因另一 CLI 门槛较低而重新路由。' },
     task_difficulty: { type: 'string', enum: [...TASK_DIFFICULTIES], description: '主代理对任务实际范围、步骤、依赖和风险的语义评估：简短问答/小范围编辑 low，多步一般任务 medium，跨模块重构 high，系统级复杂任务 extreme；不要按关键词或为了触发 CLI 夸大难度。' },
     difficulty_reason: { type: 'string', description: '非空评估依据（最多 2000 字符），说明真实任务范围、步骤、依赖或风险；必须与 task_difficulty 同时提供，不能仅用任务类型关键词当理由。' },
     cwd: { type: 'string', description: '执行目录（绝对路径）。省略时沿用本会话工作区，并在返回的 notes 里标注实际使用的目录。' },
     resume: { type: 'string', description: '续接之前的 CLI 子代理会话：传上次结果里的 sessionRef（claude 的 session id 或 codex 的 thread id），本次任务作为该会话的后续指令执行。原会话对话不会自动带入，需要的结论要写进 task；不带此参数则开全新会话。' },
-    model: { type: 'string', description: '临时指定该子代理的模型；不填则默认沿用主代理当前选择的模型（协议不支持该 CLI 时改用配置页的 dsh 模型）。两者都不可用时任务会直接报错并说明原因，不会回落到 CLI 自身配置的模型。' },
+    model: { type: 'string', description: '临时指定 DSH 模型：provider::model 固定供应商且失败不回退；裸模型名绑定主代理或配置页的可信 DSH 供应商，保留该模型名逐一解析、校验协议并预检，不能借用 CLI 自带配置。省略时沿用主代理模型（协议不兼容或不可用则回退配置页的 dsh 模型）。无可用 DSH 端点时直接报错。' },
     timeout_minutes: { type: 'number', description: 'CLI 连续无 stdout/stderr 输出超时（分钟，1–240），不是总运行时长；非空输出分片重置计时。这是无输出保护，不代表任务语义进展。缺省用配置页的每 CLI 超时。' },
+    dedupe_key: { type: 'string', description: '可选幂等键：同一个键在 10 分钟窗口内只会真正启动一次（重复调用直接返回"已派发过"）。不传则按 父会话+cli+任务名+cwd 自动推导；续接（resume）不参与去重。' },
   },
   required: ['task', 'task_difficulty', 'difficulty_reason'],
 } as const
@@ -69,7 +73,13 @@ export const TOOL_PARAMETER_SCHEMA = {
  */
 export interface ToolExec {
   readonly signal: AbortSignal
+  /** Host-minted same-process execution identity; never reconstructed from JSON. */
+  readonly token?: symbol | undefined
+  readonly callId?: string | undefined
+  readonly rootCallId?: string | undefined
   readonly agent?: {
+    /** Public agent-scoped Context; not needed to resolve tools by agent identity. */
+    readonly ctx?: Context | undefined
     readonly id?: string
     readonly options?: { readonly provider?: string; readonly model?: string }
     readonly session?: {
@@ -107,12 +117,13 @@ export function ownerSessionOf(exec: ToolExec): string | undefined {
 }
 
 /**
- * The owning session's append handle (usage reporting). `undefined` when the
- * host session does not expose `append` — the dispatch then simply reports
- * nothing, and the board still shows the per-task stats.
+ * Keep the trusted host Session itself: dispatch also uses it for access and
+ * the native child catalog. Volatile usage sinks are created only inside the
+ * accounting functions; replacing this identity would rotate capabilities.
  */
 export function usageSessionOf(exec: ToolExec): CliUsageSession | undefined {
-  return sessionUsageAppendOf(exec.agent?.session)
+  const session = exec.agent?.session
+  return session !== undefined && typeof session.append === 'function' ? session as CliUsageSession : undefined
 }
 
 /**
@@ -135,23 +146,18 @@ export function registerDispatchTool(ctx: Context, deps: MaestroToolDeps): { rea
       ...(primaryModel === undefined ? {} : { primaryModel }),
       ...(sessionId === undefined ? {} : { sessionId }),
       ...(usageSession === undefined ? {} : { usageSession }),
+      ...(exec.agent === undefined ? {} : { executionAgent: exec.agent }),
+      executionContext: { agent: exec.agent, token: exec.token, callId: exec.callId, rootCallId: exec.rootCallId },
     }
-    // DispatchError messages are already agent-facing; anything else keeps its
-    // own shape (the abort reason included).
-    const concise = parsed.task.replace(/\s+/g, ' ').slice(0, 60)
-    /* A2：任务一创建就补一行 external 目录，内核会话顶部的「N 个子智能体」
-     * 下拉框立刻出现这条 CLI 任务（external 行只作记录，不可打开）。目录投影
-     * 没有按 childId 去重，所以只写一次；写失败不影响派发。 */
-    let catalogued = false
-    const noteCatalog = (taskId: string): void => {
-      if (catalogued || usageSession === undefined) return
-      catalogued = true
-      try {
-        usageSession.append('subagent/catalog', externalCatalogRow(taskId, `cli · ${concise}`, Date.now()))
-      } catch { /* catalog rows are observability; a refusal costs nothing */ }
+    // Pre-task validation/authority errors still reject. Once a task exists,
+    // keep its real failed/cancelled/timeout result (including recovery refs)
+    // in the enforced output schema rather than dropping it with the throw.
+    try {
+      return await runDispatch(deps, params, exec.signal)
+    } catch (error) {
+      if (error instanceof DispatchError && error.value !== undefined) return error.value
+      throw error
     }
-    const value = await runDispatch(deps, params, exec.signal, { onTaskId: noteCatalog })
-    return value
   }
 
   const definitionFor = (name: string): unknown => ({
@@ -221,5 +227,11 @@ export function renderSummary(value: DispatchValue): string {
   const body = rawBody.length > RENDER_TEXT_CAP
     ? `${rawBody.slice(0, RENDER_TEXT_CAP)}\n…（结果过长已截断 ${rawBody.length - RENDER_TEXT_CAP} 字符，完整文本见任务看板转录）`
     : rawBody
-  return value.ok ? `${head}\n\n${body}` : `${head}\n${body}`
+  // 续接提示直接进对话文本：notes 不在渲染结果里，模型看不到。返工/追加时
+  // 传 resume 续接同一 CLI 会话，子代理带着完整上下文继续，不必重复背景。
+  const resumeHint = value.sessionRef === '' ? ''
+    : `\n\n如需返工或补充要求：再次调用本工具并传 resume="${value.sessionRef}"，会在同一 CLI 会话中带着完整上下文继续，无需重复背景信息。`
+  const metadata = `taskId=${value.taskId}，phase=${value.phase}`
+  const failure = !value.ok && value.error !== undefined ? `\n错误：${value.error}` : ''
+  return `${head}\n${metadata}${failure}\n\n${body}${resumeHint}`
 }

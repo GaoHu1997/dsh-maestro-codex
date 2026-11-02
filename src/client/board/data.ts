@@ -14,11 +14,8 @@
 
 import { useCallback, useEffect, useMemo, useState, useSyncExternalStore } from 'react'
 
-import { cancelTask, fetchTaskDetail, fetchTasks } from '../api.js'
+import { cancelTask, fetchTasks } from '../api.js'
 import {
-  TERMINAL_PHASES,
-  type MaestroTaskDetail,
-  type MaestroTaskEvent,
   type MaestroTaskSummary,
 } from '../../wire.js'
 import type { CliUsageState } from '../../usage.js'
@@ -29,12 +26,6 @@ import type {
 
 /** CLI 任务列表的轮询间隔（毫秒）。 */
 const TASKS_POLL_MS = 2500
-
-/** 展开的任务日志轮询间隔（更密：日志是滚动看的）。 */
-const DETAIL_POLL_MS = 900
-
-/** 一个任务日志在内存里保留的最大行数。 */
-const LOG_CAP = 600
 
 /** 会话列表 feed 的一行（`ctx.sessions.list.getSnapshot()` 的 `byId` 值）。 */
 export interface BoardSessionList {
@@ -52,6 +43,7 @@ export interface BoardProjectionSnapshot {
     readonly tokenUsage?: BoardTokenUsage
     readonly subagentTiming?: BoardTiming
     /** 本插件自己的 CLI 用量投影（见 src/usage.ts），设置卡的用量统计读它。 */
+    readonly maestroCliAccess?: import('../../wire.js').MaestroSessionAccess | null
     readonly maestroCliUsage?: CliUsageState
   }
 }
@@ -266,135 +258,42 @@ export interface BoardCliState {
  * @param active - tab 是否可见。
  * @param sessionIds - 当前会话树的会话 id；缺省则不过滤（运维视角）。
  */
-export function useCliTasks(active: boolean, sessionIds?: readonly string[]): BoardCliState {
-  const [tasks, setTasks] = useState<readonly MaestroTaskSummary[]>([])
-  const [loading, setLoading] = useState(true)
-  const [error, setError] = useState<string | undefined>(undefined)
+export function useCliTasks(active: boolean, sessionIds?: readonly string[], access?: import('../../wire.js').MaestroSessionAccess): BoardCliState {
+  const scopeKey = `${sessionIdsKey(sessionIds)}:${access?.sessionId ?? ''}:${access?.token ?? ''}`
+  const [state, setState] = useState<{ key: string; tasks: readonly MaestroTaskSummary[]; loading: boolean; error?: string }>({ key: scopeKey, tasks: [], loading: true })
   const [nonce, setNonce] = useState(0)
   const refresh = useCallback(() => { setNonce(value => value + 1) }, [])
-  const scopeKey = sessionIdsKey(sessionIds)
-
+  const idsKey = sessionIdsKey(sessionIds)
   useEffect(() => {
+    setState({ key: scopeKey, tasks: [], loading: active })
     if (!active) return
     let cancelled = false
+    const controller = new AbortController()
     let timer: number | undefined
     const load = async (): Promise<void> => {
-      const result = await fetchTasks(scopeKey === '' ? undefined : scopeKey.split(','))
+      const result = await fetchTasks(idsKey === '' ? undefined : idsKey.split(','), access, controller.signal)
       if (cancelled) return
-      if (result.ok) {
-        setTasks(result.tasks)
-        setError(undefined)
-      } else {
-        setError(result.error)
-      }
-      setLoading(false)
+      setState(previous => result.ok
+        ? { key: scopeKey, tasks: result.tasks, loading: false }
+        : { key: scopeKey, tasks: previous.key === scopeKey ? previous.tasks : [], loading: false, error: result.error })
       timer = window.setTimeout(() => { void load() }, TASKS_POLL_MS)
     }
     void load()
-    return () => {
-      cancelled = true
-      if (timer !== undefined) window.clearTimeout(timer)
-    }
+    return () => { cancelled = true; controller.abort(); if (timer !== undefined) window.clearTimeout(timer) }
   }, [active, nonce, scopeKey])
-
   const cancel = useCallback(async (id: string): Promise<string | undefined> => {
-    const result = await cancelTask(id, scopeKey === '' ? undefined : scopeKey.split(','))
+    const result = await cancelTask(id, idsKey === '' ? undefined : idsKey.split(','), access)
     if (!result.ok) return result.error
     setNonce(value => value + 1)
     return undefined
   }, [scopeKey])
-
-  return { tasks, loading, error, refresh, cancel }
+  const current = state.key === scopeKey ? state : { tasks: [], loading: active, error: undefined }
+  return { tasks: current.tasks, loading: current.loading, error: current.error, refresh, cancel }
 }
 
 /** 排序后拼成一个稳定的 effect 依赖（数组本身每次渲染都是新引用）。 */
 function sessionIdsKey(sessionIds: readonly string[] | undefined): string {
   return sessionIds === undefined || sessionIds.length === 0 ? '' : [...sessionIds].sort().join(',')
-}
-
-/** 单个任务的日志读取状态。 */
-export interface BoardCliDetailState {
-  readonly summary: MaestroTaskSummary | undefined
-  readonly events: readonly MaestroTaskEvent[]
-  /** 路由/网络层错误（读不到详情）。 */
-  readonly error: string | undefined
-  /** 任务自身的失败原因（宿主写进 detail 的 `error` 字段）。 */
-  readonly failure: string | undefined
-  readonly finalText?: string
-  readonly cwd?: string
-  readonly stats?: Readonly<Record<string, string | number | boolean>>
-}
-
-const EMPTY_DETAIL: BoardCliDetailState = { summary: undefined, events: [], error: undefined, failure: undefined }
-
-/** Keep genuine outcome fields across cursor pages that omit unchanged metadata. */
-export function cliDetailSnapshot(
-  detail: MaestroTaskDetail,
-  events: readonly MaestroTaskEvent[],
-  previous: BoardCliDetailState = EMPTY_DETAIL,
-): BoardCliDetailState {
-  return {
-    ...previous, summary: detail.summary, events, error: undefined, failure: detail.error,
-    ...(detail.finalText === undefined ? {} : { finalText: detail.finalText }),
-    ...(detail.cwd === undefined ? {} : { cwd: detail.cwd }),
-    ...(detail.stats === undefined ? {} : { stats: detail.stats }),
-  }
-}
-
-/** 连续失败多少次后放弃轮询（瞬时抖动要扛住，真被删除/剪掉的任务要停下）。 */
-const DETAIL_MAX_FAILURES = 5
-
-/**
- * 跟随式读取一个任务的详情与日志（带游标，只追加）。
- * @param id - 任务 id；`null` 表示没有展开任何任务。
- * @param active - tab 是否可见。
- * @param sessionIds - 当前会话树的会话 id；详情同样按它过滤。
- */
-export function useCliDetail(id: string | null, active: boolean, sessionIds?: readonly string[]): BoardCliDetailState {
-  const [state, setState] = useState<BoardCliDetailState>(EMPTY_DETAIL)
-  const scopeKey = sessionIdsKey(sessionIds)
-  useEffect(() => {
-    if (id === null || !active) {
-      setState(EMPTY_DETAIL)
-      return
-    }
-    let cancelled = false
-    let cursor = 0
-    let events: MaestroTaskEvent[] = []
-    let snapshot: BoardCliDetailState = EMPTY_DETAIL
-    let failures = 0
-    let timer: number | undefined
-    const load = async (): Promise<void> => {
-      const result = await fetchTaskDetail(id, cursor, scopeKey === '' ? undefined : scopeKey.split(','))
-      if (cancelled) return
-      if (!result.ok) {
-        // 一次抖动不该冻结整个转录：有界重试，连续失败才停下。
-        failures += 1
-        snapshot = { ...snapshot, summary: undefined, events, error: result.error, failure: undefined }
-        setState(snapshot)
-        if (failures < DETAIL_MAX_FAILURES) {
-          timer = window.setTimeout(() => { void load() }, DETAIL_POLL_MS)
-        }
-        return
-      }
-      failures = 0
-      const detail: MaestroTaskDetail = result
-      cursor = detail.nextCursor
-      events = [...events, ...detail.events].slice(-LOG_CAP)
-      snapshot = cliDetailSnapshot(detail, events, snapshot)
-      setState(snapshot)
-      if (!TERMINAL_PHASES.includes(detail.summary.phase)) {
-        timer = window.setTimeout(() => { void load() }, DETAIL_POLL_MS)
-      }
-    }
-    void load()
-    return () => {
-      cancelled = true
-      if (timer !== undefined) window.clearTimeout(timer)
-      cursor = 0
-    }
-  }, [id, active, scopeKey])
-  return state
 }
 
 /** 每秒走一次的“现在”，让耗时读数自己往前跑。 */

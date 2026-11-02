@@ -31,11 +31,33 @@ describe('TaskRegistry', () => {
     const task = newTask(registry)
     expect(registry.list()[0]?.usage).toBeUndefined()
     // The CLI streams counts while it runs: the board polls list() and must see them.
-    registry.setLiveStats(task, { inputTokens: 120, cachedInputTokens: 40, outputTokens: 9 })
+    registry.setLiveStats(task, { inputTokens: 120, cachedInputTokens: 40, outputTokens: 9, cacheWriteTokens: 0 })
     expect(registry.list()[0]?.usage).toEqual({ uncachedInputTokens: 120, cacheReadTokens: 40, cacheWriteTokens: 0, outputTokens: 9 })
-    // Settled stats win — and the live snapshot is not summed into them.
+    // Terminal settlement drops the live snapshot; running retries show both.
     task.stats = { inputTokens: 300, cachedInputTokens: 250, cacheWriteTokens: 0, outputTokens: 30 }
+    registry.setPhase(task, 'done', 'finished')
     expect(registry.list()[0]?.usage).toEqual({ uncachedInputTokens: 300, cacheReadTokens: 250, cacheWriteTokens: 0, outputTokens: 30 })
+  })
+
+  it.each(['inputTokens', 'outputTokens', 'cachedInputTokens', 'cacheWriteTokens'])('a live retry missing %s cannot reuse its old complete bucket', (missing) => {
+    const registry = new TaskRegistry()
+    const task = newTask(registry)
+    task.stats = { inputTokens: 10, outputTokens: 2, cachedInputTokens: 4, cacheWriteTokens: 0 }
+    const live: Record<string, number> = { inputTokens: 5, outputTokens: 1, cachedInputTokens: 1, cacheWriteTokens: 0 }
+    delete live[missing]
+    registry.setLiveStats(task, live)
+    expect(registry.list()[0]?.usage).toBeUndefined()
+    // The synthesized partial view does not mutate the previous settlement.
+    expect(task.stats['cacheWriteTokens']).toBe(0)
+    expect(task.stats[`usagePartial_${missing}`]).toBeUndefined()
+  })
+
+  it('adds fully measured live retry counters to the previous settlement', () => {
+    const registry = new TaskRegistry()
+    const task = newTask(registry)
+    task.stats = { inputTokens: 10, outputTokens: 2, cachedInputTokens: 4, cacheWriteTokens: 0 }
+    registry.setLiveStats(task, { inputTokens: 5, outputTokens: 1, cachedInputTokens: 1, cacheWriteTokens: 0 })
+    expect(registry.list()[0]?.usage).toEqual({ uncachedInputTokens: 15, outputTokens: 3, cacheReadTokens: 5, cacheWriteTokens: 0 })
   })
 
   it('caps the event ring without renumbering', () => {
@@ -88,6 +110,22 @@ describe('TaskRegistry', () => {
     // 不依赖渲染顺序：summary 里带上 owner，前端才能区分来源。
     expect(registry.list().find(summary => summary.id === 'own')?.sessionId).toBe('s1')
     expect(registry.list().find(summary => summary.id === 'npm')?.sessionId).toBeUndefined()
+  })
+
+  it('carries the flattened input preview next to the short task title', () => {
+    const registry = new TaskRegistry()
+    const task = registry.create({
+      id: 'preview', cli: 'codex', title: '修复登录页', model: '',
+      prompt: '修复登录页\n在 iOS Safari 上点击登录按钮没有反应，需要排查事件绑定，并补回归测试。',
+    })
+    expect(registry.summaryOf(task).inputPreview)
+      .toBe('修复登录页 在 iOS Safari 上点击登录按钮没有反应，需要排查事件绑定，并补回归测试。')
+    // 没有 prompt 的行（npm 作业）没有预览，看板就不画描述行。
+    const bare = newTask(registry, 'no-prompt')
+    expect(registry.summaryOf(bare)).not.toHaveProperty('inputPreview')
+    // 超长输入压平截到 80 字，与旧 title 同一条规则。
+    const long = registry.create({ id: 'long', cli: 'codex', title: '名', model: '', prompt: '字'.repeat(120) })
+    expect(registry.summaryOf(long).inputPreview).toBe('字'.repeat(80))
   })
 })
 

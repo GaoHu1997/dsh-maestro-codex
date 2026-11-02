@@ -1,16 +1,17 @@
 /**
- * 协同功能回归：external 目录行（A2）、git 上下文注入（接缝①）、会话续接
- * （resume）、失败重试与超时预警。
+ * 协同功能回归：git 上下文注入（接缝①）、会话续接（resume）、失败重试与超时预警。
+ * （A2 的 external 目录行已退役——宿主严格 schema 会在 fold 中拒绝它；子会话
+ * 记录的形态回归见 tests/child-session.test.ts。）
  */
 
 import { describe, expect, it, vi } from 'vitest'
 import { effectiveOf, validateConfig, type EffectiveConfig } from '../src/config.js'
 import { parseDispatchParams, runDispatch, type DispatchParams, type DispatchValue } from '../src/dispatch.js'
-import { externalCatalogRow } from '../src/subagent-catalog.js'
 import { gitContextBlockOf } from '../src/git-context.js'
 import { CliPathCache } from '../src/dispatch.js'
 import { Limiter, TaskRegistry } from '../src/task-registry.js'
 import { scriptedSpawn } from './fake-child.js'
+import { resolveTestDshModel, withTestDshRoutes } from './dsh-route-fixture.js'
 
 const assessment = {
   taskDifficulty: 'medium',
@@ -18,7 +19,7 @@ const assessment = {
 } satisfies Pick<DispatchParams, 'taskDifficulty' | 'difficultyReason'>
 
 function fixture(overrides: Partial<EffectiveConfig> = {}): EffectiveConfig {
-  return { ...effectiveOf({ claudeCliPath: process.execPath, codexCliPath: process.execPath }), ...overrides }
+  return { ...withTestDshRoutes(effectiveOf({ claudeCliPath: process.execPath, codexCliPath: process.execPath })), ...overrides }
 }
 
 /** A fake spawn that answers --version, git status, then a claude/codex transcript. */
@@ -67,6 +68,7 @@ function makeDeps(config: EffectiveConfig, spawnFn: ReturnType<typeof scriptedSp
       limiter: new Limiter(() => config.maxConcurrentTasks),
       controllers,
       pathCache: new CliPathCache(() => config, spawnFn),
+      resolveDshModel: resolveTestDshModel,
       spawnFn,
       logger: { warn: vi.fn(), error: vi.fn() },
     },
@@ -76,13 +78,6 @@ function makeDeps(config: EffectiveConfig, spawnFn: ReturnType<typeof scriptedSp
 }
 
 
-
-describe('subagent catalog row (A2)', () => {
-  it('builds the external row the session catalog expects', () => {
-    const row = externalCatalogRow('task-1', 'cli · 数据任务', 123)
-    expect(row).toMatchObject({ version: 2, childId: 'cli-task-1', childCreatedAt: 123, mode: 'external', label: 'cli · 数据任务' })
-  })
-})
 
 describe('git context injection (接缝①)', () => {
   it('folds a porcelain snapshot into a bounded prefix block', () => {
@@ -103,7 +98,7 @@ describe('git context injection (接缝①)', () => {
   it('runDispatch prepends the snapshot to the child task text only', async () => {
     const cli = collabCliSpawn()
     const config = fixture()
-    config.codex.dshModel = ''
+    config.codex.dshModel = 'test-codex::test-codex-model'
     const { deps } = makeDeps(config, cli.spawnFn)
     const value = await runDispatch(deps, { ...assessment, cli: 'codex', task: '数据处理任务正文' }, new AbortController().signal)
     expect(value.ok).toBe(true)
@@ -126,8 +121,11 @@ describe('resume (接缝④)', () => {
   it('continues a codex thread with `exec resume <id>` and notes the carry-over limit', async () => {
     const cli = collabCliSpawn()
     const config = fixture({ injectGitContext: false })
-    const { deps } = makeDeps(config, cli.spawnFn)
-    const value = await runDispatch(deps, { ...assessment, cli: 'codex', task: '继续刚才的任务', resume: 'thread-abc' }, new AbortController().signal)
+    const { deps, registry } = makeDeps(config, cli.spawnFn)
+    const anchor = registry.create({ id: 'resume-codex-root', cli: 'codex', title: '初轮', model: '', sessionId: 's-collab' })
+    anchor.stats = { sessionRef: 'thread-abc' }
+    registry.setPhase(anchor, 'done')
+    const value = await runDispatch(deps, { ...assessment, sessionId: 's-collab', cli: 'codex', task: '继续刚才的任务', resume: 'thread-abc' }, new AbortController().signal)
     expect(value.ok).toBe(true)
     const codexLaunch = cli.launches.find(child => child.spawnArgs[0] === 'exec' && child.spawnArgs[1] === 'resume')
     expect(codexLaunch?.spawnArgs).toContain('thread-abc')
@@ -137,8 +135,11 @@ describe('resume (接缝④)', () => {
   it('continues a claude session with --resume', async () => {
     const cli = collabCliSpawn()
     const config = fixture({ injectGitContext: false })
-    const { deps } = makeDeps(config, cli.spawnFn)
-    const value = await runDispatch(deps, { ...assessment, cli: 'claude', task: '继续', resume: 'sess-9' }, new AbortController().signal)
+    const { deps, registry } = makeDeps(config, cli.spawnFn)
+    const anchor = registry.create({ id: 'resume-claude-root', cli: 'claude', title: '初轮', model: '', sessionId: 's-collab' })
+    anchor.stats = { sessionRef: 'sess-9' }
+    registry.setPhase(anchor, 'done')
+    const value = await runDispatch(deps, { ...assessment, sessionId: 's-collab', cli: 'claude', task: '继续', resume: 'sess-9' }, new AbortController().signal)
     expect(value.ok).toBe(true)
     const claudeLaunch = cli.launches.find(child => child.spawnArgs.includes('--resume'))
     expect(claudeLaunch?.spawnArgs[claudeLaunch.spawnArgs.indexOf('--resume') + 1]).toBe('sess-9')

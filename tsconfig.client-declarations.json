@@ -1,0 +1,11 @@
+{
+  "extends": "./tsconfig.client.json",
+  "compilerOptions": {
+    "noEmit": false,
+    "declaration": true,
+    "emitDeclarationOnly": true,
+    "noEmitOnError": true,
+    "declarationMap": false
+  },
+  "include": ["src/client/index.ts"]
+}

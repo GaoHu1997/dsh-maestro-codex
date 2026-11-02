@@ -1,9 +1,11 @@
-import { describe, expect, it } from 'vitest'
+import { beforeEach, describe, expect, it, vi } from 'vitest'
+import { Session } from '@deepseek-ai/dsh-session'
 import type { MaestroTask } from '../src/task-registry.js'
 import {
   CLI_USAGE_EVENT,
   CLI_USAGE_PROJECTION_KEY,
   CLI_USAGE_RECENT_CAP,
+  clearCliUsageMirrors,
   EMPTY_CLI_USAGE,
   applyCliUsage,
   cliUsageProjectionDefinition,
@@ -55,12 +57,12 @@ describe('cliUsageRecordOf', () => {
     })
   })
 
-  it('treats missing or non-numeric stats as zero', () => {
+  it('preserves missing or non-numeric stats as unknown', () => {
     const record = cliUsageRecordOf(task({ stats: { inputTokens: 'many', outputTokens: 5 } }))
-    expect(record.inputTokens).toBe(0)
+    expect(record.inputTokens).toBeNull()
     expect(record.outputTokens).toBe(5)
-    expect(record.cachedInputTokens).toBe(0)
-    expect(record.cacheWriteTokens).toBe(0)
+    expect(record.cachedInputTokens).toBeNull()
+    expect(record.cacheWriteTokens).toBeNull()
   })
 
   it('stamps an unfinished record with the current time', () => {
@@ -70,14 +72,20 @@ describe('cliUsageRecordOf', () => {
   })
 })
 
+beforeEach(clearCliUsageMirrors)
+function visibleUsage(sessionId: string) {
+  const definition = cliUsageProjectionDefinition()
+  return definition.wire.view(definition.init({ id: sessionId }, 0))
+}
+
 describe('reportCliUsage', () => {
-  it('appends the usage event to the owning session', () => {
-    const appended: Array<{ type: string; data: unknown }> = []
-    const session = { append: (type: string, data: unknown) => { appended.push({ type, data }) } }
+  it('publishes the owning session mirror without appending private log events', () => {
+    const session = { id: 'session-1', append: vi.fn() }
     reportCliUsage(session, task())
-    expect(appended).toHaveLength(1)
-    expect(appended[0]?.type).toBe(CLI_USAGE_EVENT)
-    expect(appended[0]?.data).toMatchObject({ taskId: 'task-1', inputTokens: 120 })
+    expect(session.append).not.toHaveBeenCalled()
+    expect(visibleUsage('session-1').recent).toHaveLength(1)
+    expect(visibleUsage('session-1').recent[0]).toMatchObject({ taskId: 'task-1', inputTokens: 120 })
+    expect(visibleUsage('unrelated').recent).toHaveLength(0)
   })
 
   it('is a no-op without a session', () => {
@@ -93,11 +101,18 @@ describe('reportCliUsage', () => {
 })
 
 describe('sessionUsageAppendOf', () => {
-  it('binds append to the session object', () => {
-    const session = { seen: 0, append(this: { seen: number }) { this.seen += 1 } }
+  it('uses a stable plugin-owned sink and never calls Session.append', () => {
+    const session = Session.create('session-1')
+    const append = vi.spyOn(session, 'append')
     const handle = sessionUsageAppendOf(session)
-    handle?.append(CLI_USAGE_EVENT, {})
-    expect(session.seen).toBe(1)
+    handle?.append(CLI_USAGE_EVENT, cliUsageRecordOf(task()))
+    expect(append).not.toHaveBeenCalled()
+    expect(session.seq).toBe(0)
+    expect(sessionUsageAppendOf(session)).toBe(handle)
+    expect(sessionUsageAppendOf(handle)).toBe(handle)
+    expect(visibleUsage('session-1').totals.requests).toBe(1)
+    expect(() => handle?.append(CLI_USAGE_EVENT, cliUsageRecordOf(task({ sessionId: 'wrong-parent' })))).toThrow('does not own')
+    expect(visibleUsage('wrong-parent').totals.requests).toBe(0)
   })
 
   it('rejects non-session values', () => {
@@ -143,7 +158,7 @@ describe('cliUsageProjectionDefinition', () => {
   it('declares the projection key and a synchronous wire view', () => {
     const definition = cliUsageProjectionDefinition()
     expect(definition.key).toBe(CLI_USAGE_PROJECTION_KEY)
-    expect(definition.stateVersion).toBe(1)
+    expect(definition.stateVersion).toBe(3)
     const record: CliUsageRecord = cliUsageRecordOf(task())
     const state = definition.apply(definition.init(undefined, 0), { type: CLI_USAGE_EVENT, data: record })
     expect(definition.wire.viewSchema.parse(definition.wire.view(state))).toBe(state)

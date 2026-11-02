@@ -15,6 +15,7 @@
  */
 
 import type { DshModelEndpoint, DshModelInfo } from './dsh-models.js'
+import { publicEndpointUrl, transportDiagnostic } from './public-diagnostics.js'
 
 /** How long the probe may take before the dispatch stops waiting for it. */
 export const PREFLIGHT_TIMEOUT_MS = 8_000
@@ -79,53 +80,67 @@ export function probeRequest(endpoint: DshModelEndpoint): { url: string; init: R
   return { url: `${base}${path}`, init: { method: 'POST', headers, body: JSON.stringify(body) } }
 }
 
-/** Squash a response body into one short line (HTML pages included). */
-function snippet(text: string): string {
-  const flat = text.replace(/\s+/g, ' ').trim()
-  return flat.length === 0 ? '（空响应体）' : flat.length > 160 ? `${flat.slice(0, 160)}…` : flat
-}
-
 /** Turn one probe response into a verdict. */
 export function classifyProbe(endpoint: DshModelEndpoint, status: number, bodyText: string): DshPreflight {
   const label = `${endpoint.provider}::${endpoint.model}`
-  if (status >= 200 && status < 300) return { status: 'ok', detail: `预检通过：${label} 可服务` }
+  // Response bodies may echo credentials in arbitrary or encoded forms. They
+  // are used only for classification, never copied into agent-visible details.
+  if (status >= 200 && status < 300) {
+    let raw: unknown
+    try { raw = JSON.parse(bodyText) } catch { raw = undefined }
+    const response = typeof raw === 'object' && raw !== null && !Array.isArray(raw) ? raw as Record<string, unknown> : {}
+    const valid = endpoint.api === 'anthropic-messages' ? response['type'] === 'message' && Array.isArray(response['content'])
+      : endpoint.api === 'openai-responses' ? response['object'] === 'response' && Array.isArray(response['output'])
+        : Array.isArray(response['choices'])
+    return valid ? { status: 'ok', detail: `预检通过：${label} 可服务` }
+      : { status: 'unknown', detail: `模型预检 HTTP ${status} 响应不符合 ${endpoint.api} 协议，无法确认 ${label} 可用（仍尝试派发）` }
+  }
   if (status === 404) {
-    return { status: 'mismatch', detail: `模型预检失败：${endpoint.baseURL} 对 ${label} 返回 404（端点或模型不存在）` }
+    return { status: 'mismatch', detail: `模型预检失败：${publicEndpointUrl(endpoint.baseURL)} 对 ${label} 返回 404（端点或模型不存在）` }
   }
   if (status === 401 || status === 403) {
-    return { status: 'mismatch', detail: `模型预检失败：${label} 被端点拒绝鉴权（HTTP ${String(status)}：${snippet(bodyText)}）` }
+    return { status: 'mismatch', detail: `模型预检失败：${label} 被端点拒绝鉴权（HTTP ${String(status)}），请检查端点鉴权配置` }
   }
   if (MODEL_WORD.test(bodyText) && MISSING_WORD.test(bodyText)) {
-    return { status: 'mismatch', detail: `模型预检失败：端点不认这个模型 ${label}（HTTP ${String(status)}：${snippet(bodyText)}）` }
+    return { status: 'mismatch', detail: `模型预检失败：端点不认这个模型 ${label}（HTTP ${String(status)}）` }
   }
-  return { status: 'unknown', detail: `模型预检返回 HTTP ${String(status)}，无法判定 ${label} 是否可用（仍尝试派发：${snippet(bodyText)}）` }
+  return { status: 'unknown', detail: `模型预检返回 HTTP ${String(status)}，无法判定 ${label} 是否可用（仍尝试派发）` }
 }
 
 /**
  * Ask the endpoint to serve one token of this model.
  *
- * Never throws: any transport error becomes `unknown`, because a probe failure
- * is not evidence that the real run would fail.
+ * Transport failures become `unknown`; caller cancellation always propagates
+ * unchanged and must never authorize a CLI launch.
  */
 export async function probeDshEndpoint(
   endpoint: DshModelEndpoint,
-  options: { fetchImpl?: typeof fetch | undefined; timeoutMs?: number | undefined } = {},
+  options: { fetchImpl?: typeof fetch | undefined; timeoutMs?: number | undefined; cli?: 'codex' | 'claude' | undefined; signal?: AbortSignal | undefined } = {},
 ): Promise<DshPreflight> {
   const fetchImpl = options.fetchImpl ?? fetch
   const timeoutMs = options.timeoutMs ?? PREFLIGHT_TIMEOUT_MS
-  const { url, init } = probeRequest(endpoint)
+  const actualEndpoint: DshModelEndpoint = options.cli === 'codex' && endpoint.api === 'openai-completions'
+    ? { ...endpoint, api: 'openai-responses' } : endpoint
+  const { url, init } = probeRequest(actualEndpoint)
+  options.signal?.throwIfAborted()
   const controller = new AbortController()
+  const onAbort = (): void => controller.abort(options.signal?.reason)
+  options.signal?.addEventListener('abort', onAbort, { once: true })
   const timer = setTimeout(() => controller.abort(), timeoutMs)
   timer.unref?.()
   try {
     const response = await fetchImpl(url, { ...init, signal: controller.signal })
+    options.signal?.throwIfAborted()
     const text = await response.text().catch(() => '')
-    return classifyProbe(endpoint, response.status, text)
+    options.signal?.throwIfAborted()
+    return classifyProbe(actualEndpoint, response.status, text)
   } catch (error) {
-    const reason = error instanceof Error ? error.message : String(error)
+    options.signal?.throwIfAborted()
+    const reason = transportDiagnostic(error)
     return { status: 'unknown', detail: `模型预检无法连通 ${endpoint.provider}::${endpoint.model}（${reason}），仍尝试派发` }
   } finally {
     clearTimeout(timer)
+    options.signal?.removeEventListener('abort', onAbort)
   }
 }
 
@@ -133,7 +148,7 @@ export async function probeDshEndpoint(
 export async function preflightDshModel(
   endpoint: DshModelEndpoint,
   declared: readonly DshModelInfo[],
-  options: { fetchImpl?: typeof fetch | undefined; timeoutMs?: number | undefined } = {},
+  options: { fetchImpl?: typeof fetch | undefined; timeoutMs?: number | undefined; cli?: 'codex' | 'claude' | undefined; signal?: AbortSignal | undefined } = {},
 ): Promise<DshPreflight> {
   const note = declaredModelProblem(endpoint, declared)
   const verdict = await probeDshEndpoint(endpoint, options)

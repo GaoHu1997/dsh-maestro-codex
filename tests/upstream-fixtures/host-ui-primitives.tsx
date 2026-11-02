@@ -22,6 +22,26 @@ export function TerminalBlock(props: { command: string; output?: string }) {
   return <pre data-host-terminal={props.command}>{props.output}</pre>
 }
 export function useDismissOnOutsidePointer(): void {}
+/** MarkdownText 测试替身：正文直出（宿主 0.2 的排版管线在真实环境接管）。 */
+export function MarkdownText({ text, labels, variant }: { text: string; labels?: unknown; variant?: string }) {
+  void labels
+  return <div data-host-markdown={variant ?? 'body'}>{text}</div>
+}
+/** DisclosureRow 测试替身：summary/details 语义，props 与宿主同形。 */
+export function DisclosureRow({ icon, title, open, expandable, onToggle, expandOnRowClick, collapsedContent, children }: {
+  icon?: ReactNode; title: string; open: boolean; expandable: boolean; onToggle: () => void
+  expandOnRowClick?: boolean; collapsedContent?: ReactNode; children?: ReactNode
+}) {
+  return (
+    <div data-host-disclosure={open ? 'open' : 'closed'} data-host-disclosure-expandable={expandable}>
+      <div role="button" data-host-disclosure-title onClick={expandOnRowClick ? onToggle : undefined}>
+        {icon}{title}
+        {collapsedContent}
+      </div>
+      {open ? children : null}
+    </div>
+  )
+}
 const icon = (name: string) => (props: { size?: number }) => <svg aria-hidden="true" data-host-icon={name} width={props.size} height={props.size} />
 export const IconRefreshOutlineRegular = icon('refresh')
 export const IconChevronDownOutlineRegular = icon('chevron-down')

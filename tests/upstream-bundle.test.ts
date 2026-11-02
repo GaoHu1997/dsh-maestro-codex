@@ -21,6 +21,9 @@ beforeAll(async () => {
   await build({
     ...clientConfig,
     config: false,
+    // This fixture covers runtime CSS/shared React, not the production API DTS.
+    // The real client entry and packaged declarations have a separate build test.
+    dts: false,
     entry: { upstream: 'src/client/board/upstream/index.ts' },
     outDir: directory,
     tsconfig: 'tsconfig.client.json',

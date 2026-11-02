@@ -1,13 +1,65 @@
 import { readFileSync, statSync, unlinkSync } from 'node:fs'
 import { describe, expect, it } from 'vitest'
-import { claudeArgs, claudeEnv, claudeFrameEvents, claudeMcpArgs, claudePermissionArgs, claudeResultOf, lastLines, runClaudeTask, writeClaudeSettingsFile } from '../src/channels/claude.js'
+import { claudeArgs, claudeEnv, claudeFrameEvents, claudeMcpArgs, claudePermissionArgs, claudeResultOf, lastLines, mergeLiveUsage, runClaudeTask, writeClaudeSettingsFile } from '../src/channels/claude.js'
 import { codexArgs, codexDshModelArgs, codexEnv, codexFrameEvents, codexSandboxArgs, codexWindowsSandboxArgs, codexUsageStats, runCodexTask, tomlString } from '../src/channels/codex.js'
 import { scriptedSpawn } from './fake-child.js'
 
 describe('channel usage normalization', () => {
+  it.each([undefined, null, NaN, Infinity, -1])('keeps Codex cache %s unavailable rather than inventing uncached input', cached => {
+    const stats = codexUsageStats({ usage: { input_tokens: 100, output_tokens: 9,
+      ...(cached === undefined ? {} : { cached_input_tokens: cached as number }),
+    } })
+    expect(stats).toEqual({ reportedInputTokens: 100, outputTokens: 9, usageInputSemantics: 'includes-cache' })
+    expect(stats).not.toHaveProperty('inputTokens')
+    expect(stats).not.toHaveProperty('cachedInputTokens')
+  })
+
+  it('uses measured zero cache and keeps cache writes separate without inventing them', () => {
+    expect(codexUsageStats({ usage: { input_tokens: 100, cached_input_tokens: 0, cache_write_input_tokens: 3 } }))
+      .toEqual({ inputTokens: 97, cachedInputTokens: 0, cacheWriteTokens: 3, usageInputSemantics: 'uncached' })
+    expect(codexUsageStats({ usage: { input_tokens: 0, cached_input_tokens: 0 } }))
+      .toEqual({ inputTokens: 0, cachedInputTokens: 0, usageInputSemantics: 'uncached' })
+    expect(codexUsageStats({ usage: { input_tokens: 0 } }))
+      .toEqual({ reportedInputTokens: 0, usageInputSemantics: 'includes-cache' })
+    expect(codexUsageStats({ usage: { cached_input_tokens: 7, cache_write_input_tokens: 3, output_tokens: 9 } }))
+      .toEqual({ cachedInputTokens: 7, cacheWriteTokens: 3, outputTokens: 9 })
+  })
+
+  it('labels authoritative Claude live and final input as uncached without subtracting read/write caches', () => {
+    const usage = { input_tokens: 11, output_tokens: 7, cache_read_input_tokens: 5, cache_creation_input_tokens: 3 }
+    const expected = { inputTokens: 11, outputTokens: 7, cachedInputTokens: 5, cacheWriteTokens: 3, usageInputSemantics: 'uncached' }
+    expect(mergeLiveUsage({}, usage, 'assistant')).toEqual(expected)
+    expect(mergeLiveUsage({}, usage, 'result')).toEqual(expected)
+    expect(claudeResultOf({ usage }).stats).toEqual(expected)
+    expect(claudeResultOf({ usage: { input_tokens: 0 } }).stats).toEqual({ inputTokens: 0, usageInputSemantics: 'uncached' })
+  })
+
+  it.each([undefined, NaN, Infinity, -1])('does not manufacture Claude input or a semantics label from %s', input => {
+    const usage = { output_tokens: 9, cache_creation_input_tokens: 3, ...(input === undefined ? {} : { input_tokens: input }) }
+    const expected = { outputTokens: 9, cacheWriteTokens: 3 }
+    expect(mergeLiveUsage({}, usage, 'assistant')).toEqual(expected)
+    expect(claudeResultOf({ usage }).stats).toEqual(expected)
+  })
+
+  it('preserves unknown-cache semantics in live and settled Codex stats', async () => {
+    const { spawnFn } = scriptedSpawn(child => {
+      child.finish([
+        JSON.stringify({ type: 'item.completed', item: { type: 'agent_message', text: 'done' } }),
+        JSON.stringify({ type: 'turn.completed', usage: { input_tokens: 100, output_tokens: 9 } }),
+      ].join('\n'))
+    })
+    const seen: Record<string, string | number | boolean>[] = []
+    const result = await runCodexTask({ spawnFn, codexPath: 'fake', task: 'task', cwd: undefined, model: '', sandbox: 'read-only',
+      timeoutMs: 5000, signal: new AbortController().signal, baseUrl: '', apiKey: '', onEvent: () => {}, onUsage: stats => { seen.push(stats) } })
+    expect(result.ok).toBe(true)
+    expect(result.stats).toMatchObject({ reportedInputTokens: 100, outputTokens: 9, usageInputSemantics: 'includes-cache' })
+    expect(seen).toEqual([{ reportedInputTokens: 100, outputTokens: 9, usageInputSemantics: 'includes-cache' }])
+    expect(result.stats).not.toHaveProperty('inputTokens')
+  })
+
   it('keeps Codex inclusive input and cache reads mutually exclusive', () => {
     expect(codexUsageStats({ usage: { input_tokens: 100, cached_input_tokens: 70, output_tokens: 9 } }))
-      .toEqual({ inputTokens: 30, cachedInputTokens: 70, outputTokens: 9 })
+      .toEqual({ inputTokens: 30, cachedInputTokens: 70, outputTokens: 9, usageInputSemantics: 'uncached' })
     expect(codexUsageStats({ usage: { output_tokens: 9 } })).toEqual({ outputTokens: 9 })
     expect(codexUsageStats({})).toEqual({})
   })
@@ -15,7 +67,7 @@ describe('channel usage normalization', () => {
   it('keeps real Claude usage even on an error result', () => {
     expect(claudeResultOf({ type: 'result', is_error: true, usage: {
       input_tokens: 11, output_tokens: 7, cache_read_input_tokens: 5, cache_creation_input_tokens: 3,
-    } }).stats).toEqual({ inputTokens: 11, outputTokens: 7, cachedInputTokens: 5, cacheWriteTokens: 3 })
+    } }).stats).toEqual({ inputTokens: 11, outputTokens: 7, cachedInputTokens: 5, cacheWriteTokens: 3, usageInputSemantics: 'uncached' })
   })
 })
 
@@ -95,10 +147,14 @@ describe('claude frame parsing', () => {
     expect(init[0]?.text).toContain('m')
 
     const assistant = claudeFrameEvents({ type: 'assistant', message: { content: [
+      { type: 'thinking', thinking: '先找入口文件' },
       { type: 'text', text: '正在分析' },
-      { type: 'tool_use', name: 'Read' },
+      { type: 'tool_use', name: 'Read', input: { file_path: 'src/a.ts' } },
     ] } })
-    expect(assistant.map(event => event.kind)).toEqual(['text', 'note'])
+    expect(assistant.map(event => event.kind)).toEqual(['thinking', 'text', 'tool'])
+    expect(assistant[0]?.text).toBe('先找入口文件')
+    expect(assistant[2]?.text).toBe('Read')
+    expect(assistant[2]?.detail).toContain('src/a.ts')
 
     const result = claudeFrameEvents({ type: 'result', subtype: 'success' })
     expect(result[0]?.text).toBe('运行完成')
@@ -151,9 +207,15 @@ describe('runClaudeTask (fake spawn)', () => {
       const index = child.spawnArgs.indexOf('--settings')
       expect(index).toBeGreaterThan(-1)
       settingsPath = child.spawnArgs[index + 1] ?? ''
-      // The file must exist while the CLI runs, carrying the pinned env.
+      // The file must exist while the CLI runs, carrying the pinned env. Repo
+      // memories are shared between host and CLI, so the run also disables the
+      // CLI auto-memory write path.
       expect(JSON.parse(readFileSync(settingsPath, 'utf8'))).toEqual({
-        env: { ANTHROPIC_BASE_URL: 'https://gw.example.com', ANTHROPIC_AUTH_TOKEN: 'sk-1' },
+        env: {
+          ANTHROPIC_BASE_URL: 'https://gw.example.com',
+          ANTHROPIC_AUTH_TOKEN: 'sk-1',
+          CLAUDE_CODE_DISABLE_AUTO_MEMORY: '1',
+        },
       })
       child.finish(JSON.stringify({ type: 'result', subtype: 'success', result: 'done' }))
     })
@@ -295,6 +357,8 @@ describe('codex argv/env', () => {
     const args = codexArgs('cli-model', 'workspace-write', [], { model: 'group/deepseek-v4.1-flash', baseUrl: 'https://gw/v1' })
     expect(args).toEqual([
       'exec', '--json', '--skip-git-repo-check', '--ignore-user-config',
+      ...codexWindowsSandboxArgs(),
+      '--sandbox', 'workspace-write',
       '-c', 'model="group/deepseek-v4.1-flash"',
       '-c', 'model_provider=maestro_dsh',
       '-c', 'model_providers.maestro_dsh.name="dsh-maestro"',
@@ -303,10 +367,6 @@ describe('codex argv/env', () => {
       // codex ≥0.146 refuses `wire_api="chat"` at config-parse time, so the dsh
       // provider is always injected over the responses dialect.
       '-c', 'model_providers.maestro_dsh.wire_api="responses"',
-      // `--ignore-user-config` drops the operator's `[windows] sandbox` too, and
-      // without it codex refuses every exec_command on Windows — re-stated here.
-      ...codexWindowsSandboxArgs(),
-      '--sandbox', 'workspace-write',
       '-',
     ])
     expect(codexDshModelArgs('m', 'https://x').envKey).toBe('MAESTRO_DSH_PROVIDER_KEY')
@@ -348,14 +408,18 @@ describe('codex frame parsing', () => {
   })
   it('labels command starts and emits the final aggregate only once', () => {
     const item = { type: 'command_execution', command: 'echo hi', aggregated_output: 'hi\n', exit_code: 0, status: 'completed' }
-    expect(codexFrameEvents({ type: 'item.started', item })[0]?.text).toContain('(started)')
+    const started = codexFrameEvents({ type: 'item.started', item })[0]
+    expect(started?.text).toBe('echo hi')
+    expect(started?.detail).toContain('started')
     expect(codexFrameEvents({ type: 'item.updated', item })).toEqual([])
     const events = codexFrameEvents({ type: 'item.completed', item })
     expect(events).toHaveLength(1)
-    expect(events[0]?.kind).toBe('note')
-    expect(events[0]?.text).toContain('命令完成')
-    expect(events[0]?.text).toContain('退出码 0')
-    expect(events[0]?.text).toContain('hi\n')
+    // 命令行进折叠行：text = 命令，detail = 状态摘要 + 输出。
+    expect(events[0]?.kind).toBe('tool')
+    expect(events[0]?.text).toBe('echo hi')
+    expect(events[0]?.detail).toContain('命令完成')
+    expect(events[0]?.detail).toContain('退出码 0')
+    expect(events[0]?.detail).toContain('hi\n')
   })
 
   it.each([
@@ -363,13 +427,13 @@ describe('codex frame parsing', () => {
     { exit_code: 2, status: 'failed' },
     { exit_code: null, status: 'failed' },
     { exit_code: null, status: 'declined' },
-  ])('classifies an actual failed/declined command as an error: %j', result => {
+  ])('carries an actual failed/declined command as a failed tool row: %j', result => {
     const event = codexFrameEvents({ type: 'item.completed', item: {
       type: 'command_execution', command: 'build', aggregated_output: 'build failed: missing input', ...result,
     } })[0]
-    expect(event?.kind).toBe('error')
-    expect(event?.text).toContain('命令失败')
-    expect(event?.text).toContain('build failed: missing input')
+    expect(event?.kind).toBe('tool')
+    expect(event?.detail).toContain('命令失败')
+    expect(event?.detail).toContain('build failed: missing input')
   })
 
   it('does not classify successful ACL diagnostics or output keywords as failures', () => {
@@ -377,20 +441,49 @@ describe('codex frame parsing', () => {
       const event = codexFrameEvents({ type: 'item.completed', item: {
         type: 'command_execution', command, exit_code: 0, status: 'completed', aggregated_output: 'error count: 0\nOwner: test\n',
       } })[0]
-      expect(event?.kind).toBe('note')
-      expect(event?.text).toContain('Owner: test')
+      expect(event?.kind).toBe('tool')
+      expect(event?.detail).toContain('Owner: test')
     }
-    expect(codexFrameEvents({ type: 'item.completed', item: { type: 'command_execution', command: 'diagnose', exit_code: 0, status: 'failed' } })[0]?.kind).toBe('note')
+    expect(codexFrameEvents({ type: 'item.completed', item: { type: 'command_execution', command: 'diagnose', exit_code: 0, status: 'failed' } })[0]?.kind).toBe('tool')
   })
 
   it('bounds large command previews while preserving the head and diagnostic tail', () => {
     const event = codexFrameEvents({ type: 'item.completed', item: {
       type: 'command_execution', command: 'build', exit_code: 1, aggregated_output: `HEAD\n${'x'.repeat(10_000)}\nROOT CAUSE`,
     } })[0]
-    expect(event?.text.length).toBeLessThan(6200)
-    expect(event?.text).toContain('HEAD')
-    expect(event?.text).toContain('省略')
-    expect(event?.text).toContain('ROOT CAUSE')
+    expect(event?.detail?.length).toBeLessThan(6200)
+    expect(event?.detail).toContain('HEAD')
+    expect(event?.detail).toContain('省略')
+    expect(event?.detail).toContain('ROOT CAUSE')
+  })
+
+  it('reads the standard Codex exec reasoning.text without losing public summaries', () => {
+    const item = { type: 'reasoning', text: '公开摘要首行\n公开摘要完整内容' }
+    expect(codexFrameEvents({ type: 'item.completed', item })).toEqual([{ kind: 'thinking', text: item.text }])
+    expect(codexFrameEvents({ type: 'item.started', item })).toEqual([])
+    expect(codexFrameEvents({ type: 'item.updated', item })).toEqual([])
+    expect(codexFrameEvents({ type: 'item.completed', item: { ...item, text: '  ' } })).toEqual([])
+  })
+
+  it('prefers standard reasoning text and falls back to compatible summary/content arrays', () => {
+    expect(codexFrameEvents({ type: 'item.completed', item: { type: 'reasoning', text: '标准摘要', summary: [{ text: '兼容摘要' }] } }))
+      .toEqual([{ kind: 'thinking', text: '标准摘要' }])
+    expect(codexFrameEvents({ type: 'item.completed', item: { type: 'reasoning', text: ' ', content: [{ text: '兼容公开内容' }] } }))
+      .toEqual([{ kind: 'thinking', text: '兼容公开内容' }])
+    expect(codexFrameEvents({ type: 'item.completed', item: { type: 'reasoning', text: 42, summary: null, content: [] } } as unknown as Parameters<typeof codexFrameEvents>[0]))
+      .toEqual([])
+    // Public assistant prose is not private reasoning, regardless of keywords.
+    expect(codexFrameEvents({ type: 'item.completed', item: { type: 'agent_message', text: '正在分析，下一步请运行测试。' } }))
+      .toEqual([{ kind: 'text', text: '正在分析，下一步请运行测试。' }])
+  })
+
+  it('turns codex reasoning summaries into thinking events', () => {
+    const reasoning = codexFrameEvents({ type: 'item.completed', item: {
+      type: 'reasoning', summary: [{ type: 'summary_text', text: '先检查配置文件' }],
+    } })
+    expect(reasoning).toEqual([{ kind: 'thinking', text: '先检查配置文件' }])
+    // started/updated 阶段的空思考不发事件。
+    expect(codexFrameEvents({ type: 'item.started', item: { type: 'reasoning' } })).toEqual([])
   })
 
   it('reads canonical top-level and item errors without truncating their messages', () => {
@@ -409,12 +502,12 @@ describe('codex frame parsing', () => {
 })
 
 async function fakeCodexRun(frames: Array<Parameters<typeof codexFrameEvents>[0]>, code = 0, stderr = '') {
-  const events: Array<{ kind: 'text' | 'note' | 'error'; text: string }> = []
+  const events: Array<{ kind: string; text: string; detail?: string }> = []
   const { spawnFn } = scriptedSpawn(child => { child.finish(frames.map(frame => JSON.stringify(frame)).join('\n'), code, stderr) })
   const result = await runCodexTask({
     spawnFn, codexPath: 'codex', task: '任务', cwd: undefined, model: '', sandbox: 'workspace-write',
     baseUrl: '', apiKey: '', timeoutMs: 10_000, signal: new AbortController().signal,
-    onEvent: (kind, text) => { events.push({ kind, text }) },
+    onEvent: (kind, text, detail) => { events.push(detail === undefined ? { kind, text } : { kind, text, detail }) },
   })
   return { result, events }
 }
@@ -511,9 +604,10 @@ describe('runCodexTask (fake spawn)', () => {
     ])
     expect(result.ok).toBe(true)
     expect(result.error).toBeUndefined()
-    expect(events.filter(event => event.text.includes('build failed'))).toHaveLength(1)
+    // 失败命令现在是 tool 折叠行，诊断在 detail 里。
+    expect(events.filter(event => event.detail?.includes('build failed'))).toHaveLength(1)
     expect(events.some(event => event.kind === 'error' && event.text.includes('recoverable warning'))).toBe(true)
-    expect(events.some(event => event.text.includes('partial'))).toBe(false)
+    expect(events.some(event => event.detail?.includes('partial'))).toBe(false)
   })
 
   it.each([
@@ -571,7 +665,9 @@ describe('runCodexTask (fake spawn)', () => {
     expect(result.error).toContain('turn failure detail')
     expect(result.error).toContain('进程退出码 1')
     expect(result.error).toContain('line one\nline two\nline three\nline four\nline five')
-    expect(events.find(event => event.text.startsWith('命令失败'))?.text).not.toContain('CAUSE IN OMITTED MIDDLE')
+    const failedRow = events.find(event => event.detail?.startsWith('命令失败'))
+    expect(failedRow?.text).toBe('build')
+    expect(failedRow?.detail).not.toContain('CAUSE IN OMITTED MIDDLE')
   })
 
   it('retains exit-0 stderr diagnostics when the CLI gives no answer', async () => {
@@ -605,11 +701,11 @@ describe('runCodexTask (fake spawn)', () => {
 
   it('does not report success if cancellation races with a child that already exited 0', async () => {
     const controller = new AbortController()
-    controller.abort()
     const { spawnFn } = scriptedSpawn(child => {
       // The child has already exited, so killTree returns without invoking any
       // OS process killer. Stdout/close delivery is still queued by the fake.
       child.exitCode = 0
+      controller.abort()
       child.finish(JSON.stringify({ type: 'item.completed', item: { type: 'agent_message', text: 'answer' } }))
     })
     const result = await runCodexTask({

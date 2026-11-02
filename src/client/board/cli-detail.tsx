@@ -1,29 +1,53 @@
 /** CLI-only content; native agents and jobs use their original upstream panes. */
-import { useEffect, useRef, useState, type ReactNode } from 'react'
-import { Button, IconCodeOutlineRegular, StateDot, Switch, Tag } from '@deepseek-ai/dsh-client-ui-primitives'
-import { CLI_LABELS, cleanLogText, type MaestroTaskEvent, type MaestroTaskSummary } from '../../wire.js'
-import { type BoardCliDetailState } from './data.js'
-import { formatClock, formatDuration, taskCancellable, taskDuration, tokenSummary, type BoardNode } from './model.js'
-import { FloatingWindow } from './upstream/index.js'
+import { useState, type ReactNode } from 'react'
+import { Button, IconCodeOutlineRegular, IconRightUpOutlineRegular, StateDot, type StateDotState } from '@deepseek-ai/dsh-client-ui-primitives'
+import type { MaestroTaskSummary } from '../../wire.js'
+import { taskCancellable, taskDuration, type BoardNode, type BoardTokenUsage } from './model.js'
+import { formatJobDuration, t } from './upstream/index.js'
+import { chatT } from './upstream/client/locales.js'
+import { totalTokens } from './upstream/client/session-metrics.js'
+import { formatTokens } from './upstream/client/sidechat-transcript.js'
 import css from './upstream/client/tasks-graph.module.css'
 
-const PHASE_LABELS: Record<MaestroTaskSummary['phase'], string> = {
-  queued: '排队中', running: '运行中', done: '已完成', failed: '失败', timeout: '超时', cancelled: '已取消',
+/**
+ * 与原生子代理详情（AgentNodePopover）同一套字段：状态 / Token 用量 / 耗时。
+ * CLI 自己的模型、开始、结束、退出码和 CLI 标识都不进来——节点卡片上的
+ * executor 徽标已经标识了 CLI，多出的字段正是「详情不一致」的来源。
+ */
+function phaseWord(phase: MaestroTaskSummary['phase']): string {
+  switch (phase) {
+    case 'queued': return '排队中'
+    case 'running': return t('tasksStateRunning')
+    case 'done': return t('tasksStateDone')
+    case 'failed':
+    case 'timeout': return t('tasksStateError')
+    case 'cancelled': return '已取消'
+    case 'interrupted': return '已中断'
+  }
 }
-function CliFacts(props: { node: BoardNode; now: number }): ReactNode {
-  const task = props.node.task
-  if (task === undefined) return null
-  const facts = [
-    ['状态', PHASE_LABELS[task.phase]], ['CLI', CLI_LABELS[task.cli]],
-    ['模型', task.model === '' ? '默认模型' : task.model], ['开始', formatClock(task.startedAt)],
-    ['耗时', formatDuration(taskDuration(task, props.now))],
-    ...(task.endedAt === undefined ? [] : [['结束', formatClock(task.endedAt)]]),
-    ...(task.exitCode === undefined ? [] : [['退出码', String(task.exitCode)]]),
-    ['Token 用量', tokenSummary(props.node.tokens) ?? (task.usage !== undefined ? '0 tok' : taskCancellable(task) ? '尚未收到用量' : '未采集（不代表零消耗）')],
+function phaseDot(phase: MaestroTaskSummary['phase']): StateDotState {
+  switch (phase) {
+    case 'queued':
+    case 'running': return 'ongoing'
+    case 'done': return 'done'
+    case 'failed':
+    case 'timeout': return 'error'
+    case 'cancelled':
+    case 'interrupted': return 'idle'
+  }
+}
+/** Token 行的悬停提示：宿主用量弹窗自己的四个桶（不可用就不加提示）。 */
+function usageTip(usage: BoardTokenUsage): string | undefined {
+  const buckets: [string | undefined, number][] = [
+    [chatT('message.turnUsage.input'), usage.uncachedInputTokens],
+    [chatT('message.turnUsage.cacheRead'), usage.cacheReadTokens],
+    [chatT('message.turnUsage.cacheWrite'), usage.cacheWriteTokens],
+    [chatT('message.turnUsage.output'), usage.outputTokens],
   ]
-  return <dl className={css.popRows}>{facts.map(([label, value]) => <span key={label} style={{ display: 'contents' }}>
-    <dt className={css.popKey}>{label}</dt><dd className={css.popValue} title={value}>{value}</dd>
-  </span>)}</dl>
+  const parts = buckets
+    .filter(([label]) => label !== undefined)
+    .map(([label, count]) => `${label ?? ''} ${formatTokens(count)}`)
+  return parts.length === 0 ? undefined : parts.join(' · ')
 }
 function CancelCli(props: { task: MaestroTaskSummary; onCancel: () => Promise<string | undefined> }): ReactNode {
   const [pending, setPending] = useState(false)
@@ -40,74 +64,48 @@ function CancelCli(props: { task: MaestroTaskSummary; onCancel: () => Promise<st
   </>
 }
 export function CliNodePopover(props: {
-  node: BoardNode; now: number; onOutput: () => void; onCancel: () => Promise<string | undefined>;
+  node: BoardNode; now: number; onCancel: () => Promise<string | undefined>;
   /** 打开这个 CLI 任务的会话页（气泡转录 + 续发消息，盖在看板之上）。 */
-  onOpenSession?: () => void
+  onOpenSession: () => void
 }): ReactNode {
   const task = props.node.task
   if (task === undefined) return null
+  const usage = props.node.tokens
+  const tip = usage === undefined ? undefined : usageTip(usage)
   return <div className={css.popCard} data-cli-detail={task.id}>
-    <div className={css.popHead}><span>CLI 子代理详情</span><Tag tone="quiet">{CLI_LABELS[task.cli]}</Tag></div>
+    <div className={css.popHead}><span>{t('tasksNodeDetail')}</span></div>
     <div className={css.popTitleRow}><span className={css.popGlyph}><IconCodeOutlineRegular size={14} /></span>
       <span className={css.popTitle} title={task.title}>{task.title}</span></div>
-    <CliFacts node={props.node} now={props.now} />
+    {props.node.subtitle === undefined ? null : (
+      <div className={css.popActivityBlock} data-node-activity>
+        <span className={css.popHint} title={props.node.subtitle}>{props.node.subtitle}</span>
+      </div>
+    )}
+    <dl className={css.popRows}>
+      <span style={{ display: 'contents' }}>
+        <dt className={css.popKey}>{t('tasksNodeState')}</dt>
+        <dd className={css.popValue}><StateDot state={phaseDot(task.phase)} size={6} /> {phaseWord(task.phase)}</dd>
+      </span>
+      {usage === undefined ? null : <span style={{ display: 'contents' }}>
+        <dt className={css.popKey}>{t('tasksNodeTokens')}</dt>
+        <dd className={css.popValue} {...(tip === undefined ? {} : { title: tip })}>{formatTokens(totalTokens(usage))}</dd>
+      </span>}
+      <span style={{ display: 'contents' }}>
+        <dt className={css.popKey}>{t('tasksNodeDuration')}</dt>
+        <dd className={css.popValue}>{formatJobDuration(taskDuration(task, props.now), t)}</dd>
+      </span>
+    </dl>
     {task.truncated === true ? <span className={css.popHint}>较早输出已截断</span> : null}
-    <div className={css.popActions}>
-      {/* CLI 子代理没有本地 DSH 会话，「查看会话」进插件的会话页（对话式转录 +
-        续发输入框）；「查看转录」保留原始日志窗，快速排错用。 */}
-      {props.onOpenSession === undefined ? null
-        : <Button variant="primary" size="sm" onClick={props.onOpenSession}>查看会话</Button>}
-      <Button variant={props.onOpenSession === undefined ? 'primary' : 'outline'} size="sm" onClick={props.onOutput}>查看转录</Button>
+    {/* 与原生子代理详情同一个动作行（popFoot：hairline 之上，主按钮撑满
+      整行）；此处曾写错成不存在的 popActions，按钮就缩成自然宽度了。 */}
+    <div className={css.popFoot}>
+      {/* 「查看会话」与 dsh 子代理同一条侧边通道：进右栏的 CLI 会话 tab
+        （气泡转录 + Markdown + 续发输入框，见 session-tab.tsx）；宿主没有
+        那个面时 Board 才回落面板内覆盖层。原始日志同页可见（note/error/
+        最终结果都有），不再单设「查看转录」窗。按钮图标与 dsh 跳转一致
+        （↗ 右上箭头 = 在侧边另开）。 */}
+      <Button variant="primary" size="sm" icon={<IconRightUpOutlineRegular size={12} />} onClick={props.onOpenSession}>{t('tasksNodeJump')}</Button>
       <CancelCli task={task} onCancel={props.onCancel} />
     </div>
   </div>
-}
-/** Consecutive chunks are messages, but phase/error/result boundaries stay intact. */
-export function cliTranscriptItems(events: readonly MaestroTaskEvent[]): MaestroTaskEvent[] {
-  const items: MaestroTaskEvent[] = []
-  for (const event of events) {
-    const text = cleanLogText(event.text)
-    if (text === '') continue
-    const previous = items.at(-1)
-    if (previous !== undefined && previous.kind === event.kind && (event.kind === 'text' || event.kind === 'note')) {
-      items[items.length - 1] = { ...previous, text: `${previous.text}\n${text}` }
-    } else items.push({ ...event, text })
-  }
-  return items
-}
-export function CliOutputWindow(props: {
-  node: BoardNode; now: number; detail: BoardCliDetailState; anchor: HTMLElement;
-  onClose: () => void; onCancel: () => Promise<string | undefined>
-}): ReactNode {
-  const task = props.detail.summary ?? props.node.task
-  const bodyRef = useRef<HTMLDivElement>(null)
-  const [follow, setFollow] = useState(true)
-  const events = cliTranscriptItems(props.detail.events)
-  const lastSeq = props.detail.events.at(-1)?.seq
-  useEffect(() => {
-    if (follow && bodyRef.current !== null) bodyRef.current.scrollTop = bodyRef.current.scrollHeight
-  }, [follow, lastSeq, props.detail.finalText])
-  if (task === undefined) return null
-  return <FloatingWindow title={`转录 · ${CLI_LABELS[task.cli]} · ${task.title}`} anchor={props.anchor}
-    onClose={props.onClose} bodyRef={bodyRef}
-    footer={<><Switch checked={follow} onChange={setFollow} label="跟随最新输出" />
-      <CancelCli task={task} onCancel={props.onCancel} /></>}>
-    <CliFacts node={{ ...props.node, task }} now={props.now} />
-    {props.detail.cwd === undefined ? null : <dl className={css.popRows}>
-      <dt className={css.popKey}>工作目录</dt><dd className={css.popValue} title={props.detail.cwd}>{props.detail.cwd}</dd>
-    </dl>}
-    {props.detail.error === undefined ? null : <p className={css.popHint} role="alert">{props.detail.error}</p>}
-    {props.detail.failure === undefined ? null : <p className={css.popHint} role="alert">{props.detail.failure}</p>}
-    {task.truncated === true ? <p className={css.popHint}>较早输出已截断</p> : null}
-    {events.length === 0 && !props.detail.finalText ? <p className={css.popHint}>{taskCancellable(task) ? '等待 CLI 输出…' : '没有输出'}</p> : null}
-    {events.map(event => <div className={css.popSection} key={event.seq} data-cli-event={event.kind}>
-      <div className={css.popGroup}>{event.kind === 'result' ? '最终结果' : event.kind === 'error' ? '错误' : PHASE_LABELS[task.phase]} · {formatClock(event.at)}</div>
-      <pre className={css.popHint} style={{ whiteSpace: 'pre-wrap', overflowWrap: 'anywhere', margin: 0 }}>{event.text}</pre>
-    </div>)}
-    {props.detail.finalText && !events.some(event => event.kind === 'result' && event.text === props.detail.finalText) ? <div className={css.popSection} data-cli-final-result>
-      <div className={css.popGroup}>最终结果</div>
-      <pre className={css.popHint} style={{ whiteSpace: 'pre-wrap', overflowWrap: 'anywhere', margin: 0 }}>{cleanLogText(props.detail.finalText)}</pre>
-    </div> : null}
-    {taskCancellable(task) ? <StateDot state="ongoing" size={6} /> : null}
-  </FloatingWindow>
 }

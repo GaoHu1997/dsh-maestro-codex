@@ -294,27 +294,27 @@ function jobRow(ownerSessionId: string, overrides: Partial<BoardJob> = {}): Boar
 }
 
 describe('attachRows', () => {
-  it.each(['task-1', 'cli-task-1'])('replaces owner-local external mirror %s with one CLI row', mirrorId => {
+  it('replaces the native record session mirror with one CLI row', () => {
+    // 原生记录会话：catalog 行（continuable，真会话同 id）——节点仍被折叠进
+    // 富信息的 CLI 行，cli- 前缀 + 目录 id 命中即视作本插件的镜像。
     const base = buildSessionTree({
       rootId: 'root', sessions,
-      catalogs: { review: [{ id: mirrorId, createdAt: 1, mode: 'external', label: 'CLI mirror' }] },
+      catalogs: { review: [{ id: 'cli-task-1', createdAt: 1, mode: 'continuable', label: 'CLI mirror' }] },
     })
     const root = attachRows(base, { tasks: [cliTask({ sessionId: 'review' })] })
     const review = root.children.find(child => child.id === 'review')
     expect(review?.children.map(child => child.id)).toEqual(['deep', `${CLI_NODE_PREFIX}task-1`])
-    expect(base.children.find(child => child.id === 'review')?.children.some(child => child.id === mirrorId)).toBe(true)
   })
 
-  it('preserves local sessions and non-external rows even if their ids match a task', () => {
+  it('preserves non-cli sessions whose ids match legacy bare-task mirrors', () => {
     const base = tree()
     const prototype = base.children.find(child => child.id === 'docs')
     if (prototype === undefined) throw new Error('Missing local session fixture')
-    const local = { ...prototype, id: 'cli-task-1', mode: 'external' as const, hasSession: true }
-    const otherMode = { ...prototype, id: 'task-1', mode: 'one-shot' as const, hasSession: false }
-    const root = attachRows({ ...base, children: [local, otherMode] }, { tasks: [cliTask({ sessionId: 'root' })] })
-    expect(root.children.map(child => child.id)).toEqual(['cli-task-1', 'task-1', `${CLI_NODE_PREFIX}task-1`])
+    // 非 cli- 前缀的同名 id（旧版裸 taskId 镜像形态）：真实的 dsh 会话永远保留。
+    const local = { ...prototype, id: 'task-1', mode: 'one-shot' as const, hasSession: true }
+    const root = attachRows({ ...base, children: [local] }, { tasks: [cliTask({ sessionId: 'root' })] })
+    expect(root.children.map(child => child.id)).toEqual(['task-1', `${CLI_NODE_PREFIX}task-1`])
     expect(root.children[0]).toBe(local)
-    expect(root.children[1]).toBe(otherMode)
   })
 
   it('preserves other plugins external rows and matching mirrors under another owner', () => {

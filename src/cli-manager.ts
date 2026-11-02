@@ -6,7 +6,9 @@
  */
 
 import { existsSync } from 'node:fs'
-import { dirname, join } from 'node:path'
+import { stat } from 'node:fs/promises'
+import { dirname, join, resolve } from 'node:path'
+import { readLocalCliVersion } from './cli-local-version.js'
 import { pickWindowsCandidate, resolveCommand, runProcess, systemSpawn, whereAll } from './spawn.js'
 import { CLI_PACKAGES, type MaestroCliId } from './wire.js'
 
@@ -57,55 +59,106 @@ export interface CliDetection {
   error: string | undefined
 }
 
-/** Detect one CLI: resolve it on PATH (or the configured override), then read `--version`. */
+/** Await only until the deadline/cancellation, even if a killed child never closes. */
+async function probeWithin<T>(timeoutMs: number, external: AbortSignal | undefined, work: (signal: AbortSignal) => Promise<T>): Promise<T> {
+  external?.throwIfAborted()
+  const controller = new AbortController()
+  const signal = external === undefined ? controller.signal : AbortSignal.any([controller.signal, external])
+  const timer = setTimeout(() => controller.abort(new DOMException(`检测超时（${timeoutMs}ms）`, 'TimeoutError')), timeoutMs)
+  let onAbort: (() => void) | undefined
+  try {
+    const aborted = new Promise<never>((_, reject) => {
+      onAbort = () => reject(signal.reason)
+      signal.addEventListener('abort', onAbort, { once: true })
+    })
+    return await Promise.race([work(signal), aborted])
+  } finally {
+    clearTimeout(timer)
+    if (onAbort !== undefined) signal.removeEventListener('abort', onAbort)
+  }
+}
+
+/** Resolve locally, read the owning package, then use a short --version fallback. */
 export async function detectCli(options: {
   spawnFn?: typeof systemSpawn
   cli: MaestroCliId
   override: string
   versionTimeoutMs?: number
-  /** Extra abort signal (the caller's cancellation); merged with the version timeout. */
+  /** Extra abort signal (the caller's cancellation); merged with each deadline. */
   signal?: AbortSignal | undefined
 }): Promise<CliDetection> {
   const override = options.override.trim()
   let resolved: string | undefined
   let foundOnPath = false
-  if (override !== '') {
-    resolved = existsSync(override) ? override : undefined
-  } else {
-    const candidates = await whereAll(options.cli).catch(() => [] as string[])
-    foundOnPath = candidates.length > 0
-    resolved = process.platform === 'win32' ? pickWindowsCandidate(candidates) : candidates[0]
+  try {
+    await probeWithin(2_000, options.signal, async () => {
+      if (override !== '') {
+        resolved = resolve(override)
+      } else {
+        const candidates = await whereAll(options.cli)
+        foundOnPath = candidates.length > 0
+        resolved = process.platform === 'win32' ? pickWindowsCandidate(candidates) : candidates[0]
+      }
+      if (resolved !== undefined && !(await stat(resolved).catch(() => undefined))?.isFile()) resolved = undefined
+    })
+  } catch (error) {
+    options.signal?.throwIfAborted()
+    return { installed: false, version: '', path: '', error: `CLI 路径检测失败：${error instanceof Error ? error.message : String(error)}` }
   }
-  if (resolved === undefined || !existsSync(resolved)) {
+  if (resolved === undefined) {
     return {
       installed: false,
       version: '',
       path: '',
       error: override !== ''
-        ? `配置的 CLI 路径不存在：${override}`
+        ? `配置的 CLI 路径不存在或不是文件：${override}`
         : foundOnPath
-          ? `PATH 上只有不可执行的垫片（缺少 .exe/.cmd），可尝试在配置页重新安装`
+          ? 'PATH 上只有不可执行的垫片（缺少 .exe/.cmd），可尝试在配置页重新安装'
           : `未在 PATH 中找到 ${options.cli}`,
     }
   }
-  const versionTimeoutMs = options.versionTimeoutMs ?? 15_000
-  let version = ''
-  const timeoutSignal = AbortSignal.timeout(versionTimeoutMs + 5_000)
-  const signal = options.signal === undefined ? timeoutSignal : AbortSignal.any([timeoutSignal, options.signal])
-  const { outcome } = runProcess({
-    ...(options.spawnFn === undefined ? {} : { spawnFn: options.spawnFn }),
-    file: resolved,
-    args: ['--version'],
-    timeoutMs: versionTimeoutMs,
-    signal,
-    onStdoutLine: line => { version = line.trim() },
-  })
-  const ended = await outcome
-  if (ended.code !== 0) {
-    const last = ended.stderrTail.split(/\r?\n/).map(line => line.trim()).filter(line => line !== '').at(-1) ?? ''
-    return { installed: false, version: '', path: resolved, error: `--version 退出码 ${ended.code ?? 'null'}${last === '' ? '' : `：${last}`}` }
+  const file = resolved
+  try {
+    const localVersion = await probeWithin(500, options.signal, () => readLocalCliVersion(options.cli, file))
+    if (localVersion !== undefined) return { installed: true, version: localVersion, path: file, error: undefined }
+  } catch {
+    options.signal?.throwIfAborted()
+    // Unreadable/stale package metadata must not prevent the executable fallback.
   }
-  return { installed: true, version: extractVersion(version), path: resolved, error: undefined }
+  const versionTimeoutMs = options.versionTimeoutMs ?? 3_000
+  let stdoutVersion = ''
+  let stderrVersion = ''
+  const versionIn = (line: string): string => {
+    const clean = line.replace(/\x1b\[[0-?]*[ -/]*[@-~]/g, '')
+    return /\d+\.\d+(?:\.\d+)?(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?/.exec(clean)?.[0] ?? ''
+  }
+  try {
+    const ended = await probeWithin(versionTimeoutMs, options.signal, signal => runProcess({
+      ...(options.spawnFn === undefined ? {} : { spawnFn: options.spawnFn }),
+      file,
+      args: ['--version'],
+      timeoutMs: versionTimeoutMs,
+      signal,
+      onStdoutLine: line => { if (stdoutVersion === '') stdoutVersion = versionIn(line) },
+      onStderrLine: line => { if (stderrVersion === '') stderrVersion = versionIn(line) },
+    }).outcome)
+    options.signal?.throwIfAborted()
+    const version = stdoutVersion || stderrVersion || versionIn(ended.stderrTail)
+    if (ended.timedOut) {
+      return { installed: true, version: '', path: file, error: `--version 查询超时（${versionTimeoutMs}ms），已找到 CLI，版本暂时未知` }
+    }
+    if (ended.code !== 0) {
+      const last = ended.stderrTail.split(/\r?\n/).map(line => line.trim()).filter(line => line !== '').at(-1) ?? ''
+      return { installed: true, version, path: file, error: `--version 退出码 ${ended.code ?? 'null'}${last === '' ? '' : `：${last}`}` }
+    }
+    return { installed: true, version, path: file, error: version === '' ? '--version 未输出版本号，已找到 CLI，版本暂时未知' : undefined }
+  } catch (error) {
+    options.signal?.throwIfAborted()
+    const detail = error instanceof Error && error.name === 'TimeoutError'
+      ? `查询超时（${versionTimeoutMs}ms）`
+      : error instanceof Error ? error.message : String(error)
+    return { installed: true, version: '', path: file, error: `--version ${detail}，已找到 CLI，版本暂时未知` }
+  }
 }
 
 /**

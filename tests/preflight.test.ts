@@ -42,7 +42,7 @@ describe('probeRequest', () => {
 
 describe('classifyProbe', () => {
   it('treats 2xx as a pass', () => {
-    expect(classifyProbe(anthropic, 200, '{"ok":true}').status).toBe('ok')
+    expect(classifyProbe(anthropic, 200, '{"type":"message","content":[]}').status).toBe('ok')
   })
 
   it('treats 404 and rejected credentials as a mismatch', () => {
@@ -79,7 +79,7 @@ describe('declaredModelProblem', () => {
 
 describe('probeDshEndpoint', () => {
   it('passes when the endpoint answers', async () => {
-    const verdict = await probeDshEndpoint(anthropic, { fetchImpl: fetchReturning(200, '{}') })
+    const verdict = await probeDshEndpoint(anthropic, { fetchImpl: fetchReturning(200, ' {"type":"message","content":[]}') })
     expect(verdict.status).toBe('ok')
   })
 
@@ -101,7 +101,7 @@ describe('probeDshEndpoint', () => {
 describe('preflightDshModel', () => {
   it('attaches the undeclared-model remark to the probe verdict', async () => {
     const verdict = await preflightDshModel(anthropic, [{ id: 'other', reasoningEfforts: [] }], {
-      fetchImpl: fetchReturning(200, '{}'),
+      fetchImpl: fetchReturning(200, ' {"type":"message","content":[]}'),
     })
     expect(verdict.status).toBe('ok')
     expect(verdict.note).toContain('tierflow_pro')

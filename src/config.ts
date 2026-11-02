@@ -9,7 +9,7 @@
 import type { Volatile } from '@deepseek-ai/cordis'
 import z from '@deepseek-ai/schemastery'
 import { dshModelSelectionError } from './dsh-models.js'
-import type { MaestroCliId } from './wire.js'
+import { normalizeTaskTypes, type MaestroCliId } from './wire.js'
 
 /** readVolatile: accept both a live projected value and a plain value. */
 export function readVolatile<T>(value: Volatile<T> | T | undefined): T | undefined {
@@ -23,6 +23,14 @@ export function readVolatile<T>(value: Volatile<T> | T | undefined): T | undefin
 /** Claude permission modes accepted by `claude -p --permission-mode`. */
 export const CLAUDE_PERMISSION_MODES = ['inherit', 'default', 'acceptEdits', 'plan', 'bypassPermissions'] as const
 export type ClaudePermissionMode = (typeof CLAUDE_PERMISSION_MODES)[number]
+
+/** How host tools ride the bridge: never, filtered, or an explicit allowlist. */
+export const BRIDGE_TOOLS_MODES = ['off', 'auto', 'custom'] as const
+export type BridgeToolsMode = (typeof BRIDGE_TOOLS_MODES)[number]
+
+/** How claude children receive dsh skills: through the bridge, or natively staged. */
+export const CLAUDE_SKILLS_MODES = ['bridge', 'native'] as const
+export type ClaudeSkillsMode = (typeof CLAUDE_SKILLS_MODES)[number]
 
 /** Codex sandbox modes (the permission axis of a non-interactive codex run). */
 export const CODEX_SANDBOX_MODES = ['read-only', 'workspace-write', 'danger-full-access'] as const
@@ -52,14 +60,14 @@ export const CONFIG_DEFAULTS = {
   claudeMinTaskDifficulty: 'medium',
   codexMinTaskDifficulty: 'medium',
   claudeEnabled: true,
-  claudeTaskTypes: ['需求分析', '代码审查', '文档写作', '重构'],
+  claudeTaskTypes: ['仓库探索', '影响分析', '模块重构', '方案设计', '文档整理'],
   claudePermissionMode: 'inherit',
   claudeBaseUrl: '',
   claudeAuthToken: '',
   claudeCliPath: '',
   claudeTimeoutMinutes: 20,
   codexEnabled: true,
-  codexTaskTypes: ['代码生成', '数据处理', '项目测试', '调试修复'],
+  codexTaskTypes: ['功能开发', '缺陷修复', '测试验证', '代码审查', '数据处理'],
   codexSandbox: 'workspace-write',
   codexBaseUrl: '',
   codexApiKey: '',
@@ -68,15 +76,24 @@ export const CONFIG_DEFAULTS = {
   codexConfigOverrides: [],
   codexDshModel: '',
   claudeDshModel: '',
+  /** dsh 子代理是内置回退：类型与门槛都可配，其余选项不暴露（没有 CLI 进程）。 */
+  dshMinTaskDifficulty: 'low',
+  dshTaskTypes: ['代码定位', '资料检索', '方案核验'],
   claudeThinking: '',
   codexThinking: '',
   bridgeMcp: true,
+  bridgeSkills: true,
+  bridgeTools: 'auto',
+  bridgeToolAllowlist: [],
+  claudeSkillsMode: 'bridge',
   mcpDiagnostics: false,
   npmRegistry: '',
   maxConcurrentTasks: 2,
   persistTasks: true,
   injectGitContext: true,
+  recordChildSessions: true,
   failureRetries: 0,
+  prepareCommand: '',
 } as const
 
 /** The config shape the host entry receives. Absent keys = inherited default. */
@@ -104,10 +121,22 @@ export interface Config {
   codexConfigOverrides?: Volatile<string[]> | string[]
   codexDshModel?: Volatile<string> | string
   claudeDshModel?: Volatile<string> | string
+  /** dsh 子代理（内置回退）的最低任务难度；固定独立于 legacy 共享项。 */
+  dshMinTaskDifficulty?: Volatile<TaskDifficulty> | TaskDifficulty
+  /** dsh 子代理擅长的任务类型：命中即建议改用 subagent，不派发 CLI。 */
+  dshTaskTypes?: Volatile<string[]> | string[]
   /** Thinking level per CLI; '' = the CLI's own default. */
   claudeThinking?: Volatile<string> | string
   codexThinking?: Volatile<string> | string
   bridgeMcp?: Volatile<boolean> | boolean
+  /** Hand dsh's skills to the dispatched CLI runs (catalog + on-demand load). */
+  bridgeSkills?: Volatile<boolean> | boolean
+  /** Host-tool bridging: off, auto (denylist filter), or custom (allowlist). */
+  bridgeTools?: Volatile<string> | string
+  /** Exact tool names for `bridgeTools: 'custom'`. */
+  bridgeToolAllowlist?: Volatile<string[]> | string[]
+  /** How claude children load dsh skills: bridge tools or a staged native dir. */
+  claudeSkillsMode?: Volatile<string> | string
   mcpDiagnostics?: Volatile<boolean> | boolean
   npmRegistry?: Volatile<string> | string
   maxConcurrentTasks?: Volatile<number> | number
@@ -115,8 +144,15 @@ export interface Config {
   persistTasks?: Volatile<boolean> | boolean
   /** Prepend a read-only git branch/status snapshot to the child's task text. */
   injectGitContext?: Volatile<boolean> | boolean
+  /** Record each dispatch as a real dsh child session (usage + catalog row, default on). */
+  recordChildSessions?: Volatile<boolean> | boolean
   /** Automatic re-runs after a plain failure (not timeout/cancel); 0–2, default 0. */
   failureRetries?: Volatile<number> | number
+  /**
+   * 就绪命令：spawn 前在 cwd 里跑一次（典型是 `git worktree add`）。失败即
+   * 当轮失败；留空则不跑。
+   */
+  prepareCommand?: Volatile<string> | string
 }
 
 /**
@@ -147,15 +183,24 @@ export const Config: z = z.object({
   codexConfigOverrides: z.array(z.string()).default([]).volatile(),
   codexDshModel: z.string().default(CONFIG_DEFAULTS.codexDshModel).volatile(),
   claudeDshModel: z.string().default(CONFIG_DEFAULTS.claudeDshModel).volatile(),
+  // dsh 是内置回退，门槛不继承 legacy：旧配置只描述外部 CLI。
+  dshMinTaskDifficulty: z.union(TASK_DIFFICULTIES.map(value => z.const(value))).default(CONFIG_DEFAULTS.dshMinTaskDifficulty).volatile(),
+  dshTaskTypes: z.array(z.string()).default([...CONFIG_DEFAULTS.dshTaskTypes]).volatile(),
   claudeThinking: z.string().default(CONFIG_DEFAULTS.claudeThinking).volatile(),
   codexThinking: z.string().default(CONFIG_DEFAULTS.codexThinking).volatile(),
   bridgeMcp: z.boolean().default(CONFIG_DEFAULTS.bridgeMcp).volatile(),
+  bridgeSkills: z.boolean().default(CONFIG_DEFAULTS.bridgeSkills).volatile(),
+  bridgeTools: z.string().default(CONFIG_DEFAULTS.bridgeTools).volatile(),
+  bridgeToolAllowlist: z.array(z.string()).default([]).volatile(),
+  claudeSkillsMode: z.string().default(CONFIG_DEFAULTS.claudeSkillsMode).volatile(),
   mcpDiagnostics: z.boolean().default(CONFIG_DEFAULTS.mcpDiagnostics).volatile(),
   npmRegistry: z.string().default(CONFIG_DEFAULTS.npmRegistry).volatile(),
   maxConcurrentTasks: z.number().default(CONFIG_DEFAULTS.maxConcurrentTasks).volatile(),
   persistTasks: z.boolean().default(CONFIG_DEFAULTS.persistTasks).volatile(),
   injectGitContext: z.boolean().default(CONFIG_DEFAULTS.injectGitContext).volatile(),
+  recordChildSessions: z.boolean().default(CONFIG_DEFAULTS.recordChildSessions).volatile(),
   failureRetries: z.number().default(CONFIG_DEFAULTS.failureRetries).volatile(),
+  prepareCommand: z.string().default(CONFIG_DEFAULTS.prepareCommand).volatile(),
 })
 
 const CONFIG_KEYS = Object.keys(CONFIG_DEFAULTS) as readonly (keyof typeof CONFIG_DEFAULTS)[]
@@ -171,7 +216,7 @@ export function validateConfig(config: Config): void {
   if (defaultCli !== undefined && !(CLI_CHOICES as readonly string[]).includes(defaultCli)) {
     throw new Error(`MaestroConfig: "defaultCli" must be one of ${CLI_CHOICES.join(' | ')}`)
   }
-  for (const field of ['minTaskDifficulty', 'claudeMinTaskDifficulty', 'codexMinTaskDifficulty'] as const) {
+  for (const field of ['minTaskDifficulty', 'claudeMinTaskDifficulty', 'codexMinTaskDifficulty', 'dshMinTaskDifficulty'] as const) {
     const minimum = readVolatile(config[field])
     if (minimum !== undefined && !isTaskDifficulty(minimum)) {
       throw new Error(`MaestroConfig: "${field}" must be one of ${TASK_DIFFICULTIES.join(' | ')}`)
@@ -184,6 +229,14 @@ export function validateConfig(config: Config): void {
   const sandbox = readVolatile(config.codexSandbox)
   if (sandbox !== undefined && !(CODEX_SANDBOX_MODES as readonly string[]).includes(sandbox)) {
     throw new Error(`MaestroConfig: "codexSandbox" must be one of ${CODEX_SANDBOX_MODES.join(' | ')}`)
+  }
+  const bridgeTools = readVolatile(config.bridgeTools)
+  if (bridgeTools !== undefined && !(BRIDGE_TOOLS_MODES as readonly string[]).includes(bridgeTools)) {
+    throw new Error(`MaestroConfig: "bridgeTools" must be one of ${BRIDGE_TOOLS_MODES.join(' | ')}`)
+  }
+  const claudeSkillsMode = readVolatile(config.claudeSkillsMode)
+  if (claudeSkillsMode !== undefined && !(CLAUDE_SKILLS_MODES as readonly string[]).includes(claudeSkillsMode)) {
+    throw new Error(`MaestroConfig: "claudeSkillsMode" must be one of ${CLAUDE_SKILLS_MODES.join(' | ')}`)
   }
   validateTimeout('claudeTimeoutMinutes', readVolatile(config.claudeTimeoutMinutes))
   validateTimeout('codexTimeoutMinutes', readVolatile(config.codexTimeoutMinutes))
@@ -215,7 +268,11 @@ export function validateConfig(config: Config): void {
   if (retries !== undefined && (!Number.isInteger(retries) || retries < 0 || retries > 2)) {
     throw new Error('MaestroConfig: "failureRetries" must be an integer between 0 and 2')
   }
-  for (const field of ['claudeTaskTypes', 'codexTaskTypes', 'codexConfigOverrides'] as const) {
+  const prepare = readVolatile(config.prepareCommand)
+  if (prepare !== undefined && prepare.length > 4000) {
+    throw new Error('MaestroConfig: "prepareCommand" must be at most 4000 characters')
+  }
+  for (const field of ['claudeTaskTypes', 'codexTaskTypes', 'dshTaskTypes', 'codexConfigOverrides'] as const) {
     const list = readVolatile(config[field])
     if (list !== undefined && (!Array.isArray(list) || !list.every(item => typeof item === 'string'))) {
       throw new Error(`MaestroConfig: "${field}" must be an array of strings`)
@@ -273,16 +330,33 @@ export interface EffectiveConfig {
     /** Raw `-c key=value` overrides passed to every codex invocation. */
     configOverrides: string[]
   }
+  /** 内置 dsh 子代理：没有 CLI 进程，只由类型与门槛决定「建议用它还是主代理直接做」。 */
+  dsh: {
+    minTaskDifficulty: TaskDifficulty
+    taskTypes: string[]
+  }
   npmRegistry: string
   maxConcurrentTasks: number
   /** Persist settled dispatch results under $DSH_HOME/maestro/tasks. */
   persistTasks: boolean
   /** Prepend a read-only git snapshot to the child's task text. */
   injectGitContext: boolean
+  /** Record each dispatch as a real dsh child session (usage + catalog row). */
+  recordChildSessions: boolean
   /** Automatic re-runs after a plain failure; 0 disables (default). */
   failureRetries: number
+  /** 就绪命令：spawn 前在 cwd 里跑一次；空串 = 不跑。 */
+  prepareCommand: string
   /** Hand dsh's own MCP servers to the dispatched CLI runs. */
   bridgeMcp: boolean
+  /** Hand dsh's skills to the dispatched CLI runs (catalog + on-demand load). */
+  bridgeSkills: boolean
+  /** Host-tool bridging mode: `off`, `auto` (denylist filter) or `custom` (allowlist). */
+  bridgeTools: BridgeToolsMode
+  /** Exact tool names bridged when mode is `custom`. */
+  bridgeToolAllowlist: string[]
+  /** How claude children load dsh skills: bridge tools or a staged native dir. */
+  claudeSkillsMode: ClaudeSkillsMode
   /** Temporary discovery diagnostics for the /models route. */
   mcpDiagnostics: boolean
 }
@@ -307,7 +381,7 @@ export function effectiveOf(config: Config): EffectiveConfig {
     claude: {
       enabled: readVolatile(config.claudeEnabled) ?? CONFIG_DEFAULTS.claudeEnabled,
       minTaskDifficulty: isTaskDifficulty(claudeMinimum) ? claudeMinimum : CONFIG_DEFAULTS.claudeMinTaskDifficulty,
-      taskTypes: readVolatile(config.claudeTaskTypes) ?? [...CONFIG_DEFAULTS.claudeTaskTypes],
+      taskTypes: normalizeTaskTypes(readVolatile(config.claudeTaskTypes) ?? [...CONFIG_DEFAULTS.claudeTaskTypes]),
       dshModel: readVolatile(config.claudeDshModel) ?? '',
       thinking: thinkingOf(config, 'claudeThinking'),
       permissionMode: (CLAUDE_PERMISSION_MODES as readonly string[]).includes(permissionMode)
@@ -321,7 +395,7 @@ export function effectiveOf(config: Config): EffectiveConfig {
     codex: {
       enabled: readVolatile(config.codexEnabled) ?? CONFIG_DEFAULTS.codexEnabled,
       minTaskDifficulty: isTaskDifficulty(codexMinimum) ? codexMinimum : CONFIG_DEFAULTS.codexMinTaskDifficulty,
-      taskTypes: readVolatile(config.codexTaskTypes) ?? [...CONFIG_DEFAULTS.codexTaskTypes],
+      taskTypes: normalizeTaskTypes(readVolatile(config.codexTaskTypes) ?? [...CONFIG_DEFAULTS.codexTaskTypes]),
       dshModel: readVolatile(config.codexDshModel) ?? '',
       thinking: thinkingOf(config, 'codexThinking'),
       sandbox: (CODEX_SANDBOX_MODES as readonly string[]).includes(sandbox)
@@ -333,12 +407,29 @@ export function effectiveOf(config: Config): EffectiveConfig {
       timeoutMinutes: readVolatile(config.codexTimeoutMinutes) ?? CONFIG_DEFAULTS.codexTimeoutMinutes,
       configOverrides: readVolatile(config.codexConfigOverrides) ?? [],
     },
+    dsh: {
+      minTaskDifficulty: (() => {
+        const minimum = readVolatile(config.dshMinTaskDifficulty) ?? CONFIG_DEFAULTS.dshMinTaskDifficulty
+        return isTaskDifficulty(minimum) ? minimum : CONFIG_DEFAULTS.dshMinTaskDifficulty
+      })(),
+      taskTypes: normalizeTaskTypes(readVolatile(config.dshTaskTypes) ?? [...CONFIG_DEFAULTS.dshTaskTypes]),
+    },
     npmRegistry: readVolatile(config.npmRegistry) ?? '',
     maxConcurrentTasks: readVolatile(config.maxConcurrentTasks) ?? CONFIG_DEFAULTS.maxConcurrentTasks,
     persistTasks: readVolatile(config.persistTasks) ?? CONFIG_DEFAULTS.persistTasks,
     injectGitContext: readVolatile(config.injectGitContext) ?? CONFIG_DEFAULTS.injectGitContext,
+    recordChildSessions: readVolatile(config.recordChildSessions) ?? CONFIG_DEFAULTS.recordChildSessions,
     failureRetries: readVolatile(config.failureRetries) ?? CONFIG_DEFAULTS.failureRetries,
+    prepareCommand: readVolatile(config.prepareCommand) ?? CONFIG_DEFAULTS.prepareCommand,
     bridgeMcp: readVolatile(config.bridgeMcp) ?? CONFIG_DEFAULTS.bridgeMcp,
+    bridgeSkills: readVolatile(config.bridgeSkills) ?? CONFIG_DEFAULTS.bridgeSkills,
+    bridgeTools: (BRIDGE_TOOLS_MODES as readonly string[]).includes(readVolatile(config.bridgeTools) ?? '')
+      ? readVolatile(config.bridgeTools) as BridgeToolsMode
+      : CONFIG_DEFAULTS.bridgeTools,
+    bridgeToolAllowlist: readVolatile(config.bridgeToolAllowlist) ?? [],
+    claudeSkillsMode: (CLAUDE_SKILLS_MODES as readonly string[]).includes(readVolatile(config.claudeSkillsMode) ?? '')
+      ? readVolatile(config.claudeSkillsMode) as ClaudeSkillsMode
+      : CONFIG_DEFAULTS.claudeSkillsMode,
     mcpDiagnostics: readVolatile(config.mcpDiagnostics) ?? CONFIG_DEFAULTS.mcpDiagnostics,
   }
 }

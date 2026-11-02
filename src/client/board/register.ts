@@ -16,6 +16,8 @@ import { createElement, type ReactNode } from 'react'
 
 import type { ClientContext } from '../types.js'
 import { BOARD_TAB_ID, BOARD_TAB_TITLE, BoardTab, type BoardTabProps } from './Board.js'
+import { applyBoardCopy } from './copy.js'
+import { registerCliSessionTab } from './session-tab.js'
 
 /** better-sidebar 交给 tab 组件的属性（本面板只声明自己用到的）。 */
 export interface BoardTabInput {
@@ -63,6 +65,11 @@ export function boardIcon(size: number): ReactNode {
  * @param ctx - 客户端根上下文。
  */
 export function registerBoardTab(ctx: ClientContext): void {
+  // 词条覆盖不依赖 betterSidebar（字典对象在模块加载时就存在），先改再注册。
+  applyBoardCopy()
+  // CLI 会话的侧栏 tab（maestro-cli-chat）：走宿主自己的 sidebarRightTabs 面，
+  // 不依赖 betterSidebar——「查看会话」与 dsh 子代理同一条侧边通道。
+  registerCliSessionTab(ctx)
   ctx.inject(['betterSidebar'], (injected) => {
     const sidebar = injected.get('betterSidebar') as BoardSidebarService | undefined
     if (sidebar === undefined || typeof sidebar.registerTab !== 'function') return
@@ -71,7 +78,7 @@ export function registerBoardTab(ctx: ClientContext): void {
       dispose = sidebar.registerTab({
         id: BOARD_TAB_ID,
         title: BOARD_TAB_TITLE,
-        description: 'DSH 主任务与子代理、CLI 子代理、后台任务集中在一页',
+        description: 'DSH 主任务与子智能体、CLI 子智能体、后台任务集中在一页',
         icon: boardIcon,
         order: 45,
         single: true,

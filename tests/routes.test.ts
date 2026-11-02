@@ -2,8 +2,18 @@ import { describe, expect, it } from 'vitest'
 import { effectiveOf, type EffectiveConfig } from '../src/config.js'
 import { CliPathCache } from '../src/dispatch.js'
 import { Limiter, TaskRegistry } from '../src/task-registry.js'
-import { StatusStore, crossSitePost, handleCliNpmJob, handleCliVersions, handleHint, handleOverview, handleTaskCancel, handleTaskDetail, handleTasks } from '../src/routes.js'
+import { StatusStore, crossSitePost, handleBridgeCall, handleBridgeCatalog, handleCliNpmJob, handleCliVersions, handleHint, handleModels, handleOverview, handleTaskCancel, handleTaskDetail, handleTasks } from '../src/routes.js'
+import { createBridgeHandle } from '../src/bridge.js'
+import { detectCli } from '../src/cli-manager.js'
 import { scriptedSpawn } from './fake-child.js'
+
+/** npm.cmd keeps its verb in a cmd.exe command line, not a standalone argv item. */
+function npmOperationOf(args: readonly string[]): string | undefined {
+  if (args[2]?.toLowerCase() === '/c') {
+    return args[3]?.match(/^""[^"]+"\s+"?(view|install|uninstall)"?(?=\s|"$)/)?.[1]
+  }
+  return args.find(arg => ['view', 'install', 'uninstall'].includes(arg))
+}
 
 function makeDeps(
   config: EffectiveConfig = effectiveOf({ claudeCliPath: process.execPath, codexCliPath: process.execPath }),
@@ -12,7 +22,7 @@ function makeDeps(
   const registry = new TaskRegistry()
   const controllers = new Map<string, AbortController>()
   const spawn = scriptedSpawn(child => {
-    if (child.spawnArgs.includes('view')) {
+    if (npmOperationOf(child.spawnArgs) === 'view') {
       if (options.viewFails === true) {
         child.finish('', 1, 'npm ERR! 404 Not Found')
         return
@@ -26,7 +36,7 @@ function makeDeps(
     if (child.spawnArgs[0] === '--version') child.finish('claude version 1.0')
     else child.finish('', 0)
   })
-  const store = new StatusStore(() => config)
+  const store = new StatusStore(() => config, options => detectCli({ ...options, spawnFn: spawn.spawnFn }))
   return {
     deps: {
       readConfig: () => config,
@@ -44,6 +54,23 @@ function makeDeps(
   }
 }
 
+describe('npm fixture command recognition', () => {
+  it.each(['view', 'install', 'uninstall'])('recognizes direct and Windows-wrapped %s operations', operation => {
+    expect(npmOperationOf(['npm-cli.js', operation, '@example/package'])).toBe(operation)
+    const line = `""C:/Program Files/install tools/npm.CMD" ${operation} "@example/package""`
+    expect(npmOperationOf(['/d', '/s', '/c', line])).toBe(operation)
+  })
+
+  it('does not confuse uninstall with install or a verb in the executable path', () => {
+    expect(npmOperationOf(['/d', '/s', '/c', '""C:/install tools/npm.CMD" uninstall "@example/package""'])).toBe('uninstall')
+    expect(npmOperationOf(['/d', '/s', '/c', '""C:/install tools/npm.CMD" --version"'])).toBeUndefined()
+  })
+
+  it('does not treat command words inside a package name as npm operations', () => {
+    expect(npmOperationOf(['--version', '@example/install'])).toBeUndefined()
+  })
+})
+
 describe('handleOverview / handleTasks', () => {
   it('answers with statuses, config view and tasks', () => {
     const { deps } = makeDeps()
@@ -52,6 +79,13 @@ describe('handleOverview / handleTasks', () => {
     const body = outcome.body as { enabled: boolean; clis: Record<string, unknown>; tasks: unknown[] }
     expect(body.enabled).toBe(true)
     expect(outcome.body).toMatchObject({ minTaskDifficulties: { claude: 'medium', codex: 'medium' } })
+    expect(outcome.body).toMatchObject({
+      dsh: { minTaskDifficulty: 'low', taskTypes: ['代码定位', '资料检索', '方案核验'] },
+    })
+    const dshVersion = (outcome.body as { dsh: { version: string | null } }).dsh.version
+    expect(dshVersion === null || typeof dshVersion === 'string').toBe(true)
+    expect(handleOverview(makeDeps(effectiveOf({ dshMinTaskDifficulty: 'high' })).deps).body)
+      .toMatchObject({ dsh: { minTaskDifficulty: 'high' } })
     expect(handleOverview(makeDeps(effectiveOf({ minTaskDifficulty: 'extreme' })).deps).body)
       .toMatchObject({ minTaskDifficulties: { claude: 'extreme', codex: 'extreme' } })
     expect(handleOverview(makeDeps(effectiveOf({ claudeMinTaskDifficulty: 'low', codexMinTaskDifficulty: 'high' })).deps).body)
@@ -67,16 +101,18 @@ describe('handleOverview / handleTasks', () => {
     registry.create({ id: 'sibling', cli: 'codex', title: '子会话', model: '', sessionId: 's2' })
     registry.create({ id: 'other', cli: 'codex', title: '别的会话', model: '', sessionId: 's3' })
     // owner-less（配置页安装的 npm 任务）不属于任何会话，任何视图都看得到。
-    registry.create({ id: 'npm-1', cli: 'claude', title: 'npm', model: '' })
-    const ids = (query?: string): string[] => {
-      const outcome = handleTasks(deps, query === undefined ? undefined : new URLSearchParams(query))
+    registry.create({ id: 'npm-1', kind: 'npm', cli: 'claude', title: 'npm', model: '' })
+    const ids = (query?: string, sessionId?: string): string[] => {
+      const outcome = handleTasks(deps, query === undefined ? undefined : new URLSearchParams(query), sessionId === undefined ? undefined : { sessionId })
       return (outcome.body as { tasks: Array<{ id: string }> }).tasks.map(task => task.id).sort()
     }
-    expect(ids()).toEqual(['npm-1', 'other', 'own', 'sibling'])
-    expect(ids('sessions=s1,s2')).toEqual(['npm-1', 'own', 'sibling'])
-    expect(ids('sessions=s3')).toEqual(['npm-1', 'other'])
-    // 空 sessions 参数 = 不过滤（运维视角）。
-    expect(ids('sessions=')).toEqual(['npm-1', 'other', 'own', 'sibling'])
+    expect(ids()).toEqual(['npm-1'])
+    expect(ids('sessions=s1,s2')).toEqual(['npm-1'])
+    expect(ids(undefined, 's1')).toEqual(['npm-1', 'own'])
+    expect(ids('sessions=s1,s2', 's1')).toEqual(['npm-1', 'own'])
+    expect(ids('sessions=s3', 's1')).toEqual(['npm-1'])
+    expect(ids('sessions=', 's1')).toEqual(['npm-1', 'own'])
+    expect(ids('sessions=s3', 's3')).toEqual(['npm-1', 'other'])
   })
 })
 
@@ -89,9 +125,9 @@ describe('handleTaskDetail', () => {
 
   it('returns events after the cursor', () => {
     const { deps, registry } = makeDeps()
-    const task = registry.create({ id: 'task-1', cli: 'claude', title: 't', model: '' })
+    const task = registry.create({ id: 'task-1', cli: 'claude', title: 't', model: '', sessionId: 's1' })
     registry.push(task, 'text', 'hello')
-    const outcome = handleTaskDetail(deps, new URLSearchParams('id=task-1&cursor=0'))
+    const outcome = handleTaskDetail(deps, new URLSearchParams('id=task-1&cursor=0'), { sessionId: 's1' })
     expect(outcome.status).toBe(200)
     const body = outcome.body as { events: Array<{ text: string }>; nextCursor: number }
     expect(body.events.length).toBe(2)
@@ -103,24 +139,25 @@ describe('handleTaskDetail', () => {
     const task = registry.create({ id: 'task-2', cli: 'claude', title: 't', model: '', sessionId: 's2' })
     registry.push(task, 'text', 'hello')
     expect(handleTaskDetail(deps, new URLSearchParams('id=task-2&sessions=s1')).status).toBe(404)
-    expect(handleTaskDetail(deps, new URLSearchParams('id=task-2&sessions=s2')).status).toBe(200)
-    expect(handleTaskDetail(deps, new URLSearchParams('id=task-2&sessions=s1,s2')).status).toBe(200)
+    expect(handleTaskDetail(deps, new URLSearchParams('id=task-2&sessions=s2'), { sessionId: 's2' }).status).toBe(200)
+    expect(handleTaskDetail(deps, new URLSearchParams('id=task-2&sessions=s1,s2'), { sessionId: 's1' }).status).toBe(404)
+    expect(handleTaskDetail(deps, new URLSearchParams('id=task-2'), { sessionId: 's2' }).status).toBe(200)
   })
 })
 
 describe('handleTaskCancel', () => {
   it('aborts the task through the controllers map', async () => {
     const { deps, registry, controllers } = makeDeps()
-    const task = registry.create({ id: 'task-1', cli: 'claude', title: 't', model: '' })
+    const task = registry.create({ id: 'task-1', cli: 'claude', title: 't', model: '', sessionId: 's1' })
     registry.setPhase(task, 'running', '开始')
     const controller = new AbortController()
     controllers.set('task-1', controller)
-    const outcome = handleTaskCancel(deps, { id: 'task-1' })
+    const outcome = handleTaskCancel(deps, { id: 'task-1' }, { sessionId: 's1' })
     expect(outcome.status).toBe(200)
     expect(controller.signal.aborted).toBe(true)
     expect(handleTaskCancel(deps, { id: 'missing' }).status).toBe(404)
     registry.setPhase(task, 'done', 'ok')
-    expect(handleTaskCancel(deps, { id: 'task-1' }).status).toBe(409)
+    expect(handleTaskCancel(deps, { id: 'task-1' }, { sessionId: 's1' }).status).toBe(409)
   })
 
   it('refuses to cancel a task from another session', () => {
@@ -131,7 +168,7 @@ describe('handleTaskCancel', () => {
     controllers.set('task-2', controller)
     expect(handleTaskCancel(deps, { id: 'task-2', sessions: ['s1'] }).status).toBe(404)
     expect(controller.signal.aborted).toBe(false)
-    expect(handleTaskCancel(deps, { id: 'task-2', sessions: ['s2'] }).status).toBe(200)
+    expect(handleTaskCancel(deps, { id: 'task-2', sessions: ['s2'] }, { sessionId: 's2' }).status).toBe(200)
     expect(controller.signal.aborted).toBe(true)
   })
 })
@@ -180,8 +217,8 @@ describe('handleCliNpmJob', () => {
     const ref = outcome.body as { id: string }
     await new Promise(resolvePromise => setTimeout(resolvePromise, 50))
     expect(registry.get(ref.id)?.phase).toBe('done')
-    const install = launches.find(child => child.spawnArgs.includes('install'))
-    expect(install?.spawnArgs).toContain('@openai/codex@0.152.1')
+    const install = launches.find(child => npmOperationOf(child.spawnArgs) === 'install')
+    expect(install?.spawnArgs.join(' ')).toContain('@openai/codex@0.152.1')
   })
 
   it('rejects a malformed version and an unknown cli', () => {
@@ -194,9 +231,9 @@ describe('handleCliNpmJob', () => {
     const { deps, launches } = makeDeps()
     expect(handleCliNpmJob(deps, 'uninstall', { cli: 'claude', version: '0.3.312' }).status).toBe(200)
     await new Promise(resolvePromise => setTimeout(resolvePromise, 50))
-    const uninstall = launches.find(child => child.spawnArgs.includes('uninstall'))
-    expect(uninstall?.spawnArgs).toContain('@anthropic-ai/claude-code')
-    expect(uninstall?.spawnArgs).not.toContain('@anthropic-ai/claude-code@0.3.312')
+    const uninstall = launches.find(child => npmOperationOf(child.spawnArgs) === 'uninstall')
+    expect(uninstall?.spawnArgs.join(' ')).toContain('@anthropic-ai/claude-code')
+    expect(uninstall?.spawnArgs.join(' ')).not.toContain('@anthropic-ai/claude-code@0.3.312')
   })
 
   it('refuses a second npm job for the same CLI while one is in flight', async () => {
@@ -252,5 +289,69 @@ describe('crossSitePost', () => {
     expect(crossSitePost({ origin: 'http://127.0.0.1:9999', host: '127.0.0.1:3000' })).toBe(true)
     // Sandboxed iframes send the literal string "null" — not a URL, reject.
     expect(crossSitePost({ origin: 'null', host: '127.0.0.1:3000' })).toBe(true)
+  })
+})
+
+describe('handleBridgeCatalog / handleBridgeCall', () => {
+  it('answers 404 when the bridge handle is absent and 401 for unknown tokens', async () => {
+    const { deps } = makeDeps()
+    const missing = await handleBridgeCatalog(deps, new URLSearchParams('token=x'))
+    expect(missing.status).toBe(404)
+    const missingCall = await handleBridgeCall(deps, { token: 'x', kind: 'skill', name: 'a' })
+    expect(missingCall.status).toBe(404)
+
+    const bridge = createBridgeHandle({
+      skills: () => ({ list: async () => [], get: async () => undefined }),
+      tools: () => undefined,
+      portOf: () => 8765,
+      readConfig: () => effectiveOf({}),
+    })
+    const bad = await handleBridgeCatalog({ ...deps, bridge }, new URLSearchParams('token=nope'))
+    expect(bad.status).toBe(401)
+    const badCall = await handleBridgeCall({ ...deps, bridge }, { token: 'nope', kind: 'skill', name: 'a' })
+    expect(badCall.status).toBe(401)
+  })
+
+  it('serves the catalog and skill bodies through a real token', async () => {
+    const bridge = createBridgeHandle({
+      skills: () => ({
+        list: async () => [{ name: 'good-one', description: '可用技能', invocation: { modelInvocable: true, userInvocable: true }, source: 's', provider: 'p', rank: 1 }],
+        get: async (name: string) => name === 'good-one' ? { name: 'good-one', description: '可用技能', content: '正文', invocation: { modelInvocable: true, userInvocable: true }, source: 's', provider: 'p' } : undefined,
+      }),
+      tools: () => undefined,
+      portOf: () => 8765,
+      readConfig: () => effectiveOf({}),
+    })
+    const run = bridge.runServerEntry()
+    if (run === undefined) throw new Error('bridge should be active')
+    const { deps } = makeDeps()
+    const catalog = await handleBridgeCatalog({ ...deps, bridge }, new URLSearchParams(`token=${run.token}&cwd=/cwd`))
+    expect(catalog.status).toBe(200)
+    expect(catalog.body).toMatchObject({ serverName: 'dsh_bridge', skills: [{ name: 'good-one', tool: 'skill_good-one' }] })
+
+    const loaded = await handleBridgeCall({ ...deps, bridge }, { token: run.token, kind: 'skill', name: 'good-one', cwd: '/cwd' })
+    expect(loaded.status).toBe(200)
+    expect((loaded.body as { text: string }).text).toContain('正文')
+
+    const missing = await handleBridgeCall({ ...deps, bridge }, { token: run.token, kind: 'skill', name: 'gone' })
+    expect(missing.status).toBe(404)
+    const badKind = await handleBridgeCall({ ...deps, bridge }, { token: run.token, kind: 'wat', name: 'x' })
+    expect(badKind.status).toBe(400)
+    bridge.revoke(run.token)
+  })
+
+  it('reports bridge diagnostics through the models route', async () => {
+    const bridge = createBridgeHandle({
+      skills: () => ({ list: async () => [{ name: 'a', description: 'x', invocation: { modelInvocable: true, userInvocable: true }, source: 's', provider: 'p', rank: 1 }], get: async () => undefined }),
+      tools: () => ({ schemas: () => [{ name: 'web_search', description: 'd', parameters: { type: 'object', properties: {} } }], execute: async () => ({ content: [], isError: false }) }),
+      portOf: () => 8765,
+      readConfig: () => effectiveOf({}),
+    })
+    const { deps } = makeDeps()
+    deps.listDshModels = async () => ({ providers: [] })
+    deps.listMcpServers = () => []
+    const outcome = await handleModels({ ...deps, bridge })
+    expect(outcome.status).toBe(200)
+    expect((outcome.body as { bridge: object }).bridge).toMatchObject({ skillsEnabled: true, toolsMode: 'auto', skills: 1, tools: 0, httpReady: true })
   })
 })

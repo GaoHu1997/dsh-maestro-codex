@@ -35,6 +35,14 @@ export type ClientContext = Context & {
   }
 }
 
+/** One field edit inside a batch write: the op shape the host's
+ * `configForms` controller understands (`{ op: 'set', path: [field], value }`). */
+export interface ConfigFormOp {
+  op: 'set'
+  path: string[]
+  value: unknown
+}
+
 /** The host-projected config form for this plugin's entry. */
 export interface ConfigFormFace<T> {
   getSnapshot(): {
@@ -43,6 +51,10 @@ export interface ConfigFormFace<T> {
     value?: T | undefined
     user?: Record<string, unknown> | undefined
   }
-  set(field: string, value: unknown): Promise<void>
+  /** Write one field; resolves `false` when the host refused it (stale revision). */
+  set(field: string, value: unknown): Promise<boolean | void>
+  /** Apply several field edits as ONE revision-checked write. Optional: older
+   * hosts only expose `set`, and the form then falls back to sequential writes. */
+  mutate?(ops: readonly ConfigFormOp[], expectedRevision?: number): Promise<boolean | void>
   subscribe(listener: () => void): () => void
 }

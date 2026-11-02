@@ -5,9 +5,10 @@
  * agent. The configured sandbox IS the permission axis of the run.
  */
 
-import { runProcess } from '../spawn.js'
-import { CODEX_REASONING_EFFORTS } from '../wire.js'
+import { runProcess, type ChildOutcome } from '../spawn.js'
+import { CODEX_REASONING_EFFORTS, type MaestroChannelEvent } from '../wire.js'
 import type { CodexSandboxMode } from '../config.js'
+import { mergeCodexUsageStats, startRolloutUsageTail, usageFromTotals, type RolloutUsageStats, type RolloutUsageTail } from './codex-rollout.js'
 
 /** Parsed outcome of one codex run. */
 export interface CodexRunResult {
@@ -25,9 +26,18 @@ interface CodexFrame {
   type?: string
   thread_id?: string
   message?: string
-  item?: { id?: string; type?: string; text?: string; message?: string; command?: string; aggregated_output?: string; exit_code?: number | null; status?: string; files?: Array<{ path?: string }>; changes?: Array<{ path?: string }> }
+  item?: {
+    id?: string; type?: string; text?: string; message?: string; command?: string; aggregated_output?: string
+    exit_code?: number | null; status?: string
+    /** Modern MCP calls include public arguments/results, not just an item type. */
+    server?: string; tool?: string; arguments?: unknown; result?: unknown; error?: unknown
+    files?: Array<{ path?: string }>; changes?: Array<{ path?: string }>
+    /** Reasoning items: streaming summaries (summary_text entries) and raw thoughts. */
+    summary?: Array<{ type?: string; text?: string }>
+    content?: Array<{ type?: string; text?: string }>
+  }
   error?: { message?: string } | string
-  usage?: { input_tokens?: number; cached_input_tokens?: number; output_tokens?: number }
+  usage?: { input_tokens?: number; cached_input_tokens?: number; cache_write_input_tokens?: number; output_tokens?: number }
   msg?: { type?: string; message?: string; content?: string }
 }
 
@@ -77,9 +87,9 @@ export function codexDshModelArgs(model: string, baseUrl: string): { args: strin
 }
 
 /** The argv for one non-interactive run (before the resolved path is prepended). */
-export function codexArgs(model: string, sandbox: CodexSandboxMode, configOverrides: readonly string[] = [], dshModel?: { model: string; baseUrl: string }, mcpServers?: ReadonlyArray<{ name: string; command: string; args: readonly string[]; env: Readonly<Record<string, string>> }>, thinking?: string, resume?: string): string[] {
+export function codexArgs(model: string, sandbox: CodexSandboxMode, configOverrides: readonly string[] = [], dshModel?: { model: string; baseUrl: string }, mcpServers?: ReadonlyArray<{ name: string; transport?: 'stdio' | 'http'; command: string; args: readonly string[]; env: Readonly<Record<string, string>> }>, thinking?: string, resume?: string): string[] {
   // `codex exec resume <thread-id>` continues a prior non-interactive thread
-  // and shares every exec flag; the follow-up prompt still rides stdin (`-`).
+  // and uses its own supported flag set; the prompt still rides stdin (`-`).
   const args = resume !== undefined && resume !== ''
     ? ['exec', 'resume', resume, '--json', '--skip-git-repo-check']
     : ['exec', '--json', '--skip-git-repo-check']
@@ -95,7 +105,7 @@ export function codexArgs(model: string, sandbox: CodexSandboxMode, configOverri
     // The overrides below plus env carry everything this run needs, so dropping
     // the user config only keeps the run deterministic.
     args.push('--ignore-user-config')
-    args.push(...codexDshModelArgs(dshModel.model, dshModel.baseUrl).args)
+    // The provider pins are appended after every configurable override below.
     // ...but one key of the user config is load-bearing on Windows: codex runs
     // model commands through its own Windows sandbox, and with the default
     // (unelevated) policy every `exec_command` is refused — measured on this
@@ -120,7 +130,14 @@ export function codexArgs(model: string, sandbox: CodexSandboxMode, configOverri
     if (trimmed !== '') args.push('-c', trimmed)
   }
   if (mcpServers !== undefined) args.push(...codexMcpArgs(mcpServers))
-  args.push(...codexSandboxArgs(sandbox))
+  if (resume !== undefined && resume !== '') {
+    // Codex 0.165 exec resume has no --sandbox. The supported config override
+    // preserves the selected policy; never turn workspace-write into bypass.
+    args.push('-c', `sandbox_mode=${tomlString(sandbox)}`)
+    args.push('-c', 'approval_policy="never"')
+  } else args.push(...codexSandboxArgs(sandbox))
+  // Pin the selected dsh endpoint AFTER untrusted/general config overrides.
+  if (dshModel !== undefined) args.push(...codexDshModelArgs(dshModel.model, dshModel.baseUrl).args)
   // `-` reads the prompt from stdin — no quoting surface for task text.
   args.push('-')
   return args
@@ -137,22 +154,37 @@ export function codexWindowsSandboxArgs(platform: string = process.platform): st
 }
 
 /**
+ * Approval mode stamped onto every bridged MCP server: `approve` pre-approves
+ * the server's tools so a non-interactive run can call them (see
+ * {@link codexMcpArgs}). Legal values on codex 0.165: `auto`, `prompt`,
+ * `writes`, `approve`.
+ */
+const CODEX_MCP_APPROVAL_MODE = 'approve'
+
+/**
  * `-c mcp_servers.*` overrides handing dsh's MCP servers to codex. The whole
  * server record rides ONE TOML inline table per `-c` pair, so each server is
  * a single atomic override (no multi-pair ordering hazards).
  */
-export function codexMcpArgs(servers: ReadonlyArray<{ name: string; command: string; args: readonly string[]; env: Readonly<Record<string, string>> }>): string[] {
+export function codexMcpArgs(servers: ReadonlyArray<{ name: string; transport?: 'stdio' | 'http'; command: string; args: readonly string[]; env: Readonly<Record<string, string>> }>): string[] {
   const args: string[] = []
   for (const server of servers) {
     // `http` transport rows carry no command — codex cannot spawn them, and an
     // empty `command = ""` would make codex reject the whole override.
-    if (server.command.trim() === '') continue
+    if (server.transport === 'http' || server.command.trim() === '') continue
     const parts = [`command = ${tomlString(server.command)}`]
     if (server.args.length > 0) parts.push(`args = [${server.args.map(tomlString).join(', ')}]`)
     const envEntries = Object.entries(server.env)
     if (envEntries.length > 0) {
       parts.push(`env = { ${envEntries.map(([key, value]) => `${tomlKey(key)} = ${tomlString(value)}`).join(', ')} }`)
     }
+    // `codex exec` is non-interactive: its approval policy is `never`, so an MCP
+    // tool call that asks for approval can never be granted and every bridge
+    // call dies with `MCP tool call requires approval, but approval policy is
+    // never`. These servers are dsh's own tool surface (already granted to every
+    // claude dispatch through `--allowedTools`), so pre-approve them per server.
+    // Legal values on codex 0.165: `auto`, `prompt`, `writes`, `approve`.
+    parts.push(`default_tools_approval_mode = ${tomlString(CODEX_MCP_APPROVAL_MODE)}`)
     // Names come from user config and may contain `.` or spaces; a bare dotted
     // key would be parsed as a nested path, so quote only when necessary.
     // No spaces around the top-level `=`: codex splits `-c key=value` on the
@@ -200,9 +232,72 @@ function commandSummary(item: NonNullable<CodexFrame['item']>, preview: boolean)
   return `${label} ${item.command ?? '?'}${suffix}${status}${output.trim() === '' ? '' : `\n输出：\n${preview ? commandOutputPreview(output) : output}`}`
 }
 
+function publicToolDetail(value: unknown): string {
+  if (value === undefined) return ''
+  try {
+    return JSON.stringify(value, (key: string, entry: unknown): unknown => {
+      if (/^(?:(?:access|refresh|bridge)[_-]?)?token$|^(?:api[_-]?key|authorization|proxy-authorization|password|secret|cookie|set-cookie)$/i.test(key)) return '[redacted]'
+      if (typeof entry === 'string') return entry.replace(/\bBearer\s+[^\s"']+/gi, 'Bearer [redacted]')
+        .replace(/([?&](?:token|api[_-]?key|access_token|bridge_token)=)[^&#\s"']+/gi, '$1[redacted]')
+      if (typeof entry === 'object' && entry !== null && !Array.isArray(entry)) {
+        const row = entry as Record<string, unknown>
+        if ((row['type'] === 'image' || row['type'] === 'audio') && typeof row['data'] === 'string') {
+          return { ...row, data: '[binary payload omitted; text and resource references retained]' }
+        }
+      }
+      return entry
+    }, 2) ?? ''
+  } catch { return '[工具详情无法序列化]' }
+}
+
+function codexMcpEvent(item: NonNullable<CodexFrame['item']>, started: boolean): MaestroChannelEvent {
+  const name = `${item.server ?? 'mcp'}/${item.tool ?? '?'}`
+  const result = item.result !== null && typeof item.result === 'object' ? item.result as Record<string, unknown> : undefined
+  const failed = item.status === 'failed' || item.error != null || result?.['isError'] === true || result?.['is_error'] === true
+  const detail = [
+    `调用 ID：${item.id ?? '?'}；状态：${item.status ?? (started ? 'in_progress' : 'completed')}`,
+    item.arguments === undefined ? '' : `参数：\n${publicToolDetail(item.arguments)}`,
+    item.result === undefined ? '' : `结果：\n${publicToolDetail(item.result)}`,
+    item.error == null ? '' : `错误：\n${publicToolDetail(item.error)}`,
+  ].filter(Boolean).join('\n\n')
+  return { kind: failed ? 'error' : started ? 'tool' : 'result', text: `MCP ${name}${failed ? ' · 失败' : ''}`, detail }
+}
+
+function codexFrameOf(raw: unknown): CodexFrame | undefined {
+  if (typeof raw !== 'object' || raw === null || Array.isArray(raw)) return undefined
+  const frame = { ...raw } as Record<string, unknown>
+  for (const key of ['type', 'thread_id', 'message']) if (typeof frame[key] !== 'string') delete frame[key]
+  for (const key of ['item', 'usage', 'msg']) {
+    const value = frame[key]
+    if (typeof value !== 'object' || value === null || Array.isArray(value)) { delete frame[key]; continue }
+    const record = { ...value } as Record<string, unknown>
+    if (key !== 'usage') {
+      for (const field of ['id', 'type', 'text', 'message', 'command', 'aggregated_output', 'status', 'content', 'server', 'tool']) {
+        if (field === 'content' && key === 'item') continue
+        if (typeof record[field] !== 'string') delete record[field]
+      }
+      if (key === 'item') for (const field of ['files', 'changes', 'summary', 'content']) {
+        const entries = record[field]
+        if (!Array.isArray(entries)) { delete record[field]; continue }
+        record[field] = entries.filter(entry => typeof entry === 'object' && entry !== null && !Array.isArray(entry)).map(entry => {
+          const safe = { ...entry } as Record<string, unknown>
+          for (const textField of ['path', 'text', 'type']) if (typeof safe[textField] !== 'string') delete safe[textField]
+          return safe
+        })
+      }
+    }
+    frame[key] = record
+  }
+  const error = frame['error']
+  if (typeof error !== 'string') frame['error'] = typeof error === 'object' && error !== null && typeof (error as Record<string, unknown>)['message'] === 'string'
+    ? { message: (error as Record<string, unknown>)['message'] } : undefined
+  return frame as CodexFrame
+}
+
 /** Extract progress facts out of one JSONL frame. */
-export function codexFrameEvents(frame: CodexFrame): Array<{ kind: 'text' | 'note' | 'error'; text: string }> {
-  const events: Array<{ kind: 'text' | 'note' | 'error'; text: string }> = []
+export function codexFrameEvents(frame: CodexFrame): MaestroChannelEvent[] {
+  frame = codexFrameOf(frame) ?? {}
+  const events: MaestroChannelEvent[] = []
   // Modern thread/item dialect.
   if (frame.type === 'thread.started') return events
   if (frame.type === 'item.started' || frame.type === 'item.updated' || frame.type === 'item.completed') {
@@ -211,13 +306,22 @@ export function codexFrameEvents(frame: CodexFrame): Array<{ kind: 'text' | 'not
       // updated frames repeat an accumulating output snapshot. The completed
       // item contains the full aggregate, so emit it once, not on every update.
       if (frame.type === 'item.started') {
-        events.push({ kind: 'note', text: `命令开始 (started) ${item.command ?? '?'}` })
+        events.push({ kind: 'tool', text: item.command ?? '?', detail: '命令开始 (started)' })
       } else if (frame.type === 'item.completed') {
-        events.push({ kind: commandFailed(item) ? 'error' : 'note', text: commandSummary(item, true) })
+        events.push({ kind: 'tool', text: item.command ?? '?', detail: commandSummary(item, true) })
       }
+    } else if (item.type === 'mcp_tool_call') {
+      if (frame.type !== 'item.updated') events.push(codexMcpEvent(item, frame.type === 'item.started'))
     } else if (item.type === 'file_change') {
       const paths = (item.changes ?? item.files ?? []).map(file => file.path ?? '?').join(', ')
       events.push({ kind: item.status === 'failed' ? 'error' : 'note', text: `文件变更 ${item.status ?? ''} ${paths}`.trim() })
+    } else if (item.type === 'reasoning' && frame.type === 'item.completed') {
+      // 标准 exec JSONL 公开摘要在 text；兼容旧 summary/content 数组：
+      // 会话页折叠成「思考过程」行。
+      const summary = (item.summary ?? []).map(entry => entry.text ?? '').join('\n').trim()
+      const raw = (item.content ?? []).map(entry => entry.text ?? '').join('\n').trim()
+      const body = (item.text ?? '').trim() || summary || raw
+      if (body !== '') events.push({ kind: 'thinking', text: body })
     } else if (item.type === 'agent_message' && frame.type === 'item.completed' && (item.text ?? '').trim() !== '') {
       events.push({ kind: 'text', text: item.text ?? '' })
     } else if (item.type === 'error' && frame.type !== 'item.updated') {
@@ -243,17 +347,8 @@ export function codexFrameEvents(frame: CodexFrame): Array<{ kind: 'text' | 'not
 
 /** The stats a completed turn reports. */
 export function codexUsageStats(frame: CodexFrame): Record<string, string | number | boolean> {
-  const stats: Record<string, string | number | boolean> = {}
-  const usage = frame.usage
-  if (usage === undefined) return stats
-  if (typeof usage.input_tokens === 'number') {
-    // Codex input_tokens includes cached reads; the shared usage projection
-    // expects mutually exclusive uncached input / cache read / cache write.
-    stats['inputTokens'] = Math.max(0, usage.input_tokens - (usage.cached_input_tokens ?? 0))
-  }
-  if (typeof usage.cached_input_tokens === 'number') stats['cachedInputTokens'] = usage.cached_input_tokens
-  if (typeof usage.output_tokens === 'number') stats['outputTokens'] = usage.output_tokens
-  return stats
+  frame = codexFrameOf(frame) ?? {}
+  return { ...usageFromTotals(frame.usage) }
 }
 
 /**
@@ -273,12 +368,12 @@ export async function runCodexTask(options: {
   resume?: string
   configOverrides?: readonly string[]
   dshModel?: { model: string; baseUrl: string; apiKey: string }
-  mcpServers?: ReadonlyArray<{ name: string; command: string; args: readonly string[]; env: Readonly<Record<string, string>> }>
+  mcpServers?: ReadonlyArray<{ name: string; transport?: 'stdio' | 'http'; command: string; args: readonly string[]; env: Readonly<Record<string, string>> }>
   baseUrl: string
   apiKey: string
   timeoutMs: number
   signal: AbortSignal
-  onEvent: (kind: 'text' | 'note' | 'error', text: string) => void
+  onEvent: (kind: MaestroChannelEvent['kind'], text: string, detail?: string) => void
   /** Running usage snapshot, one call per frame that carries counts. */
   onUsage?: (stats: Record<string, string | number | boolean>) => void
 }): Promise<CodexRunResult> {
@@ -295,26 +390,54 @@ export async function runCodexTask(options: {
   let turnStatus: 'completed' | 'failed' | undefined
   let pendingStreamError = false
   const failureReasons: string[] = []
-  let stats: Record<string, string | number | boolean> = {}
+  let stats: RolloutUsageStats = {}
+
+  // `codex exec` only reports usage on `turn.completed`, but the CLI appends a
+  // `token_count` row to its rollout transcript after every model response
+  // (see codex-rollout.ts). Tailing that file keeps the board live; the
+  // turn-level numbers fill gaps until the last transcript drain settles totals.
+  let liveUsage: RolloutUsageStats = {}
+  let usageTail: RolloutUsageTail | undefined
+  const startUsageTail = (thread: string): void => {
+    if (usageTail !== undefined) return
+    usageTail = startRolloutUsageTail({
+      threadId: thread,
+      resume: options.resume === thread,
+      onUsage: usage => {
+        liveUsage = usage
+        options.onUsage?.({ ...mergeCodexUsageStats(liveUsage, stats) })
+      },
+      onWarning: message => {
+        liveUsage = {}
+        options.onEvent('note', message)
+      },
+    })
+  }
 
   const handleLine = (line: string): void => {
     let frame: CodexFrame
     try {
-      const parsed: unknown = JSON.parse(line)
-      if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) return
-      frame = parsed as CodexFrame
+      const parsed = codexFrameOf(JSON.parse(line))
+      if (parsed === undefined) return
+      frame = parsed
     } catch {
       if (line.trim().startsWith('{')) return
       options.onEvent('note', line.slice(0, 300))
       return
     }
-    if (frame.thread_id !== undefined && threadId === '') threadId = frame.thread_id
+    if (frame.thread_id !== undefined && threadId === '') {
+      threadId = frame.thread_id
+      startUsageTail(threadId)
+    }
     for (const event of codexFrameEvents(frame)) {
-      options.onEvent(event.kind, event.text)
-      if (event.kind === 'error') {
+      options.onEvent(event.kind, event.text, event.detail)
+      // 失败命令的事件本体是 tool 行（会话页折叠展示），失败归因在这里补。
+      if (frame.type === 'item.completed' && frame.item?.type === 'command_execution' && commandFailed(frame.item)) {
         // Progress previews are bounded; the returned failure retains the full
         // command diagnostic if the overall run ultimately fails.
-        failureReasons.push(frame.item?.type === 'command_execution' ? commandSummary(frame.item, false) : event.text)
+        failureReasons.push(commandSummary(frame.item, false))
+      } else if (event.kind === 'error') {
+        failureReasons.push(event.text)
       }
     }
     if (frame.type === 'item.completed' && frame.item?.type === 'agent_message' && (frame.item.text ?? '').trim() !== '') {
@@ -322,12 +445,10 @@ export async function runCodexTask(options: {
     }
     if (frame.msg?.type === 'agent_message' && (frame.msg.message ?? '').trim() !== '') finalText = frame.msg.message ?? ''
     // Keep real usage even if this frame/run fails; never infer it from logs.
-    const usageDelta = codexUsageStats(frame)
+    const usageDelta = usageFromTotals(frame.usage) ?? {}
     if (Object.keys(usageDelta).length > 0) {
-      stats = { ...stats, ...usageDelta }
-      // Codex reports usage once per turn, so the board updates when a turn
-      // completes rather than token by token (unlike claude's per-message frames).
-      options.onUsage?.({ ...stats })
+      stats = mergeCodexUsageStats(usageDelta, stats)
+      options.onUsage?.({ ...mergeCodexUsageStats(liveUsage, stats) })
     }
     if (frame.type === 'turn.completed') {
       turnStatus = 'completed'
@@ -339,27 +460,33 @@ export async function runCodexTask(options: {
     if (frame.type === 'error') pendingStreamError = true
   }
 
-  const { outcome } = runProcess({
-    ...(options.spawnFn === undefined ? {} : { spawnFn: options.spawnFn }),
-    file: options.codexPath,
-    args,
-    ...(options.cwd === undefined ? {} : { cwd: options.cwd }),
-    ...(Object.keys(env).length === 0 ? {} : { env }),
-    stdin: options.task,
-    timeoutMs: options.timeoutMs,
-    timeoutMode: 'idle',
-    onTimeoutWarning: remainingMs => {
-      options.onEvent('note', `CLI 已连续无 stdout/stderr 输出；若仍无输出，将在约 ${String(Math.round(remainingMs / 1000))} 秒后超时终止（无输出保护，不代表任务语义进展）`)
-    },
-    signal: options.signal,
-    onStdoutLine: handleLine,
-    // stderr is diagnostics, not protocol — surface it as notes so a hung or
-    // failing run is visible while it runs, not only in the final error string.
-    onStderrLine: (line: string) => { options.onEvent('note', `stderr: ${line.slice(0, 300)}`) },
-  })
-  const ended = await outcome
+  if (options.resume !== undefined && options.resume !== '' && !options.signal.aborted) startUsageTail(options.resume)
 
-  const runStats = { ...stats }
+  let ended: ChildOutcome
+  try {
+    const { outcome } = runProcess({
+      ...(options.spawnFn === undefined ? {} : { spawnFn: options.spawnFn }),
+      file: options.codexPath,
+      args,
+      ...(options.cwd === undefined ? {} : { cwd: options.cwd }),
+      ...(Object.keys(env).length === 0 ? {} : { env }),
+      stdin: options.task,
+      timeoutMs: options.timeoutMs,
+      timeoutMode: 'idle',
+      onTimeoutWarning: remainingMs => {
+        options.onEvent('note', `CLI 已连续无 stdout/stderr 输出；若仍无输出，将在约 ${String(Math.round(remainingMs / 1000))} 秒后超时终止（无输出保护，不代表任务语义进展）`)
+      },
+      signal: options.signal,
+      onStdoutLine: handleLine,
+      // stderr is diagnostics, not protocol — surface it while the run is active.
+      onStderrLine: (line: string) => { options.onEvent('note', `stderr: ${line.slice(0, 300)}`) },
+    })
+    ended = await outcome
+  } finally {
+    usageTail?.stop()
+  }
+
+  const runStats: Record<string, string | number | boolean> = { ...mergeCodexUsageStats(liveUsage, stats), usageNormalization: 'codex-turn-delta-v2' }
   if (threadId !== '') runStats['threadId'] = threadId
   if (ended.timedOut) runStats['timedOut'] = true
   // Individual tool errors are recoverable. Final turn/stream state, process

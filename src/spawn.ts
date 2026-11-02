@@ -7,7 +7,10 @@
 
 import { spawn, type ChildProcess } from 'node:child_process'
 import { execFile } from 'node:child_process'
-import { existsSync } from 'node:fs'
+import { constants, existsSync } from 'node:fs'
+import { access, stat } from 'node:fs/promises'
+import path from 'node:path'
+import { StringDecoder } from 'node:string_decoder'
 
 /** The spawn seam: everything a runner needs, injectable for tests. */
 export type SpawnFn = (file: string, args: readonly string[], options: SpawnOptionsLike) => ChildProcess
@@ -75,27 +78,56 @@ export function pickWindowsCandidate(candidates: readonly string[]): string | un
   return undefined
 }
 
-/** Every PATH hit for one command name, in `where`/`command -v` order. */
-export async function whereAll(name: string): Promise<string[]> {
-  if (process.platform === 'win32') {
-    const out = await execFileText('where.exe', [name])
-    return out.split(/\r?\n/).map(line => line.trim()).filter(line => line !== '')
-  }
-  const out = await execFileText('/bin/sh', ['-c', `command -v ${JSON.stringify(name)}`])
-  return out.split(/\r?\n/).map(line => line.trim()).filter(line => line !== '')
-}
-
-function execFileText(file: string, args: readonly string[]): Promise<string> {
-  return new Promise((resolvePromise, rejectPromise) => {
-    execFile(file, args as string[], { windowsHide: true, timeout: 10_000 }, (error, stdout) => {
-      // where.exe exits 1 on "no match" — treat any stdout as the answer.
-      if (error !== undefined && stdout === '') {
-        rejectPromise(error)
-        return
-      }
-      resolvePromise(stdout)
+/** Every PATH hit, without starting where.exe/a shell for each detection. */
+export async function whereAll(name: string, options: { env?: NodeJS.ProcessEnv; cwd?: string; timeoutMs?: number } = {}): Promise<string[]> {
+  const windows = process.platform === 'win32'
+  const env = options.env ?? process.env
+  const cwd = options.cwd ?? process.cwd()
+  const envValue = (key: string): string | undefined => windows
+    ? Object.entries(env).find(([candidate]) => candidate.toUpperCase() === key)?.[1]
+    : env[key]
+  const pathValue = envValue('PATH') ?? ''
+  const extensions = windows && path.extname(name) === ''
+    ? ['', ...new Set((envValue('PATHEXT') ?? '.COM;.EXE;.BAT;.CMD').split(';').map(value => value.trim()).filter(value => /^\.[a-z0-9]+$/i.test(value)))]
+    : ['']
+  // where.exe searches cwd first on Windows. Empty PATH entries mean cwd on
+  // POSIX; an absent PATH is not an implicit search of the current directory.
+  const directories = [
+    ...(windows ? [cwd] : []),
+    ...(pathValue === '' ? [] : pathValue.split(path.delimiter).map(value => value.trim().replace(/^"(.*)"$/, '$1') || cwd)),
+  ]
+  const seen = new Set<string>()
+  const candidates = directories.flatMap(directory => extensions.map(extension => path.resolve(cwd, directory, `${name}${extension}`)))
+    .filter(candidate => {
+      const key = windows ? candidate.toLowerCase() : candidate
+      if (seen.has(key)) return false
+      seen.add(key)
+      return true
     })
-  })
+  const hits: (string | undefined)[] = candidates.map(() => undefined)
+  const search = Promise.all(candidates.map(async (candidate, index) => {
+    try {
+      if (!(await stat(candidate)).isFile()) return
+      if (!windows) await access(candidate, constants.X_OK)
+      hits[index] = candidate
+    } catch {
+      // Missing or inaccessible candidates do not hide other PATH hits.
+    }
+  }))
+  // An offline PATH entry must not discard already-confirmed local hits.
+  const timeoutMs = options.timeoutMs ?? 1_000
+  let timer: ReturnType<typeof setTimeout> | undefined
+  try {
+    const expired = await Promise.race([
+      search.then(() => false),
+      new Promise<boolean>(resolvePromise => { timer = setTimeout(() => resolvePromise(true), timeoutMs) }),
+    ])
+    const found = hits.filter((candidate): candidate is string => candidate !== undefined)
+    if (expired && found.length === 0) throw new Error(`PATH 查找超时（${timeoutMs}ms）`)
+    return found
+  } finally {
+    clearTimeout(timer)
+  }
 }
 
 /**
@@ -161,6 +193,7 @@ export function runProcess(options: {
   onStdoutLine?: ((line: string) => void) | undefined
   onStderrLine?: ((line: string) => void) | undefined
 }): { child: ChildProcess; outcome: Promise<ChildOutcome> } {
+  options.signal.throwIfAborted()
   const spawnFn = options.spawnFn ?? systemSpawn
   const launch = launchPlan(options.file, options.args)
   const child = spawnFn(launch.file, launch.args, {
@@ -226,44 +259,42 @@ export function runProcess(options: {
   }
 
   const wire = (stream: NodeJS.ReadableStream | null, onLine: ((line: string) => void) | undefined, isStderr: boolean): void => {
-    if (stream === null || onLine === undefined) {
-      if (stream !== null && isStderr) {
-        stream.on('data', (chunk: Buffer) => { stderrTail = appendTail(stderrTail, chunk.toString('utf8')) })
-      }
-      return
-    }
+    if (stream === null) return
+    const decoder = new StringDecoder('utf8')
     let buffer = ''
-    stream.on('data', (chunk: Buffer) => {
-      const text = chunk.toString('utf8')
+    let discarding = false
+    const accept = (text: string): void => {
       if (isStderr) stderrTail = appendTail(stderrTail, text)
-      buffer += text
-      let index = buffer.indexOf('\n')
-      while (index >= 0) {
-        const line = buffer.slice(0, index).replace(/\r$/, '')
-        buffer = buffer.slice(index + 1)
-        if (line !== '') onLine(line)
-        index = buffer.indexOf('\n')
-      }
-      // A final line without a newline still matters (progress bars, final result).
-      // Wait for the newline however long the line gets — cutting it here would
-      // corrupt a JSONL record. Only a pathological line is dropped.
-      if (buffer.length > MAX_LINE_CHARS) {
-        stderrTail = appendTail(stderrTail, `\n[maestro] dropped an oversized line (${buffer.length} chars, no newline)`)
-        buffer = ''
-      }
-    })
-    stream.on('end', () => {
-      const rest = buffer.replace(/\r$/, '')
-      if (rest.trim() !== '' && onLine !== undefined) {
-        if (rest.length > MAX_LINE_CHARS) {
-          stderrTail = appendTail(stderrTail, `\n[maestro] dropped an oversized final line (${rest.length} chars)`)
-        } else {
-          onLine(rest)
+      if (onLine === undefined) return
+      let start = 0
+      while (start < text.length) {
+        const newline = text.indexOf('\n', start)
+        const end = newline < 0 ? text.length : newline
+        if (!discarding) {
+          const part = text.slice(start, end)
+          if (buffer.length + part.length > MAX_LINE_CHARS) {
+            stderrTail = appendTail(stderrTail, `\n[maestro] dropped an oversized line (limit ${MAX_LINE_CHARS} chars)`)
+            buffer = ''
+            discarding = true
+          } else buffer += part
         }
+        if (newline < 0) break
+        if (!discarding) {
+          const line = buffer.replace(/\r$/, '')
+          if (line !== '') onLine(line)
+        }
+        buffer = ''
+        discarding = false
+        start = newline + 1
       }
+    }
+    stream.on('data', (chunk: Buffer) => accept(decoder.write(chunk)))
+    stream.on('end', () => {
+      accept(decoder.end())
+      const rest = buffer.replace(/\r$/, '')
+      if (!discarding && rest.trim() !== '') onLine?.(rest)
+      buffer = ''
     })
-    // A stdio pipe error with no listener is an uncaught exception — the host
-    // must survive the child; the close event still settles the outcome.
     stream.on('error', (error: Error) => {
       stderrTail = appendTail(stderrTail, `\n[maestro] ${isStderr ? 'stderr' : 'stdout'} stream error: ${error.message}`)
     })

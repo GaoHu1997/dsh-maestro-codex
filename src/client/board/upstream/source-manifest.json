@@ -33,7 +33,9 @@
       "mode": "adapted",
       "sha256": "15d88b1ee857b1bbff25f540e7c104b21cab5a7250fcdcb3c36fb57b9c2b8cdb",
       "sourceSha256": "f04af9246b2f34bc63af2b42e1e3cb6dd39359adf7f1cb43b1e8102a72b4e98c",
-      "adaptations": ["Only teams.taskCreate/taskUpdate, original payloads, CAS and envelopes; no explorer API. Prefix-safe document.baseURI HTTP resolution; SSR returns unavailable."]
+      "adaptations": [
+        "Only teams.taskCreate/taskUpdate, original payloads, CAS and envelopes; no explorer API. Prefix-safe document.baseURI HTTP resolution; SSR returns unavailable."
+      ]
     },
     {
       "path": "client/use-markdown-surface.ts",
@@ -41,7 +43,9 @@
       "mode": "adapted",
       "sha256": "03cead4c36ab0bdfbf95e1eec3572fd3cc65d454ce663c387e585b4f4b892719",
       "sourceSha256": "27c8bf587132b4e548c96d85605cb3149d5f273368412a4e2bb02377812793c5",
-      "adaptations": ["Explicit Context.openMarkdownFile callback only, no explorer service or routes. Existing DOM id jumps supported; source rewrite is identity; original generated heading slugs and cross-file anchor retention not ported."]
+      "adaptations": [
+        "Explicit Context.openMarkdownFile callback only, no explorer service or routes. Existing DOM id jumps supported; source rewrite is identity; original generated heading slugs and cross-file anchor retention not ported."
+      ]
     },
     {
       "path": "client/SubagentView.module.css",
@@ -182,8 +186,9 @@
     {
       "path": "client/TasksPopovers.tsx",
       "source": "src/client/TasksPopovers.tsx",
-      "mode": "verbatim",
-      "sha256": "525cf6857815a536464a50691d4df99c07d7d5e7898fdb299158d9d98a0e2883"
+      "mode": "adapted-side-only-jump",
+      "sha256": "a6f71b974679a467852b5325629f636eb7d9e4c5f35ccb8762187ec9e683ae1c",
+      "sourceSha256": "525cf6857815a536464a50691d4df99c07d7d5e7898fdb299158d9d98a0e2883"
     },
     {
       "path": "client/JobsDrawer.tsx",
@@ -258,7 +263,9 @@
       ],
       "sha256": "f83dc0db04769ad8ec3961ac56ad4b1cdf7bf9513024353693fb6f992f0223c5",
       "sourceSha256": "93fccd6bd73747a126dba02498d7d4401e98cb8085b9230813ae538c1bb0da99",
-      "adaptations": ["Context is a narrow explicit task-note callback adapter, not the original plugin activation context."]
+      "adaptations": [
+        "Context is a narrow explicit task-note callback adapter, not the original plugin activation context."
+      ]
     },
     {
       "path": "client/sidechat-transcript.ts",

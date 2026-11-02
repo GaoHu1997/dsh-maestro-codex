@@ -1,11 +1,11 @@
 /**
- * The plugin configuration card on the dsh settings page — "CLI 子代理".
+ * The plugin configuration card on the dsh settings page — "子智能体".
  *
  * Tabbed layout, one concern per tab: per-CLI configuration (CLI 管理 — one
  * expandable row per CLI with model / task-type / permission / connection
- * settings), CLI binary management (SDK 管理 — one card per npm package with
- * a version picker, install / uninstall), routing defaults (调度设置) and the
- * task monitor (任务监视).
+ * settings), CLI binary management (SDK 管理 — one collapsible card per npm
+ * package with a version picker, install / uninstall), routing defaults
+ * (调度设置) and the task monitor (任务监视).
  *
  * Plain React + one injected stylesheet: the web shell has no CSS pipeline
  * and the card must be self-contained in the plugin bundle. The stylesheet
@@ -22,11 +22,13 @@ import {
 import { cliMinTaskDifficulty, fieldText, type MaestroFormActions, type MaestroFormState, type MaestroStore, type SectionValue, type StagedField } from './form.js'
 import { formatDuration, formatTokens } from './board/model.js'
 import type { BoardHost } from './board/data.js'
+import { EXECUTOR_BRANDS } from './board/accent.js'
+import { needsPerson } from '../stage.js'
 import { useUsageSummary } from './usage-panel.js'
 import {
-  cleanLogText, CLI_LABELS, CLI_PACKAGES, MAESTRO_CLI_IDS, TASK_TYPE_CATALOG, TERMINAL_PHASES,
-  type DshProviderModels, type MaestroCliId, type MaestroCliVersions, type MaestroOverview, type MaestroPhase,
-  type MaestroTaskDetail, type MaestroTaskSummary,
+  cleanLogText, CLI_LABELS, CLI_PACKAGES, MAESTRO_CLI_IDS, MAESTRO_STAGE_LABELS, TASK_TYPE_CATALOG, TASK_TYPE_DESCRIPTIONS, TERMINAL_PHASES,
+  type DshProviderModels, type MaestroCliId, type MaestroCliStatus, type MaestroCliVersions, type MaestroOverview, type MaestroPhase,
+  type MaestroStage, type MaestroTaskDetail, type MaestroTaskSummary,
 } from '../wire.js'
 
 /** The props the slot entry injects (see client/index.ts). */
@@ -37,11 +39,25 @@ export interface MaestroCardProps {
   maestroCtx?: BoardHost | undefined
 }
 
-/** Per-CLI identity colors, reused by the row monograms and the task list. */
+/** Per-CLI identity colors, reused by the task list and inline labels. */
 const CLI_BRAND: Record<MaestroCliId, string> = { claude: '#d97757', codex: '#10a37f' }
-const CLI_MONOGRAM: Record<MaestroCliId, string> = { claude: 'CL', codex: 'CX' }
 
 const CLI_OPTIONS = MAESTRO_CLI_IDS.map(cli => ({ value: cli, label: CLI_LABELS[cli] }))
+
+/** The built-in dsh fallback: no binary, no npm package, no model selection. */
+const DSH_LABEL = 'dsh 子代理'
+
+/** Installation and version knowledge are independent (including the first poll). */
+export function cliStatusLabel(status: MaestroCliStatus | undefined): string {
+  if (status === undefined || (status.checking === true && status.path === '') || status.error === '尚未检测') return '检测中…'
+  if (status.installed) return status.version === '' ? '已安装（版本未知）' : `v${status.version}`
+  return status.error?.includes('检测失败') === true ? '检测失败' : '未安装'
+}
+
+function cliStatusTone(status: MaestroCliStatus | undefined): 'idle' | 'ok' | 'warn' {
+  if (status === undefined || (status.checking === true && status.path === '')) return 'idle'
+  return !status.installed || status.error !== undefined ? 'warn' : 'ok'
+}
 
 export const TASK_DIFFICULTY_OPTIONS = [
   { value: 'low', label: '低' },
@@ -80,13 +96,14 @@ const SUBAGENT_LABELS: Record<MaestroCliId, string> = {
 }
 
 const PHASE_LABELS: Record<MaestroPhase, string> = {
-  queued: '排队中', running: '执行中', done: '已完成', failed: '失败', cancelled: '已取消', timeout: '超时',
+  queued: '排队中', running: '执行中', done: '已完成', failed: '失败', cancelled: '已取消', timeout: '超时', interrupted: '已中断',
 }
 
 /** The phase dot's color; running pulses. */
 const PHASE_COLOR: Record<MaestroPhase, string> = {
   queued: 'var(--dmc-fg3)', running: 'var(--dmc-accent)', done: 'var(--dmc-ok)',
   failed: 'var(--dmc-danger)', cancelled: 'var(--dmc-fg3)', timeout: 'var(--dmc-warn)',
+  interrupted: 'var(--dmc-warn)',
 }
 
 type TabId = 'cli' | 'sdk' | 'routing' | 'tasks'
@@ -160,12 +177,21 @@ const CARD_CSS = `
  * a separate dmch-* namespace so their horizontal rows cannot leak here. */
 .dmc-row { display: flex; flex-direction: column; align-items: stretch; min-width: 0; border: 1px solid var(--dmc-border); border-radius: 12px; background: var(--dmc-panel); overflow: hidden; }
 .dmc-stack { display: flex; flex-direction: column; gap: 10px; }
-.dmc-rowbtn { display: flex; align-items: center; gap: 12px; width: 100%; padding: 11px 14px; background: none; border: none; color: inherit; cursor: pointer; text-align: left; transition: background .15s; }
-.dmc-rowbtn:hover { background: var(--dmc-hover); }
+/* The header strip carries the expand button plus, on the CLI tab, the
+ * enable switch. The switch MUST stay outside the button: a checkbox nested in
+ * a button is invalid HTML, and its clicks would also collapse the row — the
+ * reason the switch used to live in the expanded body only. */
+.dmc-rowhead { display: flex; align-items: center; gap: 10px; padding: 0 14px; transition: background .15s; }
+.dmc-rowhead:hover { background: var(--dmc-hover); }
+.dmc-rowbtn { display: flex; align-items: center; gap: 12px; width: 100%; flex: 1; min-width: 0; padding: 11px 0; background: none; border: none; color: inherit; cursor: pointer; text-align: left; }
+.dmc-rowsw { flex: none; display: inline-flex; align-items: center; }
 .dmc-rowmain { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 1px; }
 .dmc-rowname { font-weight: 600; font-size: 13px; display: flex; align-items: center; gap: 8px; min-width: 0; flex-wrap: wrap; }
 .dmc-rowsub { font-size: 11.5px; color: var(--dmc-fg3); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.dmc-mono { width: 30px; height: 30px; border-radius: 9px; display: inline-flex; align-items: center; justify-content: center; font-size: 11px; font-weight: 700; letter-spacing: .03em; flex: none; }
+.dmc-mono { width: 30px; height: 30px; border-radius: 9px; display: inline-flex; align-items: center; justify-content: center; flex: none; }
+/* Executor mark: the board badge vocabulary (same SVG masks as the board
+ * source badges), so a row here reads as the same actor it does on the board. */
+.dmc-mono-glyph { display: block; background: currentColor; -webkit-mask-position: center; mask-position: center; -webkit-mask-size: contain; mask-size: contain; -webkit-mask-repeat: no-repeat; mask-repeat: no-repeat; }
 .dmc-chevron { flex: none; color: var(--dmc-fg3); transition: transform .18s; }
 .dmc-chevron-open { transform: rotate(180deg); }
 .dmc-detail { border-top: 1px solid var(--dmc-border); }
@@ -228,6 +254,10 @@ const CARD_CSS = `
 .dmc-knob { position: absolute; top: 2px; left: 2px; width: 14px; height: 14px; border-radius: 999px; background: #fff; box-shadow: 0 1px 2px rgba(0,0,0,.3); transition: left .18s; }
 .dmc-switch input:checked + .dmc-track .dmc-knob { left: 16px; }
 .dmc-switch input:disabled + .dmc-track { opacity: .45; cursor: not-allowed; }
+/* Always-on switch (built-in dsh fallback): disabled removes the click target,
+ * but the track keeps its enabled color instead of fading to 45%. */
+.dmc-rowsw-locked .dmc-switch { cursor: default; }
+.dmc-rowsw-locked .dmc-switch input:disabled + .dmc-track { opacity: 1; cursor: default; }
 .dmc-togglelabel { font-size: 12.5px; }
 
 /* --- save bar --- */
@@ -241,15 +271,19 @@ const CARD_CSS = `
 .dmc-typecard-on { border-color: color-mix(in srgb, var(--dmc-accent) 55%, transparent); background: var(--dmc-accent-soft); color: var(--dmc-accent); font-weight: 600; }
 .dmc-typecard:focus-visible { outline: 2px solid var(--dmc-accent); outline-offset: 2px; }
 
-/* --- SDK cards (one per CLI, dependency-manager layout) --- */
-.dmc-sdkcard { border: 1px solid var(--dmc-border); border-radius: 12px; background: var(--dmc-panel); padding: 14px 16px; display: flex; flex-direction: column; gap: 11px; }
-.dmc-sdkhead { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+/* --- SDK cards (one collapsible card per CLI, dependency-manager layout.
+ * The accordion shell reuses .dmc-row / .dmc-rowbtn from the CLI tab; only
+ * the expanded body and the header's status marks are SDK-specific.) --- */
+.dmc-sdkbody { padding: 14px 16px; display: flex; flex-direction: column; gap: 11px; }
 .dmc-sdkcheck { width: 18px; height: 18px; border-radius: 999px; display: inline-flex; align-items: center; justify-content: center; font-size: 11px; font-weight: 700; color: var(--dmc-ok); background: color-mix(in srgb, var(--dmc-ok) 15%, transparent); flex: none; }
 .dmc-sdkcheck-off { color: var(--dmc-fg3); background: color-mix(in srgb, var(--dmc-fg3) 15%, transparent); }
+/* A read-only row (dsh ships with the host): same geometry, no click
+ * affordance and no hover tint, so it does not look installable. */
+.dmc-rowhead-static:hover { background: none; }
+.dmc-rowbtn-static { cursor: default; }
 .dmc-sdkname { font-size: 14px; font-weight: 650; }
 .dmc-sdkver { font-size: 12px; color: var(--dmc-fg2); font-variant-numeric: tabular-nums; }
 .dmc-sdkarrow { color: var(--dmc-fg3); font-size: 12px; }
-.dmc-sdkdesc { margin: 0; font-size: 12px; color: var(--dmc-fg3); }
 .dmc-sdkfield { display: flex; flex-direction: column; gap: 4px; }
 .dmc-sdkactions { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
 .dmc-sdkmeta { font-size: 11.5px; color: var(--dmc-fg3); display: flex; gap: 14px; flex-wrap: wrap; font-variant-numeric: tabular-nums; }
@@ -263,6 +297,9 @@ const CARD_CSS = `
 .dmc-log-final { margin-top: 8px; padding-top: 8px; border-top: 1px dashed var(--dmc-border); color: var(--dmc-fg); }
 .dmc-banner { padding: 8px 12px; border-radius: 8px; font-size: 12px; line-height: 1.5; }
 .dmc-banner-err { color: var(--dmc-danger); background: color-mix(in srgb, var(--dmc-danger) 8%, transparent); border: 1px solid color-mix(in srgb, var(--dmc-danger) 28%, transparent); }
+.dmc-banner-info { color: var(--dmc-fg2); background: color-mix(in srgb, var(--dmc-accent) 8%, transparent); border: 1px solid color-mix(in srgb, var(--dmc-accent) 26%, transparent); }
+.dmc-notice { position: fixed; right: 24px; bottom: 80px; z-index: 90; max-width: min(420px, calc(100vw - 48px)); display: flex; align-items: flex-start; gap: 8px; box-shadow: 0 8px 24px rgba(0, 0, 0, .18); }
+.dmc-notice-text { flex: 1; min-width: 0; }
 
 /* --- tasks --- */
 .dmc-toolbar { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
@@ -301,8 +338,10 @@ function useStore<T>(store: { getSnapshot(): T; subscribe(listener: () => void):
  * switch itself is the click target: the wrapping element stretches to the
  * field's full width as a flex child, so a `<label>` around the whole thing
  * made every click in that row flip the switch — the text sits outside it.
+ * `ariaLabel` names the switch without printing a visible caption (the row
+ * header's trailing enable switch uses it).
  */
-function Toggle(props: { checked: boolean; onChange: (value: boolean) => void; label?: string | undefined; disabled?: boolean | undefined }): ReactNode {
+function Toggle(props: { checked: boolean; onChange: (value: boolean) => void; label?: string | undefined; ariaLabel?: string | undefined; disabled?: boolean | undefined }): ReactNode {
   return (
     <span className="dmc-toggle">
       <label className="dmc-switch">
@@ -310,7 +349,7 @@ function Toggle(props: { checked: boolean; onChange: (value: boolean) => void; l
           type="checkbox"
           checked={props.checked}
           disabled={props.disabled}
-          aria-label={props.label}
+          aria-label={props.ariaLabel ?? props.label}
           onChange={event => { props.onChange(event.target.checked) }}
         />
         <span className="dmc-track"><span className="dmc-knob" /></span>
@@ -398,15 +437,43 @@ function Chevron(props: { open: boolean }): ReactNode {
   )
 }
 
-/** The per-CLI identity mark (brand-tinted monogram). */
-function Monogram(props: { cli: MaestroCliId }): ReactNode {
-  const brand = CLI_BRAND[props.cli]
-  const style: CSSProperties = { background: `color-mix(in srgb, ${brand} 16%, transparent)`, color: brand }
-  return <span className="dmc-mono" style={style}>{CLI_MONOGRAM[props.cli]}</span>
+/**
+ * The executor mark at the head of a row: the board's own logo mask (claude
+ * flower, codex knot, DSH whale) on the board's brand tint, so a settings row
+ * and its board node read as the same actor.
+ */
+function ExecutorMark(props: { executor: 'claude' | 'codex' | 'DSH'; size?: number }): ReactNode {
+  const brand = EXECUTOR_BRANDS[props.executor] ?? { color: 'currentColor', mask: 'none' }
+  const glyph: CSSProperties = {
+    width: props.size ?? 16,
+    height: props.size ?? 16,
+    WebkitMaskImage: brand.mask,
+    maskImage: brand.mask,
+  }
+  return (
+    <span
+      className="dmc-mono"
+      data-executor={props.executor}
+      style={{ background: `color-mix(in srgb, ${brand.color} 16%, transparent)`, color: brand.color }}
+    >
+      <span className="dmc-mono-glyph" style={glyph} />
+    </span>
+  )
+}
+
+/**
+ * 阶段（stage）比 phase 多说一件事：这个任务现在是不是在等人。
+ * 只有 person/* 值得占位；`working` / `idle` 和 phase 说的是同一件事。
+ * 独立成纯函数，好让客户端测试直接覆盖这张表。
+ */
+export function stageChipLabel(stage: MaestroStage | undefined): string | undefined {
+  if (stage === undefined || !needsPerson(stage)) return undefined
+  return MAESTRO_STAGE_LABELS[stage]
 }
 
 /** Task phase pill with a colored (pulsing when running) dot. */
-function PhaseChip(props: { phase: MaestroPhase }): ReactNode {
+function PhaseChip(props: { phase: MaestroPhase; stage?: MaestroStage | undefined }): ReactNode {
+  const waiting = stageChipLabel(props.stage)
   return (
     <span className="dmc-phase">
       <span
@@ -414,6 +481,7 @@ function PhaseChip(props: { phase: MaestroPhase }): ReactNode {
         style={{ background: PHASE_COLOR[props.phase] }}
       />
       {PHASE_LABELS[props.phase]}
+      {waiting !== undefined && <span className="dmc-chip dmc-chip-warn">{waiting}</span>}
     </span>
   )
 }
@@ -618,6 +686,12 @@ export function MaestroCard(props: MaestroCardProps): ReactNode {
 
   const [tab, setTab] = useState<TabId>('cli')
   const [openCli, setOpenCli] = useState<MaestroCliId | undefined>(undefined)
+  // The dsh fallback has no CLI id (it never spawns a process), so its
+  // accordion state is separate from the two external CLIs.
+  const [openDsh, setOpenDsh] = useState(false)
+  // SDK tab uses the same one-open accordion as the CLI tab, so the page stays
+  // a glanceable list as more SDKs join.
+  const [openSdk, setOpenSdk] = useState<MaestroCliId | undefined>(undefined)
 
   const [overview, setOverview] = useState<MaestroOverview | undefined>(undefined)
   const [overviewError, setOverviewError] = useState('')
@@ -695,7 +769,7 @@ export function MaestroCard(props: MaestroCardProps): ReactNode {
       setHint(result.ok ? { text: result.hint, error: '' } : { text: '', error: result.error })
     })
     return () => { disposed = true }
-  }, [tab, values.minTaskDifficulty, values.claudeMinTaskDifficulty, values.codexMinTaskDifficulty, values.defaultCli, values.claudeTaskTypes, values.codexTaskTypes, values.claudeEnabled, values.codexEnabled])
+  }, [tab, values.minTaskDifficulty, values.claudeMinTaskDifficulty, values.codexMinTaskDifficulty, values.dshMinTaskDifficulty, values.defaultCli, values.claudeTaskTypes, values.codexTaskTypes, values.dshTaskTypes, values.claudeEnabled, values.codexEnabled])
 
   // Poll the selected task's detail until it settles: a terminal phase stops
   // the timer instead of polling a finished task forever.
@@ -760,8 +834,8 @@ export function MaestroCard(props: MaestroCardProps): ReactNode {
           return next
         })
       }
-      // The npm job may still be running; re-detect to pick the new binary up.
-      await withBusy(`refresh-${cli}`, () => refreshCli(cli))
+      // The host invalidates/re-detects after npm settles; probing now would
+      // only read the old or partially written installation.
     })()
   }
 
@@ -771,9 +845,8 @@ export function MaestroCard(props: MaestroCardProps): ReactNode {
   const activeCount = tasks.filter(task => task.phase === 'running' || task.phase === 'queued').length
 
   // Retire an optimistic npm click once the overview reports its task settled,
-  // then re-detect that CLI: the install request answers immediately, so the
-  // refresh fired right after it runs while `npm -g` is still writing and sees
-  // the old version. The TTL only catches a job that left the newest-20 window
+  // then share the host's post-install refresh. Never probe while npm is writing.
+  // The TTL only catches a job that left the newest-20 window
   // before we saw it end, so a stuck 「安装中…」 cannot outlive the npm timeout.
   useEffect(() => {
     if (Object.keys(npmClicks).length === 0) return
@@ -835,11 +908,19 @@ export function MaestroCard(props: MaestroCardProps): ReactNode {
     const status = statusOf(cli)
     const enabled = cli === 'claude' ? values.claudeEnabled === true : values.codexEnabled === true
     const taskTypes: readonly string[] = (cli === 'claude' ? values.claudeTaskTypes : values.codexTaskTypes) ?? []
-    const taskTypeField = cli === 'claude' ? 'claudeTaskTypes' : 'codexTaskTypes'
-    const toggleTaskType = (type: string): void => {
-      const next = taskTypes.includes(type) ? taskTypes.filter(entry => entry !== type) : [...taskTypes, type]
-      actions.setImmediate(taskTypeField, next)
-    }
+    // Task types name exactly one executor: the two CLIs and the built-in dsh
+    // fallback all draw from the same catalogue, so adding here removes there.
+    const otherOwners: ReadonlyArray<{ label: string; types: readonly string[] }> = cli === 'claude'
+      ? [
+          { label: CLI_LABELS.codex, types: values.codexTaskTypes ?? [] },
+          { label: DSH_LABEL, types: values.dshTaskTypes ?? [] },
+        ]
+      : [
+          { label: CLI_LABELS.claude, types: values.claudeTaskTypes ?? [] },
+          { label: DSH_LABEL, types: values.dshTaskTypes ?? [] },
+        ]
+    const otherTaskTypes: readonly string[] = otherOwners.flatMap(entry => entry.types)
+    const toggleTaskType = (type: string): void => { actions.toggleTaskType(cli, type) }
     const selection = dshSelectionOf(cli)
     const thinkingValue = String(cli === 'claude' ? values.claudeThinking ?? '' : values.codexThinking ?? '')
     // The thinking options ARE the selected model's configured reasoningEfforts.
@@ -861,33 +942,38 @@ export function MaestroCard(props: MaestroCardProps): ReactNode {
     }
     return (
       <div key={cli} className="dmc-row">
-        <button type="button" className="dmc-rowbtn" aria-expanded={open} onClick={() => { setOpenCli(open ? undefined : cli) }}>
-          <Monogram cli={cli} />
-          <span className="dmc-rowmain">
-            <span className="dmc-rowname">
-              {CLI_LABELS[cli]}
-              <StateChip tone={status === undefined ? 'idle' : status.installed ? 'ok' : 'warn'}>
-                {status === undefined ? '检测中…' : status.installed ? (status.version !== '' ? `v${status.version}` : '已安装') : '未安装'}
-              </StateChip>
-              {enabled ? undefined : <StateChip tone="idle">已停用</StateChip>}
+        <div className="dmc-rowhead">
+          <button type="button" className="dmc-rowbtn" aria-expanded={open} onClick={() => { setOpenCli(open ? undefined : cli) }}>
+            <ExecutorMark executor={cli} />
+            <span className="dmc-rowmain">
+              <span className="dmc-rowname">
+                {CLI_LABELS[cli]}
+                <StateChip tone={cliStatusTone(status)}>
+                  {cliStatusLabel(status)}
+                </StateChip>
+                {enabled ? undefined : <StateChip tone="idle">已停用</StateChip>}
+              </span>
+              <span className="dmc-rowsub">
+                {`${modelSummary(cli)} · ${String(taskTypes.length)} 类任务 · 最低难度 ${TASK_DIFFICULTY_OPTIONS.find(option => option.value === cliMinTaskDifficulty(values, cli))?.label ?? '中'}`}
+              </span>
             </span>
-            <span className="dmc-rowsub">
-              {`${modelSummary(cli)} · ${String(taskTypes.length)} 类任务 · 最低难度 ${TASK_DIFFICULTY_OPTIONS.find(option => option.value === cliMinTaskDifficulty(values, cli))?.label ?? '中'}`}
-            </span>
+            <Chevron open={open} />
+          </button>
+          {/* 启用开关放在折叠行尾：不用展开也能看到状态并直接切换。开关必须在
+           * button 之外——checkbox 嵌进 button 是非法 HTML，而且点它会顺带折叠整行。 */}
+          <span
+            className="dmc-rowsw"
+            title={enabled ? `${CLI_LABELS[cli]} 参与任务路由，点击可停用` : `${CLI_LABELS[cli]} 已停用，不参与任务路由，点击可启用`}
+          >
+            <Toggle
+              checked={enabled}
+              ariaLabel={`启用 ${CLI_LABELS[cli]}`}
+              onChange={value => { actions.setImmediate(cli === 'claude' ? 'claudeEnabled' : 'codexEnabled', value) }}
+            />
           </span>
-          <Chevron open={open} />
-        </button>
+        </div>
         {open && (
           <div className="dmc-detail dmc-body">
-            <div className="dmc-field">
-              <span className="dmc-label">启用此 CLI</span>
-              <Toggle
-                checked={enabled}
-                label={enabled ? '参与任务路由' : '已停用，不参与路由'}
-                onChange={value => { actions.setImmediate(cli === 'claude' ? 'claudeEnabled' : 'codexEnabled', value) }}
-              />
-            </div>
-
             <div className="dmc-group">
               <p className="dmc-grouptitle">模型</p>
               <div className="dmc-pair">
@@ -916,17 +1002,33 @@ export function MaestroCard(props: MaestroCardProps): ReactNode {
             <Field
               label="任务类型"
               wide
-              hint="关键词只用于选择此 CLI；还须达到此 CLI 的最低任务难度才会派发，全部未命中时用「调度设置」里的默认 CLI。"
+              hint="内置任务统一使用四字名称，悬停查看具体工作；关键词只用于选择此 CLI，还须达到此 CLI 的最低任务难度才会派发，全部未命中时用「调度设置」里的默认 CLI。"
             >
               <div className="dmc-typegrid">
-                {[...TASK_TYPE_CATALOG, ...taskTypes.filter(type => !TASK_TYPE_CATALOG.includes(type))].map(type => {
+                {[
+                  ...TASK_TYPE_CATALOG,
+                  ...taskTypes.filter(type => !TASK_TYPE_CATALOG.includes(type)),
+                  ...otherTaskTypes.filter(type => !TASK_TYPE_CATALOG.includes(type) && !taskTypes.includes(type)),
+                ].map(type => {
                   const on = taskTypes.includes(type)
+                  // 存量数据里多个执行器可能选了同一个类型：点这一下就把它归到这边，
+                  // 另外几个持有者在同一次写入里移除。
+                  const holders = otherOwners.filter(entry => entry.types.includes(type)).map(entry => entry.label)
+                  const heldByOther = !on && holders.length > 0
+                  const selectionHint = on
+                    ? '取消这一类型（只影响此 CLI）'
+                    : heldByOther
+                      ? `${holders.join('、')} 也有这一类型：勾选后会从那里移除`
+                      : '勾选这一类型（一个任务类型只属于一个执行器）'
+                  const description = TASK_TYPE_DESCRIPTIONS.get(type)
+                  const title = description === undefined ? selectionHint : `${description}\n${selectionHint}`
                   return (
                     <button
                       key={type}
                       type="button"
                       className={on ? 'dmc-typecard dmc-typecard-on' : 'dmc-typecard'}
                       aria-pressed={on}
+                      title={title}
                       onClick={() => { toggleTaskType(type) }}
                     >{type}</button>
                   )
@@ -1018,8 +1120,134 @@ export function MaestroCard(props: MaestroCardProps): ReactNode {
     )
   }
 
-  /** One SDK card (tab 2): dependency-manager layout — status header, version picker, actions, path. */
+  /**
+   * The built-in dsh fallback (tab 1, after the two CLIs). It never spawns a
+   * process of its own, so it has no model, permission, connection or enable
+   * switch: only the task types it owns and the difficulty floor at which it
+   * is preferred over doing the work in the main agent.
+   */
+  const dshRow = (): ReactNode => {
+    const taskTypes: readonly string[] = values.dshTaskTypes ?? []
+    const minimum = String(values.dshMinTaskDifficulty ?? 'low')
+    const otherOwners: ReadonlyArray<{ label: string; types: readonly string[] }> = [
+      { label: CLI_LABELS.claude, types: values.claudeTaskTypes ?? [] },
+      { label: CLI_LABELS.codex, types: values.codexTaskTypes ?? [] },
+    ]
+    const otherTaskTypes: readonly string[] = otherOwners.flatMap(entry => entry.types)
+    return (
+      <div key="dsh" className="dmc-row">
+        <div className="dmc-rowhead">
+          <button type="button" className="dmc-rowbtn" aria-expanded={openDsh} onClick={() => { setOpenDsh(!openDsh) }}>
+            <ExecutorMark executor="DSH" />
+            <span className="dmc-rowmain">
+              <span className="dmc-rowname">
+                {DSH_LABEL}
+                <StateChip tone="accent">内置</StateChip>
+                <span title="外部 CLI 不可用、任务类型只属于 dsh，或任务未达到所选 CLI 的最低难度时，由内置 dsh 子代理接手；它不替代外部 CLI。">
+                  <StateChip tone="ok">默认回退</StateChip>
+                </span>
+              </span>
+              <span className="dmc-rowsub">
+                {`${String(taskTypes.length)} 类任务 · 最低难度 ${TASK_DIFFICULTY_OPTIONS.find(option => option.value === minimum)?.label ?? '低'} · 随宿主提供`}
+              </span>
+            </span>
+            <Chevron open={openDsh} />
+          </button>
+          {/* dsh 随宿主内置，没有关闭路径：开关只为与上面两行对齐，永远呈现
+           * 开启态（disabled 只去掉点击目标，颜色由 .dmc-rowsw-locked 保住）。 */}
+          <span className="dmc-rowsw dmc-rowsw-locked" title="dsh 子代理随宿主内置，始终启用">
+            <Toggle checked onChange={() => {}} disabled ariaLabel="dsh 子代理（内置，始终启用）" />
+          </span>
+        </div>
+        {openDsh && (
+          <div className="dmc-detail dmc-body">
+            <SelectField
+              label="最低任务难度"
+              value={minimum}
+              options={TASK_DIFFICULTY_OPTIONS}
+              onChange={value => { actions.setImmediate('dshMinTaskDifficulty', value) }}
+              hint="外部 CLI 门槛未达、且任务达到这一门槛时，改用 dsh 子代理（subagent / subagent_fork）；仍未达到则由主代理直接完成。"
+            />
+
+            <Field
+              label="任务类型"
+              wide
+              hint="这一类任务不派发给外部 CLI，而由 dsh 子代理完成；一个任务类型只属于一个执行器，勾选后会从其他执行器移除。"
+            >
+              <div className="dmc-typegrid">
+                {[
+                  ...TASK_TYPE_CATALOG,
+                  ...taskTypes.filter(type => !TASK_TYPE_CATALOG.includes(type)),
+                  ...otherTaskTypes.filter(type => !TASK_TYPE_CATALOG.includes(type) && !taskTypes.includes(type)),
+                ].map(type => {
+                  const on = taskTypes.includes(type)
+                  const holders = otherOwners.filter(entry => entry.types.includes(type)).map(entry => entry.label)
+                  const heldByOther = !on && holders.length > 0
+                  const selectionHint = on
+                    ? '取消这一类型（只影响 dsh 子代理）'
+                    : heldByOther
+                      ? `${holders.join('、')} 也有这一类型：勾选后会从那里移除`
+                      : '勾选这一类型（一个任务类型只属于一个执行器）'
+                  const description = TASK_TYPE_DESCRIPTIONS.get(type)
+                  const title = description === undefined ? selectionHint : `${description}\\n${selectionHint}`
+                  return (
+                    <button
+                      key={type}
+                      type="button"
+                      className={on ? 'dmc-typecard dmc-typecard-on' : 'dmc-typecard'}
+                      aria-pressed={on}
+                      title={title}
+                      onClick={() => { actions.toggleTaskType('dsh', type) }}
+                    >{type}</button>
+                  )
+                })}
+              </div>
+            </Field>
+          </div>
+        )}
+      </div>
+    )
+  }
+
+  /**
+   * Read-only SDK row for dsh (tab 2): it ships inside the host, so there is
+   * nothing to install, upgrade or probe. It keeps the same collapsed-row
+   * geometry as an installable SDK (check dot, name + version, description)
+   * but is not expandable and has no hover/press affordance.
+   */
+  const dshSdkRow = (): ReactNode => {
+    const raw = overview?.dsh?.version
+    const version = typeof raw === 'string' && raw !== '' ? `v${raw}` : '版本未知'
+    return (
+      <div key="dsh-sdk" className="dmc-row">
+        <div className="dmc-rowhead dmc-rowhead-static">
+          <div className="dmc-rowbtn dmc-rowbtn-static">
+            <span className="dmc-sdkcheck" aria-hidden>✓</span>
+            <span className="dmc-rowmain">
+              <span className="dmc-rowname">
+                <span className="dmc-sdkname">dsh 子代理</span>
+                <span className="dmc-sdkver">{version}</span>
+                <StateChip tone="accent">内置</StateChip>
+                <span title="外部 CLI 不可用、任务类型只属于 dsh，或任务未达到所选 CLI 的最低难度时，由内置 dsh 子代理接手；它不替代外部 CLI。">
+                  <StateChip tone="ok">默认回退</StateChip>
+                </span>
+              </span>
+              <span className="dmc-rowsub">随宿主安装，无需 npm 安装 / 升级</span>
+            </span>
+          </div>
+        </div>
+      </div>
+    )
+  }
+
+  /**
+   * One collapsible SDK card (tab 2). The collapsed header keeps the
+   * dependency-manager glance — installed check, current/target version,
+   * update & npm-job chips — and expanding reveals the version picker,
+   * actions, and install path. Same accordion behavior as the CLI tab.
+   */
   const sdkRow = (cli: MaestroCliId): ReactNode => {
+    const open = openSdk === cli
     const status = statusOf(cli)
     const installed = status?.installed === true
     const current = installed ? status.version : ''
@@ -1035,79 +1263,88 @@ export function MaestroCard(props: MaestroCardProps): ReactNode {
     const buttons = sdkActionButtons({ running, busy: busy !== '', installed, current, selected })
     const liveTask = liveNpmTask(tasks, cli)
     return (
-      <div key={cli} className="dmc-sdkcard">
-        <div className="dmc-sdkhead">
-          <span className={installed ? 'dmc-sdkcheck' : 'dmc-sdkcheck dmc-sdkcheck-off'} aria-hidden>{installed ? '✓' : '·'}</span>
-          <span className="dmc-sdkname">{SDK_TITLES[cli]}</span>
-          <span className="dmc-sdkver">{current === '' ? '未安装' : `v${current}`}</span>
-          {hasUpdate && (
-            <>
-              <span className="dmc-sdkarrow">→</span>
-              <span className="dmc-sdkver">{`v${latest}`}</span>
-              <StateChip tone="accent">有更新</StateChip>
-            </>
-          )}
-          {running !== undefined && <StateChip tone="accent">{running === 'install' ? '安装中…' : '卸载中…'}</StateChip>}
-          <span style={{ flex: 1 }} />
-          <button type="button" className="dmc-btn dmc-btn-sm" disabled={busy !== '' || buttons.locked} onClick={() => { void withBusy(`refresh-${cli}`, () => refreshCli(cli)) }}>重新检测</button>
-        </div>
-        <p className="dmc-sdkdesc">{SDK_DESCRIPTIONS[cli]}</p>
-
-        <Field label="目标版本" hint={`只列正式版（不含 alpha / beta）· 当前平台 ${registry?.platform ?? '—'}`}>
-          <select
-            className="dmc-select"
-            value={selected}
-            disabled={loading || options.length === 0 || buttons.locked}
-            onChange={event => { setVersionDraft(previous => ({ ...previous, [cli]: event.target.value })) }}
-          >
-            <option value="">{loading ? '加载版本列表…' : (latest === '' ? '最新版' : `最新版（v${latest}）`)}</option>
-            {options.map(version => (
-              <option key={version} value={version}>{version === current ? `v${version}（当前）` : `v${version}`}</option>
-            ))}
-          </select>
-        </Field>
-
-        <div className="dmc-sdkactions">
-          <button
-            type="button"
-            className="dmc-btn dmc-btn-primary"
-            disabled={buttons.installDisabled}
-            aria-busy={running === 'install'}
-            onClick={() => { npmAction(cli, 'install', selected) }}
-          >{buttons.installLabel}</button>
-          <button
-            type="button"
-            className="dmc-btn dmc-btn-danger"
-            disabled={buttons.uninstallDisabled}
-            aria-busy={running === 'uninstall'}
-            onClick={() => { npmAction(cli, 'uninstall') }}
-          >{buttons.uninstallLabel}</button>
-          {loading && <span className="dmc-sdkloading">正在读取 npm registry 版本…</span>}
-          {running !== undefined && (
-            <span className="dmc-sdkloading">
-              {`npm ${running} 进行中${liveTask === undefined ? '' : `：${liveTask.id}`}，完成前不能重复执行，结束后自动重新检测版本`}
+      <div key={cli} className="dmc-row">
+        <div className="dmc-rowhead">
+          <button type="button" className="dmc-rowbtn" aria-expanded={open} onClick={() => { setOpenSdk(open ? undefined : cli) }}>
+            <span className={installed ? 'dmc-sdkcheck' : 'dmc-sdkcheck dmc-sdkcheck-off'} aria-hidden>{installed ? '✓' : '·'}</span>
+            <span className="dmc-rowmain">
+              <span className="dmc-rowname">
+                <span className="dmc-sdkname">{SDK_TITLES[cli]}</span>
+                <span className="dmc-sdkver">{cliStatusLabel(status)}</span>
+                {hasUpdate && (
+                  <>
+                    <span className="dmc-sdkarrow">→</span>
+                    <span className="dmc-sdkver">{`v${latest}`}</span>
+                    <StateChip tone="accent">有更新</StateChip>
+                  </>
+                )}
+                {running !== undefined && <StateChip tone="accent">{running === 'install' ? '安装中…' : '卸载中…'}</StateChip>}
+              </span>
+              <span className="dmc-rowsub">{SDK_DESCRIPTIONS[cli]}</span>
             </span>
-          )}
+            <Chevron open={open} />
+          </button>
         </div>
+        {open && (
+          <div className="dmc-detail dmc-sdkbody">
+            <Field label="目标版本" hint={`只列正式版（不含 alpha / beta）· 当前平台 ${registry?.platform ?? '—'}`}>
+              <select
+                className="dmc-select"
+                value={selected}
+                disabled={loading || options.length === 0 || buttons.locked}
+                onChange={event => { setVersionDraft(previous => ({ ...previous, [cli]: event.target.value })) }}
+              >
+                <option value="">{loading ? '加载版本列表…' : (latest === '' ? '最新版' : `最新版（v${latest}）`)}</option>
+                {options.map(version => (
+                  <option key={version} value={version}>{version === current ? `v${version}（当前）` : `v${version}`}</option>
+                ))}
+              </select>
+            </Field>
 
-        <div className="dmc-sdkmeta">
-          <span>{`当前版本 ${current === '' ? '—' : `v${current}`}`}</span>
-          <span>{`最新稳定版 ${latest === '' ? (loading ? '加载中…' : '—') : `v${latest}`}`}</span>
-        </div>
+            <div className="dmc-sdkactions">
+              <button
+                type="button"
+                className="dmc-btn dmc-btn-primary"
+                disabled={buttons.installDisabled}
+                aria-busy={running === 'install'}
+                onClick={() => { npmAction(cli, 'install', selected) }}
+              >{buttons.installLabel}</button>
+              <button
+                type="button"
+                className="dmc-btn dmc-btn-danger"
+                disabled={buttons.uninstallDisabled}
+                aria-busy={running === 'uninstall'}
+                onClick={() => { npmAction(cli, 'uninstall') }}
+              >{buttons.uninstallLabel}</button>
+              <button type="button" className="dmc-btn dmc-btn-sm" disabled={busy !== '' || buttons.locked} onClick={() => { void withBusy(`refresh-${cli}`, () => refreshCli(cli)) }}>重新检测</button>
+              {loading && <span className="dmc-sdkloading">正在读取 npm registry 版本…</span>}
+              {running !== undefined && (
+                <span className="dmc-sdkloading">
+                  {`npm ${running} 进行中${liveTask === undefined ? '' : `：${liveTask.id}`}，完成前不能重复执行，结束后自动重新检测版本`}
+                </span>
+              )}
+            </div>
 
-        {registry !== undefined && registry.error !== '' && (
-          <div className="dmc-banner dmc-banner-err">{`无法读取 npm registry：${registry.error}`}</div>
+            <div className="dmc-sdkmeta">
+              <span>{`当前版本 ${current === '' ? '—' : `v${current}`}`}</span>
+              <span>{`最新稳定版 ${latest === '' ? (loading ? '加载中…' : '—') : `v${latest}`}`}</span>
+            </div>
+
+            {registry !== undefined && registry.error !== '' && (
+              <div className="dmc-banner dmc-banner-err">{`无法读取 npm registry：${registry.error}`}</div>
+            )}
+            {status?.error !== undefined && status.error !== '' && (
+              <div className="dmc-banner dmc-banner-err">{status.error}</div>
+            )}
+
+            <div className="dmc-sdkpath">
+              <span aria-hidden>📁</span>
+              <span title={installed ? status.path : CLI_PACKAGES[cli]}>
+                {installed ? status.path : `未安装 · npm -g ${CLI_PACKAGES[cli]}`}
+              </span>
+            </div>
+          </div>
         )}
-        {status?.error !== undefined && status.error !== '' && (
-          <div className="dmc-banner dmc-banner-err">{status.error}</div>
-        )}
-
-        <div className="dmc-sdkpath">
-          <span aria-hidden>📁</span>
-          <span title={installed ? status.path : CLI_PACKAGES[cli]}>
-            {installed ? status.path : `未安装 · npm -g ${CLI_PACKAGES[cli]}`}
-          </span>
-        </div>
       </div>
     )
   }
@@ -1116,8 +1353,8 @@ export function MaestroCard(props: MaestroCardProps): ReactNode {
     <div className="dmc">
       <header className="dmc-head">
         <div>
-          <h3 className="dmc-title">CLI 子代理</h3>
-          <p className="dmc-subtitle">把任务按类型派发给 codex / claude 子代理（headless），取回结果回填主会话</p>
+          <h3 className="dmc-title">子智能体</h3>
+          <p className="dmc-subtitle">按类型把任务派发给 claude / codex 子代理（headless），未达门槛时回退内置 dsh 子代理，结果回填主会话</p>
         </div>
         <div className="dmc-headside">
           {activeCount > 0 && <StateChip tone="accent">{`子代理运行中 ${String(activeCount)}`}</StateChip>}
@@ -1142,7 +1379,7 @@ export function MaestroCard(props: MaestroCardProps): ReactNode {
 
       {notice !== '' && <div className="dmc-banner dmc-banner-err">{notice}</div>}
 
-      {tab === 'cli' && <div className="dmc-stack">{MAESTRO_CLI_IDS.map(cliRow)}</div>}
+      {tab === 'cli' && <div className="dmc-stack">{MAESTRO_CLI_IDS.map(cliRow)}{dshRow()}</div>}
 
       {tab === 'sdk' && (
         <div className="dmc-stack">
@@ -1160,6 +1397,7 @@ export function MaestroCard(props: MaestroCardProps): ReactNode {
             <button type="button" className="dmc-btn" disabled={busy !== ''} onClick={refreshAll}>全部重新检测</button>
           </div>
           {MAESTRO_CLI_IDS.map(sdkRow)}
+          {dshSdkRow()}
           <div className="dmc-hint">「目标版本」来自 npm registry，可安装任意已发布版本；安装 / 卸载通过 npm -g 执行，过程与结果在「任务监视」标签页实时可见。registry 改动需保存。</div>
         </div>
       )}
@@ -1211,6 +1449,47 @@ export function MaestroCard(props: MaestroCardProps): ReactNode {
                 </div>
                 <div className="dmc-field">
                   <Toggle
+                    checked={values.bridgeSkills !== false}
+                    label="桥接 dsh 技能到子代理"
+                    onChange={value => { actions.setImmediate('bridgeSkills', value) }}
+                  />
+                  <span className="dmc-hint">派发时把 dsh 技能目录（名称 + 摘要）注入任务开头，子代理经 dsh_bridge 工具按需加载全文；只暴露「模型可调用」的技能。</span>
+                </div>
+                <div className="dmc-grid">
+                  <SelectField
+                    label="桥接宿主工具"
+                    value={String(values.bridgeTools ?? 'auto')}
+                    options={[
+                      { value: 'auto', label: '自动（排除 shell/文件/会话类）' },
+                      { value: 'custom', label: '自定义白名单' },
+                      { value: 'off', label: '关闭' },
+                    ]}
+                    onChange={value => { actions.setImmediate('bridgeTools', value) }}
+                    hint="子代理经 dsh_bridge 调用 dsh 宿主工具（走完整审批流水线）；MCP 工具不重复桥接（stdio 已原生桥接）。"
+                  />
+                  <SelectField
+                    label="claude 技能加载方式"
+                    value={String(values.claudeSkillsMode ?? 'bridge')}
+                    options={[
+                      { value: 'bridge', label: 'dsh_bridge 按需加载' },
+                      { value: 'native', label: '原生技能目录（--add-dir）' },
+                    ]}
+                    onChange={value => { actions.setImmediate('claudeSkillsMode', value) }}
+                    hint="原生模式把技能暂存成临时 .claude/skills 树挂给 claude，用 claude 自带的 Skill 工具与 /技能名 加载；暂存失败自动回退 dsh_bridge。"
+                  />
+                </div>
+                {values.bridgeTools === 'custom' && (
+                  <StagedArea
+                    label="工具白名单（每行一个精确工具名）"
+                    field="bridgeToolAllowlist"
+                    state={form}
+                    actions={actions}
+                    placeholder={'web_search\nmcp__http_server__tool'}
+                    hint="自定义模式按名单精确匹配；http 传输的 MCP 工具（mcp__服务器__工具）只能从这里桥接给子代理。"
+                  />
+                )}
+                <div className="dmc-field">
+                  <Toggle
                     checked={values.persistTasks !== false}
                     label="保存任务结果到本地"
                     onChange={value => { actions.setImmediate('persistTasks', value) }}
@@ -1224,6 +1503,14 @@ export function MaestroCard(props: MaestroCardProps): ReactNode {
                     onChange={value => { actions.setImmediate('injectGitContext', value) }}
                   />
                   <span className="dmc-hint">派发前把 cwd 的分支与未提交改动（git status 只读快照）拼在任务开头，CLI 子代理少猜一轮工作区状态。</span>
+                </div>
+                <div className="dmc-field">
+                  <Toggle
+                    checked={values.recordChildSessions !== false}
+                    label="记录为原生子会话"
+                    onChange={value => { actions.setImmediate('recordChildSessions', value) }}
+                  />
+                  <span className="dmc-hint">每次派发在 dsh 里建一条真实子会话：用量进 tokenUsage 等标准投影（统计类插件可直接读取），顶部子智能体下拉与看板按同一目录行去重。关闭后仅任务看板可见。</span>
                 </div>
               </div>
             </div>
@@ -1266,7 +1553,7 @@ export function MaestroCard(props: MaestroCardProps): ReactNode {
                       className={task.id === selectedId ? 'dmc-taskrow dmc-taskrow-active' : 'dmc-taskrow'}
                       onClick={() => { setSelectedId(task.id === selectedId ? '' : task.id) }}
                     >
-                      <PhaseChip phase={task.phase} />
+                      <PhaseChip phase={task.phase} stage={task.stage} />
                       <span className="dmc-dot" style={{ background: CLI_BRAND[task.cli] }} />
                       <span className="dmc-taskowner">{SUBAGENT_LABELS[task.cli]}</span>
                       <span className="dmc-tasktitle" title={task.title}>{task.title}</span>
@@ -1298,6 +1585,11 @@ export function MaestroCard(props: MaestroCardProps): ReactNode {
                       ))}
                       {detail.finalText !== undefined && <div className="dmc-log-final">{cleanLogText(detail.finalText)}</div>}
                     </div>
+                    {detail.summary.result !== undefined && detail.summary.result.source === 'protocol' && (
+                      <div className="dmc-banner" style={{ marginTop: 8 }}>
+                        {`收尾：${detail.summary.result.state}${detail.summary.result.humanAction === undefined ? '' : `；需要你：${detail.summary.result.humanAction}`}`}
+                      </div>
+                    )}
                     {detail.error !== undefined && <div className="dmc-banner dmc-banner-err" style={{ marginTop: 8 }}>{detail.error}</div>}
                     {detail.stats !== undefined && Object.keys(detail.stats).length > 0 && (
                       <div className="dmc-chips" style={{ marginTop: 8 }}>
@@ -1311,6 +1603,15 @@ export function MaestroCard(props: MaestroCardProps): ReactNode {
               </div>
             </div>
           </div>
+        </div>
+      )}
+
+      {form.notice !== undefined && (
+        <div
+          className={`dmc-banner dmc-notice ${form.notice.tone === 'error' ? 'dmc-banner-err' : 'dmc-banner-info'}`}
+          role="status"
+        >
+          <span className="dmc-notice-text">{form.notice.text}</span>
         </div>
       )}
 
