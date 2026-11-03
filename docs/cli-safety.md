@@ -50,7 +50,7 @@ stdio MCP 是直接子进程配置；HTTP MCP 是宿主工具桥接路径，不�
 
 插件通过公开 `maestroCliAccounting` 服务把某个父会话的完整结算历史交给已授权的其他插件/页面；读取必须持有该父会话的宿主能力，`sessionId` 本身不授权，也不提供全局回退。`semantics.requests` 是已结算的 CLI 任务数，不是 provider billable 调用数；`semantics.nativeMirrors` 标明父子是同一笔消耗，统计方不可相加。
 
-CLI child 的 `maestro/cli-child` marker 标明 parent/child/task/usageId/source，标准 tokenUsage 是同一笔消耗的镜像。新建 child 通过公开 `create` seed 保存 **`ignorable: true`** 的只读 marker，结算不再用 `Session.append` 追加私有事件；冷恢复直接持久化的 marker 同样显式标记可忽略。如果结算身份改变而不能匹配只读 marker，则仅保留 canonical 账本，省略会误归属的原生用量样本。统计插件应按该关联去重，不能同时把父自定义账本与子标准投影各加一遍。必填 input/output 或语义未知时不伪造标准 usage；可选 cache 未知时省略，可靠的真实 0 保留。total 只保留 provider 的有效明确值，不编造总额与费用。
+CLI child 的 `maestro/cli-child` marker 标明 parent/child/task/usageId/source，标准 tokenUsage 是同一笔消耗的镜像。新建 child 通过公开 `create` seed 保存 **`ignorable: true`** 的只读 marker，结算不再用 `Session.append` 追加私有事件；**运行中的用量快照也不再写 `maestro/cli-usage-live`**（0.1.6 曾向子会话与父会话追加该类型，因宿主 append 丢弃 `ignorable` 而使父会话日志无法加载；0.1.7 起移除，实时数字只走任务板 `setLiveStats` 与显示镜像）。冷恢复直接持久化的 marker 同样显式标记可忽略。如果结算身份改变而不能匹配只读 marker，则仅保留 canonical 账本，省略会误归属的原生用量样本。统计插件应按该关联去重，不能同时把父自定义账本与子标准投影各加一遍。必填 input/output 或语义未知时不伪造标准 usage；可选 cache 未知时省略，可靠的真实 0 保留。total 只保留 provider 的有效明确值，不编造总额与费用。
 
 宿主重启后的原生镜像恢复使用公开接口：插件自有 `maestroCliRecord` host-only 投影 + `sessionQuery.readSession` + `sessionPersistence.open/create`。只有**同时**满足「公开 query 报确切的 `SESSION_QUERY_SESSION_NOT_FOUND`」「目标物理 generation 不存在」「绑定 identity/epoch 在每次 await 后仍一致」才尝试重建；`stat` 返回 undefined 或 header 损坏都视为未知并跳过，因为二者都不能证明磁盘上没有旧记录。重建只追加 4 条计数观察事件并复用 canonical 的 usageId，不伪造原任务文本、最终答复、catalog 或 Agent；原 prefix、header 与 cut 绝不重写，`flush` 只代表本次写句柄的 barrier，不等于其他第三方统计已读到。无法确认时明确 `skipped` 并保留 canonical，宁可少补也不重复计账。
 

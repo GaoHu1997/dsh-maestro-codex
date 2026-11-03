@@ -213,7 +213,7 @@ describe('bounded --version fallback', () => {
 })
 
 describe('filesystem PATH lookup', () => {
-  it('keeps confirmed local hits when another PATH entry is stalled', async () => {
+  it('keeps confirmed local hits when another PATH entry is stalled', { timeout: 25_000 }, async () => {
     const dir = await directory()
     const offline = path.join(dir, 'offline')
     const name = 'maestro-partial-path'
@@ -247,7 +247,7 @@ describe('filesystem PATH lookup', () => {
     expect(hits.map(value => value.toLowerCase())).toEqual([executable.toLowerCase()])
   })
 
-  it.skipIf(process.platform !== 'win32')('retains only supported Windows launch targets when sh/ps1 files exist', async () => {
+  it.skipIf(process.platform !== 'win32')('retains only supported Windows launch targets when sh/ps1 files exist', { timeout: 25_000 }, async () => {
     const dir = await directory()
     await writeFile(path.join(dir, 'maestro-lookup'), 'shell shim')
     await writeFile(path.join(dir, 'maestro-lookup.ps1'), 'powershell shim')

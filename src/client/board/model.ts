@@ -586,12 +586,16 @@ export function formatClock(ts: number): string {
   return `${pad(date.getHours())}:${pad(date.getMinutes())}:${pad(date.getSeconds())}`
 }
 
-/** token 数 → `1.2k` / `3.4M`。 */
+/** token 数 → `517` / `12.2k` / `517k` / `1.2M`（与宿主 formatTokens 同一取整规则：
+ * 三位以上整数不再保留小数，避免 1555 → `1.6k` 这类读起来像精确值的写法）。 */
 export function formatTokens(count: number): string {
   if (!Number.isFinite(count) || count <= 0) return '0'
   if (count < 1000) return String(Math.round(count))
-  if (count < 1_000_000) return `${(count / 1000).toFixed(1)}k`
-  return `${(count / 1_000_000).toFixed(1)}M`
+  const scaled = (candidate: number): string => candidate >= 100
+    ? String(Math.round(candidate))
+    : String(Math.round(candidate * 10) / 10)
+  if (count < 1_000_000) return `${scaled(count / 1000)}k`
+  return `${scaled(count / 1_000_000)}M`
 }
 
 /** 一行 token 摘要：输入(未缓存) / 输出 / 缓存读。 */

@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from 'vitest'
 import { Session } from '@deepseek-ai/dsh-session'
-import { CLI_CHILD_RECORD_EVENT, CLI_USAGE_LIVE_EVENT, createChildSessionRecorder, type ChildSessionAppend, type ChildSessionStoreFace } from '../src/child-session.js'
+import { CLI_CHILD_RECORD_EVENT, createChildSessionRecorder, type ChildSessionAppend, type ChildSessionStoreFace } from '../src/child-session.js'
 
 interface RecordedEvent { readonly type: string; readonly data: Record<string, unknown>; readonly opts: { surfaceOp?: 'append' } | undefined; readonly ignorable?: true }
 interface FakeSession { readonly id: string; readonly meta: { cwd?: string; parentSession?: string; origin?: string } | undefined; readonly events: RecordedEvent[] }
@@ -30,7 +30,7 @@ function recorder(store: ChildSessionStoreFace | undefined, recordChildSessions 
 const START = { taskId: 'task-1', cli: 'claude', startedAt: 1000, label: 'cli · 数据任务', taskText: '整理数据并输出报表', cwd: 'D:/work', parentSessionId: 'session-parent' } as const
 const USAGE = { inputTokens: 1200, outputTokens: 340, cachedInputTokens: 56, cacheWriteTokens: 7, usageInputSemantics: 'uncached' } as const
 const ROUTE = { provider: 'ofox', model: 'gpt-6.1-sol' }
-const nativeEvents = (events: RecordedEvent[]) => events.filter(e => e.type !== CLI_CHILD_RECORD_EVENT && e.type !== CLI_USAGE_LIVE_EVENT && e.type !== 'request/context')
+const nativeEvents = (events: RecordedEvent[]) => events.filter(e => e.type !== CLI_CHILD_RECORD_EVENT && e.type !== 'request/context')
 
 describe('CLI record session start', () => {
   it('creates native parent lineage and a one-shot catalog without pretending DSH continuation', () => {
@@ -101,7 +101,7 @@ describe('CLI native settlement', () => {
     expect(events[2]?.data).toMatchObject({ turn: 1, step: 1, stream: [], message: { role: 'assistant', source: { kind: 'model', ...ROUTE } },
       usage: { inputTokens: 1200, outputTokens: 340, cacheReadTokens: 56, cacheWriteTokens: 7 } })
     expect(all.find(e => e.type === 'request/context')?.data).toEqual(ROUTE)
-    expect(fake.parent.events.map(e => e.type)).toEqual(['subagent/catalog', CLI_USAGE_LIVE_EVENT])
+    expect(fake.parent.events.map(e => e.type)).toEqual(['subagent/catalog'])
   })
   it('attributes a failed attempt through request/context without fake optional zeros', () => {
     const fake = fakeStore()
@@ -184,70 +184,36 @@ describe('real installed Session append contract (not cross-plugin R acceptance)
     child.start({ ...START, parentSessionId: 'real-parent', parentSession: wrap(parent) })
     child.settle({ taskId: 'task-1', ok, stats: USAGE, route: ROUTE, finalText: 'ok' })
     expect(warn).not.toHaveBeenCalled()
-    expect(sessions.get('cli-task-1')?.seq).toBe(7)
+    expect(sessions.get('cli-task-1')?.seq).toBe(6)
     const markers = (committed as Array<{ type: string; ignorable?: true }>).filter(event => event.type === CLI_CHILD_RECORD_EVENT)
     expect(markers).toHaveLength(1)
     expect(markers[0]?.ignorable).toBe(true)
-    expect(parent.seq).toBe(2)
+    expect(parent.seq).toBe(1)
     expect(() => Session.create('cli-task-1', committed as Parameters<typeof Session.create>[1])).not.toThrow()
   })
 })
 
-describe('CLI live usage snapshots', () => {
-  it('throttles running snapshots and leaves one durable settlement on the parent', () => {
-    vi.useFakeTimers()
-    try {
-      vi.setSystemTime(10_000)
-      const fake = fakeStore()
-      const child = recorder(fake.store)
-      child.start({ ...START, parentSession: fake.parent })
-      const liveOf = () => (fake.sessions.get('cli-task-1')?.events ?? []).filter(e => e.type === CLI_USAGE_LIVE_EVENT)
-      child.reportLive({ taskId: 'task-1', stats: USAGE, route: ROUTE })
-      expect(liveOf()).toHaveLength(1)
-      expect(liveOf()[0]?.data).toMatchObject({
-        version: 1, kind: 'live', phase: 'running',
-        taskId: 'task-1', childSessionId: 'cli-task-1', parentSessionId: 'session-parent',
-        provider: 'ofox', model: 'gpt-6.1-sol', turn: 1, step: 1,
-        usage: { inputTokens: 1200, outputTokens: 340, cacheReadTokens: 56, cacheWriteTokens: 7 },
-      })
-      // Identical counters inside the window: no duplicate snapshot.
-      child.reportLive({ taskId: 'task-1', stats: USAGE, route: ROUTE })
-      expect(liveOf()).toHaveLength(1)
-      // New counters still wait for the throttle window.
-      child.reportLive({ taskId: 'task-1', stats: { ...USAGE, inputTokens: 1500 }, route: ROUTE })
-      expect(liveOf()).toHaveLength(1)
-      vi.setSystemTime(12_500)
-      child.reportLive({ taskId: 'task-1', stats: { ...USAGE, inputTokens: 1500 }, route: ROUTE })
-      expect(liveOf()).toHaveLength(2)
-      expect(liveOf()[1]?.data['usage']).toMatchObject({ inputTokens: 1500 })
-      // Settlement closes the child row and writes the parent's durable copy.
-      vi.setSystemTime(20_000)
-      child.settle({ taskId: 'task-1', ok: true, stats: { ...USAGE, inputTokens: 1600 }, route: ROUTE, finalText: 'done' })
-      const settledChild = liveOf().filter(e => e.data['kind'] === 'settled')
-      expect(settledChild).toHaveLength(1)
-      expect(settledChild[0]?.data).toMatchObject({ phase: 'done', usage: { inputTokens: 1600, outputTokens: 340 } })
-      const parentRow = fake.parent.events.find(e => e.type === CLI_USAGE_LIVE_EVENT)
-      expect(parentRow?.data).toMatchObject({
-        kind: 'settled', phase: 'done', childSessionId: 'cli-task-1', parentSessionId: 'session-parent',
-        usage: { inputTokens: 1600, outputTokens: 340 },
-      })
-      // A snapshot after settlement has no live record to write.
-      vi.setSystemTime(30_000)
-      child.reportLive({ taskId: 'task-1', stats: USAGE, route: ROUTE })
-      expect(liveOf()).toHaveLength(3)
-    } finally {
-      vi.useRealTimers()
-    }
-  })
-  it('skips incomplete samples and tolerates an offline parent at settlement', () => {
+describe('session logs stay loadable without a private append', () => {
+  it('writes no private event type into the child or the parent session log', () => {
     const fake = fakeStore()
     const child = recorder(fake.store)
     child.start({ ...START, parentSession: fake.parent })
-    // No input/output pair: nothing representable can be reported.
-    child.reportLive({ taskId: 'task-1', stats: { outputTokens: 9 } })
-    expect((fake.sessions.get('cli-task-1')?.events ?? []).filter(e => e.type === CLI_USAGE_LIVE_EVENT)).toHaveLength(0)
+    child.settle({ taskId: 'task-1', ok: true, stats: USAGE, route: ROUTE, finalText: 'done' })
+    const childEvents = fake.sessions.get('cli-task-1')?.events ?? []
+    // The only private marker travels through the create() seed, whose public
+    // contract preserves the explicit ignore marker. Everything appended must
+    // stay a host-known type, or the parent log becomes unloadable.
+    expect(childEvents.filter(e => e.type.startsWith('maestro/')).map(e => e.type)).toEqual([CLI_CHILD_RECORD_EVENT])
+    expect(childEvents.find(e => e.type === CLI_CHILD_RECORD_EVENT)?.ignorable).toBe(true)
+    expect(childEvents.every(e => e.type === CLI_CHILD_RECORD_EVENT || !e.type.startsWith('maestro/'))).toBe(true)
+    expect(fake.parent.events.map(e => e.type)).toEqual(['subagent/catalog'])
+  })
+  it('settles without a live parent and appends nothing to it', () => {
+    const fake = fakeStore()
+    const child = recorder(fake.store)
+    child.start({ ...START, parentSession: fake.parent })
     fake.setParentOnline(false)
     expect(() => child.settle({ taskId: 'task-1', ok: false, stats: { inputTokens: 50, outputTokens: 2 }, route: ROUTE })).not.toThrow()
-    expect(fake.parent.events.filter(e => e.type === CLI_USAGE_LIVE_EVENT)).toHaveLength(0)
+    expect(fake.parent.events.map(e => e.type)).toEqual(['subagent/catalog'])
   })
 })

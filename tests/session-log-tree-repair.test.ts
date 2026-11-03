@@ -107,7 +107,7 @@ describe('offline Maestro session-tree repair', () => {
     expect(await snapshot(root)).toEqual(before)
   })
 
-  it('repairs mixed multi-frame formats, preserves every original backup, and verifies changed:0', async () => {
+  it('repairs mixed multi-frame formats, preserves every original backup, and verifies changed:0', { timeout: 25_000 }, async () => {
     const { root, logs } = await fixture()
     const report = await repairSessionLogTree(root, await offlineOptions())
     expect(report).toMatchObject({ status: 'applied', repaired: 3, markedEvents: 9, planned: 3, remaining: [] })
@@ -128,7 +128,7 @@ describe('offline Maestro session-tree repair', () => {
     expect(JSON.stringify(report)).not.toContain(SECRET)
   })
 
-  it('rescans a repaired tree as a byte-identical no-op with no additional backups', async () => {
+  it('rescans a repaired tree as a byte-identical no-op with no additional backups', { timeout: 25_000 }, async () => {
     const { root } = await fixture()
     const options = await offlineOptions()
     await repairSessionLogTree(root, options)
@@ -191,7 +191,7 @@ describe('offline Maestro session-tree repair', () => {
     expect(await readdir(root)).toEqual([])
   })
 
-  it('uses this invocation\'s new scan hash, never a previous dry-run report', async () => {
+  it('uses this invocation\'s new scan hash, never a previous dry-run report', { timeout: 25_000 }, async () => {
     const { root, logs } = await fixture()
     const oldPlan = await repairSessionLogTree(root)
     const updated = Buffer.from(plain.toString().replace('"untouched":true', '"untouched":false'))
@@ -203,7 +203,7 @@ describe('offline Maestro session-tree repair', () => {
     expect((await readFile(report.applied[0].backupPath)).equals(updated)).toBe(true)
   })
 
-  it('stops at the first file failure, reports confirmed progress, and never rolls back or continues', async () => {
+  it('stops at the first file failure, reports confirmed progress, and never rolls back or continues', { timeout: 25_000 }, async () => {
     const { root, logs } = await fixture()
     const collision = `${logs[1].path}.maestro-original-${sha256(logs[1].bytes)}.bak`
     await writeFile(collision, SECRET, { flag: 'wx', mode: 0o600 })

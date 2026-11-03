@@ -198,7 +198,7 @@ describe('formatting', () => {
     expect(tokenSummary(undefined)).toBeUndefined()
     expect(tokenSummary({ uncachedInputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0 })).toBeUndefined()
     expect(tokenSummary({ uncachedInputTokens: 1500, outputTokens: 200, cacheReadTokens: 9000, cacheWriteTokens: 0 }))
-      .toBe('入 1.5k · 出 200 · 缓存 9.0k')
+      .toBe('入 1.5k · 出 200 · 缓存 9k')
   })
 
   it('summarises timing for settled and active rounds', () => {
@@ -394,7 +394,7 @@ describe('attachRows', () => {
     expect(node?.tokens).toEqual({
       uncachedInputTokens: 1200, outputTokens: 340, cacheReadTokens: 5000, cacheWriteTokens: 0,
     })
-    expect(tokenSummary(node?.tokens)).toBe('入 1.2k · 出 340 · 缓存 5.0k')
+    expect(tokenSummary(node?.tokens)).toBe('入 1.2k · 出 340 · 缓存 5k')
   })
 
   it('shows tokens on a task that is still running', () => {

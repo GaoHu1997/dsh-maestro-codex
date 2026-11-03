@@ -14,16 +14,16 @@ import type { MaestroCliId } from './wire.js'
 export const CLI_CHILD_RECORD_EVENT = 'maestro/cli-child'
 export const CLI_CHILD_PENDING_CAP = 256
 /**
- * Live CLI usage snapshots, written into the child session while the task is
- * running and into the parent session once at settlement. The parent copy is
- * the durable ledger: the child session itself is memory-only, so a restart
- * would otherwise erase every CLI subagent from the usage view. `kind`
- * distinguishes the throttled running snapshot from the final settlement.
+ * This module NEVER appends a private `maestro/*` event to a session. The
+ * installed host's `Session.append` accepts only surfaceOp/sourceEventSeqs and
+ * has no `ignorable` channel, so a private type written that way makes the
+ * whole stored log unloadable ("contains event type ... unknown to this
+ * harness and not marked ignorable"). Durable CLI usage already lives in the
+ * append-only usage journal ($DSH_HOME/maestro/usage-journal), which is what
+ * the usage view and replay fold; the only private marker written here travels
+ * through the public `create({ seed })` contract, which does preserve
+ * `ignorable`.
  */
-export const CLI_USAGE_LIVE_EVENT = 'maestro/cli-usage-live'
-/** Minimum spacing between two live snapshots of one task. The CLI emits
- *  usage far more often than a human can read; the view polls every 1.5s. */
-export const LIVE_USAGE_MIN_INTERVAL_MS = 2_000
 export interface ChildSessionAppend {
   readonly header?: { readonly createdAt: number } | undefined
   append(type: string, data: unknown, opts?: { surfaceOp?: 'append' }): unknown
@@ -51,17 +51,8 @@ export interface ChildSessionSettleInput {
   readonly route?: { readonly provider: string; readonly model: string } | undefined
   readonly finalText?: string | undefined
 }
-/** One throttled usage snapshot taken while the task is still running. */
-export interface ChildSessionLiveInput {
-  readonly taskId: string
-  readonly stats: ChildSessionUsageStats
-  readonly route?: { readonly provider: string; readonly model: string } | undefined
-}
 export interface ChildSessionRecorder {
   start(input: ChildSessionStartInput): void
-  /** Publish a running usage snapshot (child) plus the eventual settlement
-   *  (child and parent). No-op once settled or when the sample is incomplete. */
-  reportLive(input: ChildSessionLiveInput): void
   settle(input: ChildSessionSettleInput): void
   /** Retry parent catalog publication against live get only; NOT a disk replay. */
   flushPending?(): number
@@ -82,8 +73,6 @@ interface LiveRecord {
   readonly startedAt: number
   stepStarted: boolean
   settled: boolean
-  lastLiveAt: number
-  lastLiveSignature: string
 }
 interface NativeUsage {
   inputTokens: number
@@ -120,40 +109,6 @@ function usableRoute(route: ChildSessionSettleInput['route']): { provider: strin
   const provider = route?.provider.trim() ?? ''
   const model = route?.model.trim() ?? ''
   return provider !== '' && model !== '' ? { provider, model } : undefined
-}
-/**
- * One `maestro/cli-usage-live` payload. Both the child snapshot (`live`) and
- * the durable parent ledger row (`settled`) share this shape so a consumer can
- * fold them with the same code; `kind` only tells recovery which rows count.
- */
-function liveUsagePayload(
-  record: LiveRecord,
-  kind: 'live' | 'settled',
-  phase: 'running' | 'done' | 'failed',
-  usage: NativeUsage | undefined,
-  route: { provider: string; model: string } | undefined,
-  now: number,
-): Record<string, unknown> {
-  return {
-    version: 1, kind, phase,
-    taskId: record.taskId,
-    childSessionId: record.childSessionId,
-    parentSessionId: record.parentSessionId,
-    source: record.source,
-    usageId: record.usageId,
-    cli: record.source.startsWith('cli:') ? record.source.slice(4) : record.source,
-    turn: 1, step: 1,
-    startedAt: record.startedAt,
-    updatedAt: now,
-    ...(route === undefined ? {} : { provider: route.provider, model: route.model }),
-    ...(usage === undefined ? {} : { usage: {
-      inputTokens: usage.inputTokens, outputTokens: usage.outputTokens,
-      ...(usage.cacheReadTokens === undefined ? {} : { cacheReadTokens: usage.cacheReadTokens }),
-      ...(usage.cacheWriteTokens === undefined ? {} : { cacheWriteTokens: usage.cacheWriteTokens }),
-      ...(usage.totalTokens === undefined ? {} : { totalTokens: usage.totalTokens }),
-    } }),
-    label: record.label,
-  }
 }
 export function createChildSessionRecorder(parts: ChildSessionRecorderParts): ChildSessionRecorder {
   const live = new Map<string, LiveRecord>()
@@ -209,7 +164,7 @@ export function createChildSessionRecorder(parts: ChildSessionRecorderParts): Ch
         live.set(input.taskId, {
           session, taskId: input.taskId, parentSessionId, childSessionId: id, source, usageId,
           label: input.label, startedAt: input.startedAt ?? now,
-          stepStarted: false, settled: false, lastLiveAt: 0, lastLiveSignature: '',
+          stepStarted: false, settled: false,
         })
         const data = { version: 0, childId: id, childCreatedAt: createdAt, mode: 'one-shot', label: input.label }
         const parent = input.parentSession ?? store.get?.(parentSessionId)
@@ -227,28 +182,6 @@ export function createChildSessionRecorder(parts: ChildSessionRecorderParts): Ch
           warn('catalog', error)
         }
       } catch (error) { warn('recording', error) }
-    },
-    reportLive(input) {
-      const record = live.get(input.taskId)
-      if (record === undefined || record.settled) return
-      try {
-        const usage = usageSampleOf(input.stats)
-        // Partial CLI output cannot be represented as native usage; the view
-        // keeps the previous snapshot instead of showing a truncated number.
-        if (usage === undefined) return
-        const now = Date.now()
-        const route = usableRoute(input.route)
-        const signature = [
-          usage.inputTokens, usage.outputTokens, usage.cacheReadTokens ?? 0,
-          usage.cacheWriteTokens ?? 0, usage.totalTokens ?? 0,
-          route?.provider ?? '', route?.model ?? '',
-        ].join(':')
-        if (signature === record.lastLiveSignature) return
-        if (now - record.lastLiveAt < LIVE_USAGE_MIN_INTERVAL_MS) return
-        record.lastLiveAt = now
-        record.lastLiveSignature = signature
-        record.session.append(CLI_USAGE_LIVE_EVENT, liveUsagePayload(record, 'live', 'running', usage, route, now))
-      } catch (error) { warn('live usage', error) }
     },
     settle(input) {
       const record = live.get(input.taskId)
@@ -277,14 +210,9 @@ export function createChildSessionRecorder(parts: ChildSessionRecorderParts): Ch
             stream: usage === undefined ? [] : [{ type: 'chunk', time: Date.now(), chunk: { type: 'usage', usage } }],
           })
         }
-        const phase = input.ok ? 'done' as const : 'failed' as const
-        record.session.append(CLI_USAGE_LIVE_EVENT, liveUsagePayload(record, 'settled', phase, usage, route, Date.now()))
-        // Durable copy of the final usage for the usage view: the child session
-        // is memory-only, so settlement is the last moment the spend can survive
-        // a restart. Best effort — a disposed parent must not fail settlement.
-        try {
-          parts.store()?.get?.(record.parentSessionId)?.append(CLI_USAGE_LIVE_EVENT, liveUsagePayload(record, 'settled', phase, usage, route, Date.now()))
-        } catch (error) { warn('parent usage ledger', error) }
+        // No private settlement row is appended to the child or the parent: the
+        // canonical usage journal owns durable CLI spend, and an unmarked
+        // `maestro/*` append would make the parent log unloadable.
         record.settled = true
         // Drop append faces after settlement. Duplicate starts are also blocked
         // by the host's real duplicate-id guard, duplicate settles by this removal.

@@ -62,6 +62,17 @@ describe('bounded byte-preserving Maestro metadata codec', () => {
     expect(JSON.parse(result.bytes.toString().split('\n')[2]).data.ignorable).toBe(false)
   })
 
+  it('marks a live CLI usage record written by plugin 0.1.6 so the log stays loadable', () => {
+    const live = Buffer.from(header + '{"type":"maestro/cli-usage-live","seq":0,"time":1,"data":{"kind":"settled"}}\n')
+    const result = repairSessionLogBytes(live)
+    expect(result.stats.changed).toBe(1)
+    expect(result.stats.targets['maestro/cli-usage-live']).toMatchObject({ marked: 1, alreadyMarked: 0 })
+    expect(decodeSessionLog(result.bytes).plaintext.toString()).toContain('"ignorable":true')
+    const twice = repairSessionLogBytes(result.bytes)
+    expect(twice.stats.changed).toBe(0)
+    expect(twice.stats.targets['maestro/cli-usage-live'].alreadyMarked).toBe(1)
+  })
+
   it('reads all concatenated frames and preserves unchanged header/core compressed frames', () => {
     const raw = encoded()
     const result = repairSessionLogBytes(raw, { encoding: 'zstd' })

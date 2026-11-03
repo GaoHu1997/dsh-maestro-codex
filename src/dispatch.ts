@@ -816,18 +816,11 @@ export async function runDispatch(deps: DispatchDeps, params: DispatchParams, si
 
             // Live counters: the board polls the task list, so writing the
             // running snapshot here is what puts tokens on a card before the
-            // task ends. Settled `stats` still wins once the run resolves.
+            // task ends. Settled `stats` still wins once the run resolves. No
+            // session log is touched: private session appends are unloadable on
+            // hosts whose append has no ignorable channel.
             const onUsage = (stats: Record<string, string | number | boolean>): void => {
               deps.registry.setLiveStats(task, stats)
-              // The same snapshot feeds the CLI child session, which is what the
-              // usage view folds for a running subagent. Throttled there; a
-              // failure here must never disturb the task itself.
-              try {
-                deps.childSessions?.reportLive({
-                  taskId: id, stats,
-                  ...(resolvedRoute === undefined ? {} : { route: resolvedRoute }),
-                })
-              } catch { /* best effort */ }
             }
 
             abort.signal.throwIfAborted()

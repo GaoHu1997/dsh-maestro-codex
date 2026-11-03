@@ -29,14 +29,15 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type ComponentType, type ReactNode } from 'react'
 import * as uiPrimitives from '@deepseek-ai/dsh-client-ui-primitives'
 import {
-  IconCodeOutlineRegular, MarkdownText, StateDot, type StateDotState,
+  IconCodeOutlineRegular, IconDatabaseOutlineRegular, IconGaugeOutlineRegular, MarkdownText,
 } from '@deepseek-ai/dsh-client-ui-primitives'
 
 import { cancelTask, fetchTaskDetail, fetchTasks, replyTask } from '../api.js'
 import {
-  CLI_LABELS, MAESTRO_STAGE_LABELS, TERMINAL_PHASES, type MaestroCliId, type MaestroPhase,
+  CLI_LABELS, TERMINAL_PHASES, type MaestroCliId,
   type MaestroTaskEvent, type MaestroTaskSummary, type MaestroSessionAccess,
 } from '../../wire.js'
+import { EXECUTOR_BRANDS } from './accent.js'
 import { formatClock, formatDuration, formatTokens } from './model.js'
 import { chatT } from './upstream/client/locales.js'
 
@@ -47,24 +48,6 @@ const CHAIN_POLL_MS = 2500
 /** 一个轮次的转录在内存里保留的最大事件数（与看板日志一致）。 */
 const EVENT_CAP = 800
 
-/** 看板状态的中文短词（与 Board 共用一套口径）。 */
-const STATUS_LABELS: Record<MaestroPhase, string> = {
-  queued: '排队中', running: '运行中', done: '已完成', failed: '失败', cancelled: '已取消', timeout: '已超时', interrupted: '已中断',
-}
-
-/** phase → 宿主 StateDot 的语义色（与看板 cli-detail 的 phaseDot 同一口径）。 */
-function phaseDotState(phase: MaestroPhase | undefined): StateDotState {
-  switch (phase) {
-    case 'queued':
-    case 'running': return 'ongoing'
-    case 'done': return 'done'
-    case 'failed':
-    case 'timeout': return 'error'
-    case 'cancelled':
-    case 'interrupted': return 'idle'
-    default: return 'idle'
-  }
-}
 
 /**
  * 宿主 embedded 会话的同款变量面（`dsh-client-ui-conversation` 的
@@ -294,15 +277,25 @@ const SESSION_CSS = `
   gap: 8px; min-width: 0; padding: 2px 8px 6px;
 }
 .dms-toolrow-left { display: flex; align-items: center; gap: 12px; min-width: 0; }
+/* 左下角那一格与宿主 InputBar 的 28px 圆钮同尺寸同底色，图标换成该 CLI 的
+ * 品牌 logo（mask 上色，跟随亮/暗主题）。没有文字：宿主同位置也不带文字，
+ * CLI 名在会话页头部 chip 和这里的 tooltip/aria-label 里。 */
 .dms-cli-badge {
-  display: inline-flex; align-items: center; gap: 6px; height: 28px; max-width: 220px;
-  min-width: 0; padding: 0 10px 0 8px; border-radius: 999px;
+  display: grid; place-items: center; flex: none;
+  width: 28px; height: 28px; border-radius: 999px; padding: 0;
   background: var(--dsw-specific-selector, var(--dsw-alias-interactive-bg-hover, transparent));
-  color: var(--dsw-alias-label-primary, inherit);
-  font-size: 13px; line-height: 20px; white-space: nowrap;
 }
-.dms-cli-badge svg { flex: none; opacity: .85; }
-.dms-cli-badge > span { min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+.dms-cli-logo {
+  display: block; width: 15px; height: 15px;
+  background: currentColor;
+  -webkit-mask-repeat: no-repeat; mask-repeat: no-repeat;
+  -webkit-mask-position: center; mask-position: center;
+  -webkit-mask-size: contain; mask-size: contain;
+}
+.dms-cli-badge[data-cli="claude"] { color: ${EXECUTOR_BRANDS['claude']!.color}; }
+.dms-cli-badge[data-cli="claude"] .dms-cli-logo { -webkit-mask-image: ${EXECUTOR_BRANDS['claude']!.mask}; mask-image: ${EXECUTOR_BRANDS['claude']!.mask}; }
+.dms-cli-badge[data-cli="codex"] { color: ${EXECUTOR_BRANDS['codex']!.color}; }
+.dms-cli-badge[data-cli="codex"] .dms-cli-logo { -webkit-mask-image: ${EXECUTOR_BRANDS['codex']!.mask}; mask-image: ${EXECUTOR_BRANDS['codex']!.mask}; }
 .dms-toolrow-actions { display: flex; align-items: center; gap: 8px; margin-left: auto; }
 /* 发送：宿主 InputBar 的 primary 圆钮（34px，上箭头）。 */
 .dms-send {
@@ -321,35 +314,27 @@ const SESSION_CSS = `
 }
 .dms-stop:hover { color: var(--dsw-alias-state-error-primary, #d92d20); }
 .dms-stop i { display: block; width: 10px; height: 10px; border-radius: 2px; background: currentColor; }
-/* 卡外 footer：宿主 StatsPills 的锚点（状态点 + 轮次 + 用量 + 续接引用）。 */
+/* 卡外 footer：与宿主 conversation.composer.dock 的 StatsPills 同构。
+ * 每个读数是「14px 图标 + label」的 pill（padding 1px 8px、radius sm、
+ * label-tertiary、tabular-nums），pill 内部用 "·" 分隔符。没有数据的
+ * pill 整个不渲染，所以不会留下孤立分隔符。 */
 .dms-stats {
   width: 100%; max-width: var(--dsh-composer-card-max-width); align-self: center;
-  display: flex; flex-wrap: wrap; align-items: center; gap: 6px; min-width: 0;
+  display: flex; flex-wrap: wrap; align-items: center; justify-content: center; min-width: 0;
   padding: 0 4px; color: var(--dsw-alias-label-tertiary, inherit);
   font-size: calc(var(--dsh-content-font-size-secondary, 13px) - 1px);
   line-height: calc(20px + var(--dsh-content-font-delta-secondary, 0px));
 }
-.dms-stat {
-  display: inline-flex; align-items: center; gap: 5px; white-space: nowrap;
-  font-variant-numeric: tabular-nums;
+.dms-stat-pill {
+  display: inline-flex; align-items: center; gap: 6px; min-width: 0; max-width: 100%;
+  padding: 1px 8px; border-radius: var(--dsw-radius-sm, 6px);
+  font: inherit; color: inherit; font-variant-numeric: tabular-nums; white-space: nowrap;
 }
-.dms-stat-sep { flex: none; width: 1px; height: 10px; background: var(--dsw-alias-border-l1, var(--dsh-border, #2e3440)); }
-.dms-mono { font-family: var(--dms-mono); }
-.dms-refcopy {
-  appearance: none; border: 0; background: transparent; font: inherit; font-size: 11px;
-  padding: 0; cursor: pointer; display: inline-flex; align-items: center; gap: 3px;
-  min-width: 0; overflow: hidden; color: var(--dsw-alias-label-tertiary, inherit);
-}
-.dms-refcopy:hover .dms-mono { color: var(--dsw-alias-label-primary, inherit); text-decoration: underline; }
-.dms-refcopy svg { flex: none; }
-.dms-stats > .dms-refcopy { margin-left: auto; max-width: 46%; }
+.dms-stat-pill svg { flex: none; width: 14px; height: 14px; }
+.dms-stat-label { min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+.dms-sep { color: var(--dsw-alias-separator-primary, var(--dsh-border, #2e3440)); margin: 0 6px; }
 @container dms-composer (max-width: 560px) {
   .dms-toolrow { gap: 6px; }
-  .dms-cli-badge { padding: 0 8px; }
-  .dms-cli-badge > span { display: none; }
-  .dms-stats { gap: 4px; }
-  .dms-stats > .dms-refcopy { margin-left: 0; }
-  .dms-stat-detail { display: none; }
 }
 `
 
@@ -937,30 +922,8 @@ function SessionPageContent(props: Parameters<typeof SessionPage>[0] & { access:
   const lastRunning = pendingReplyId !== undefined
     || (lastSummary !== undefined && (lastSummary.phase === 'running' || lastSummary.phase === 'queued'))
   // 续发落点用 replyAnchorOf：尾轮失败/超时没有会话引用时退回更早的轮次。
+  // 续接引用只在后台使用（/task/reply 在服务端取真实 sessionRef），不展示。
   const replyAnchorId = replyAnchorOf(chain, summaries)
-  // 续接引用 = 下次续发实际 resume 的会话（锚点轮的 sessionRef）。
-  const anchorRef = replyAnchorId === undefined ? '' : summaries[replyAnchorId]?.sessionRef ?? ''
-  const [copiedRef, setCopiedRef] = useState(false)
-  const copyAnchorRef = useCallback(() => {
-    if (anchorRef === '') return
-    const done = (): void => {
-      setCopiedRef(true)
-      window.setTimeout(() => { setCopiedRef(false) }, 1500)
-    }
-    // 宿主 webview 优先 clipboard API；没有就退回 execCommand（旧实现仍最稳）。
-    if (navigator.clipboard !== undefined) {
-      void navigator.clipboard.writeText(anchorRef).then(done, () => {})
-      return
-    }
-    const area = document.createElement('textarea')
-    area.value = anchorRef
-    area.style.position = 'fixed'
-    area.style.opacity = '0'
-    document.body.appendChild(area)
-    area.select()
-    if (document.execCommand('copy')) done()
-    area.remove()
-  }, [anchorRef])
 
   // 模型目录会话页不再读取：续发沿用该 CLI 的服务端配置（模型与思考档位
   // 都不在会话页改）。
@@ -1067,13 +1030,7 @@ function SessionPageContent(props: Parameters<typeof SessionPage>[0] & { access:
     element.style.height = `${String(Math.min(element.scrollHeight, 336))}px`
   }, [draft])
 
-  // 刚发出的回复还没有摘要：头部状态按运行中显示。
-  const phase = pendingReplyId !== undefined ? 'running' : lastSummary?.phase
-  // phase 之上的「现在该谁动」；working/idle 与 phase 同义，不重复显示。
-  const stageLabel = pendingReplyId === undefined && lastSummary?.stage !== undefined
-    && lastSummary.stage !== 'working' && lastSummary.stage !== 'working/queued' && lastSummary.stage !== 'idle'
-    ? MAESTRO_STAGE_LABELS[lastSummary.stage]
-    : undefined
+  // 状态不在这里：页头徽标与看板常驻显示阶段，footer 只留读数。
   const notice = sendError ?? (listError === undefined ? undefined : `任务列表读取失败：${listError}`)
   return (
     <div className={place === 'panel' ? 'dms dms-panel' : 'dms'} role="dialog" aria-label="CLI 会话">
@@ -1150,11 +1107,10 @@ function SessionPageContent(props: Parameters<typeof SessionPage>[0] & { access:
           <div className="dms-toolrow">
             <div className="dms-toolrow-left">
               <span
-                className="dms-cli-badge"
-                title={`续发沿用 ${CLI_LABELS[cli]} 的服务端配置（模型与思考档位不在会话页改）；CLI 续发只接受文本，需要文件请把路径写进消息`}
+                className="dms-cli-badge" data-cli={cli} role="img" aria-label={CLI_LABELS[cli]}
+                title={`${CLI_LABELS[cli]}：续发沿用它的服务端配置（模型与思考档位不在会话页改）；CLI 续发只接受文本，需要文件请把路径写进消息`}
               >
-                <IconCodeOutlineRegular size={14} />
-                <span>{CLI_LABELS[cli]}</span>
+                <span className="dms-cli-logo" aria-hidden />
               </span>
             </div>
             <div className="dms-toolrow-actions">
@@ -1183,54 +1139,33 @@ function SessionPageContent(props: Parameters<typeof SessionPage>[0] & { access:
             </div>
           </div>
         </div>
+        {/* 状态不在这里：会话页头部徽标与看板已经常驻显示阶段，footer 只放
+            宿主同款的读数，避免同一屏里出现两处状态。 */}
         <div className="dms-stats">
-          <span className="dms-stat" title={phase === undefined ? '正在载入任务摘要' : `任务阶段：${STATUS_LABELS[phase]}`}>
-            <StateDot size={6} state={phaseDotState(phase)} />
-            {phase === undefined ? '载入中' : STATUS_LABELS[phase]}
+          <span
+            className="dms-stat-pill" data-composer-stat="activity"
+            title={`回复链共 ${String(chain.length)} 轮${pendingReplyId === undefined ? '' : '（含刚发出、尚未入库的一轮）'}${tokensPerSecondTip === undefined ? '' : `；${tokensPerSecondTip}`}`}
+          >
+            <IconGaugeOutlineRegular />
+            <span className="dms-stat-label">
+              {`${String(chain.length)} 轮`}
+              {tokensPerSecond === undefined ? undefined : <span className="dms-sep">·</span>}
+              {tokensPerSecond === undefined ? undefined : <>{String(tokensPerSecond)} tok/s</>}
+            </span>
           </span>
-          {stageLabel === undefined ? undefined : (
-            <>
-              <span className="dms-stat-sep" />
-              <span className="dms-stat">{stageLabel}</span>
-            </>
-          )}
-          <span className="dms-stat-sep" />
-          <span className="dms-stat" title={`回复链共 ${String(chain.length)} 轮${pendingReplyId === undefined ? '' : '（含刚发出、尚未入库的一轮）'}`}>
-            {chain.length} 轮
-          </span>
-          {totalTokens === undefined ? undefined : (
-            <>
-              <span className="dms-stat-sep" />
-              <span className="dms-stat" {...(tokensTip === undefined ? {} : { title: tokensTip })}>
-                {formatTokens(totalTokens)} tokens
+          {totalTokens === undefined && cacheHit === undefined ? undefined : (
+            <span
+              className="dms-stat-pill" data-composer-stat="usage"
+              {...(tokensTip === undefined ? {} : { title: tokensTip })}
+            >
+              <IconDatabaseOutlineRegular />
+              <span className="dms-stat-label">
+                {totalTokens === undefined ? undefined : <>{formatTokens(totalTokens)} tok</>}
+                {cacheHit === undefined ? undefined : (
+                  <>{totalTokens === undefined ? undefined : <span className="dms-sep">·</span>}缓存命中 {String(cacheHit)}%</>
+                )}
               </span>
-            </>
-          )}
-          {cacheHit === undefined ? undefined : (
-            <>
-              <span className="dms-stat-sep dms-stat-detail" />
-              <span className="dms-stat dms-stat-detail" title="缓存命中率 = 缓存读 /（未缓存输入 + 缓存读）">
-                缓存 {String(cacheHit)}%
-              </span>
-            </>
-          )}
-          {tokensPerSecond === undefined ? undefined : (
-            <>
-              <span className="dms-stat-sep dms-stat-detail" />
-              <span className="dms-stat dms-stat-detail" {...(tokensPerSecondTip === undefined ? {} : { title: tokensPerSecondTip })}>
-                {String(tokensPerSecond)} tok/s
-              </span>
-            </>
-          )}
-          {anchorRef === '' ? undefined : (
-            <button type="button" className="dms-refcopy" onClick={copyAnchorRef}
-              title={`续接引用（下次 resume 用），点击复制：${anchorRef}`}>
-              <span className="dms-mono">resume · {copiedRef ? '已复制' : anchorRef.slice(0, 8)}</span>
-              <svg width="10" height="10" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.4" aria-hidden>
-                <rect x="5.5" y="5.5" width="8" height="8" rx="1.5" />
-                <path d="M10.5 3.5h-7a1 1 0 0 0-1 1v7" />
-              </svg>
-            </button>
+            </span>
           )}
         </div>
       </div>

@@ -3,9 +3,9 @@ import { isAbsolute, win32 } from 'node:path'
 import { zstdCompressSync, zstdDecompressSync } from 'node:zlib'
 
 // This is deliberately not a general log migration or replay implementation.
-// It changes one omission-safety bit on three known Maestro metadata records.
+// It changes one omission-safety bit on four known Maestro metadata records.
 export const MAESTRO_METADATA_TYPES = Object.freeze([
-  'maestro/cli-access', 'maestro/cli-usage', 'maestro/cli-child',
+  'maestro/cli-access', 'maestro/cli-usage', 'maestro/cli-child', 'maestro/cli-usage-live',
 ])
 const TARGETS = new Set(MAESTRO_METADATA_TYPES)
 const MARKER = Buffer.from(',"ignorable":true')

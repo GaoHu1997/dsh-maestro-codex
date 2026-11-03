@@ -228,13 +228,30 @@ function parseSessionList(raw: unknown): ReadonlySet<string> | undefined {
   return ids.length === 0 ? undefined : new Set(ids)
 }
 
+/** The CLI child session DSH owns for one task; the id is derived, never stored. */
+function childSessionIdOf(taskId: string): string {
+  return `cli-${taskId}`
+}
+
 /**
  * Whether one task belongs to the caller's session scope. Owner-less tasks
  * (npm installs started from the config card) stay visible everywhere.
+ *
+ * A task's own CLI child session is an owner too: its session page reads the
+ * task it was dispatched from. That id is derived from the task id (dispatch
+ * always seeds `cli-<taskId>`), so a child session can only ever name the one
+ * task it belongs to — it cannot borrow another conversation's task.
  */
-function taskVisible(task: { readonly sessionId?: string | undefined; readonly kind?: 'cli' | 'npm' | undefined }, sessions: ReadonlySet<string> | undefined, principal?: TaskPrincipal): boolean {
+function taskVisible(
+  task: { readonly id: string; readonly sessionId?: string | undefined; readonly kind?: 'cli' | 'npm' | undefined },
+  sessions: ReadonlySet<string> | undefined,
+  principal?: TaskPrincipal,
+): boolean {
   if (task.sessionId === undefined) return task.kind === 'npm'
-  return principal !== undefined && task.sessionId === principal.sessionId && (sessions === undefined || sessions.has(task.sessionId))
+  if (principal === undefined) return false
+  const childSessionId = childSessionIdOf(task.id)
+  if (principal.sessionId !== task.sessionId && principal.sessionId !== childSessionId) return false
+  return sessions === undefined || sessions.has(task.sessionId) || sessions.has(childSessionId)
 }
 
 /** GET task?id=&cursor=&sessions= — one task's detail plus events after the cursor. */

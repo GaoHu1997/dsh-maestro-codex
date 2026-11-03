@@ -3,6 +3,7 @@ import { lstat, open, readdir, realpath } from 'node:fs/promises'
 import { isAbsolute, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { repairSessionLogFile } from './repair-maestro-session-logs.mjs'
+import { MAESTRO_METADATA_TYPES } from './session-log-codec.mjs'
 
 // Read-only inventory. It never applies a repair, loads a Session, or prints data.
 const MAX_DIRECTORIES = 10_000
@@ -45,7 +46,7 @@ export async function scanSessionLogs(rootInput) {
     try { logs.push(await repairSessionLogFile(path)) }
     catch (error) { refused.push({ path, code: codeOf(error) }) }
   }
-  const targets = { 'maestro/cli-access': 0, 'maestro/cli-usage': 0, 'maestro/cli-child': 0 }
+  const targets = Object.fromEntries(MAESTRO_METADATA_TYPES.map(type => [type, 0]))
   for (const log of logs) for (const type of Object.keys(targets)) targets[type] += log.targets[type].marked
   return {
     schemaVersion: 1, mode: 'dry-run', root, generatedAt: new Date().toISOString(),

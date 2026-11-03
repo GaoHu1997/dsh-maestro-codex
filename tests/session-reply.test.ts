@@ -220,8 +220,8 @@ describe('handleTaskReply validation', () => {
       expect.objectContaining({ type: 'user/message', data: expect.objectContaining({ content: [{ type: 'text', text: '继续刚才的任务' }] }) }),
       expect.objectContaining({ type: 'maestro/cli-child', ignorable: true, data: expect.objectContaining({ taskId: id, parentSessionId: owner.id, childSessionId: `cli-${id}` }) }),
     ])
-    expect(created[0]?.events.map(event => event.type)).toEqual(['user/message', 'maestro/cli-child', 'maestro/cli-usage-live', 'request/context', 'step/start', 'assistant/message', 'maestro/cli-usage-live'])
-    expect(created[0]?.appended.map(event => event.type)).toEqual(['maestro/cli-usage-live', 'request/context', 'step/start', 'assistant/message', 'maestro/cli-usage-live'])
+    expect(created[0]?.events.map(event => event.type)).toEqual(['user/message', 'maestro/cli-child', 'request/context', 'step/start', 'assistant/message'])
+    expect(created[0]?.appended.map(event => event.type)).toEqual(['request/context', 'step/start', 'assistant/message'])
     expect(created[0]?.events.find(event => event.type === 'request/context')?.data).toEqual({ provider: 'wb', model: 'gpt-6.1' })
     expect(created[0]?.events.find(event => event.type === 'assistant/message')?.data).toMatchObject({
       message: { source: { kind: 'model', provider: 'wb', model: 'gpt-6.1' }, content: [{ type: 'text', text: 'claude 收到，继续完成' }] },

@@ -134,6 +134,23 @@ describe('handleTaskDetail', () => {
     expect(body.nextCursor).toBe(2)
   })
 
+  it('lets the task CLI child session read the task it was dispatched from', () => {
+    const { deps, registry, controllers } = makeDeps()
+    const task = registry.create({ id: 'task-9', cli: 'codex', title: 't', model: '', sessionId: 's1' })
+    registry.push(task, 'text', 'hello')
+    registry.setPhase(task, 'running')
+    controllers.set('task-9', new AbortController())
+    // 侧栏里的 CLI 子会话（id 固定为 cli-<taskId>）自己打开时也能读到本轮任务。
+    expect(handleTaskDetail(deps, new URLSearchParams('id=task-9&sessions=s1,cli-task-9'), { sessionId: 'cli-task-9' }).status).toBe(200)
+    expect(handleTaskDetail(deps, new URLSearchParams('id=task-9&sessions=cli-task-9'), { sessionId: 'cli-task-9' }).status).toBe(200)
+    // 父会话的 scope 只剩子会话 id（树里没有父节点）时也仍然成立。
+    expect(handleTaskDetail(deps, new URLSearchParams('id=task-9&sessions=cli-task-9'), { sessionId: 's1' }).status).toBe(200)
+    // 别的任务/会话的子会话 id 不会借到这份可见性。
+    expect(handleTaskDetail(deps, new URLSearchParams('id=task-9&sessions=cli-task-9'), { sessionId: 'cli-task-other' }).status).toBe(404)
+    expect(handleTaskDetail(deps, new URLSearchParams('id=task-9&sessions=other'), { sessionId: 'cli-task-9' }).status).toBe(404)
+    expect(handleTaskCancel(deps, { id: 'task-9', sessions: ['cli-task-9'] }, { sessionId: 'cli-task-9' }).status).toBe(200)
+  })
+
   it('hides a task owned by another session', () => {
     const { deps, registry } = makeDeps()
     const task = registry.create({ id: 'task-2', cli: 'claude', title: 't', model: '', sessionId: 's2' })
