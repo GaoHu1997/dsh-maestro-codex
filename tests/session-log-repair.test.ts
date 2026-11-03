@@ -225,17 +225,18 @@ describe('offline file repair with exclusive verified backups', () => {
     await expect(repairSessionLogFile(path)).rejects.toThrow('HARD_LINK_REFUSED')
   })
 
-  it('runs the CLI as a default read-only command with redacted success and failure output', async () => {
+  it('runs the CLI as a default read-only command with redacted success and failure output', { timeout: 25_000 }, async () => {
     const { path, directory } = await fixture()
     const script = fileURLToPath(new URL('../scripts/repair-maestro-session-logs.mjs', import.meta.url))
     const run = promisify(execFile)
-    const success = await run(process.execPath, [script, path])
+    // Two real Node processes share a busy Windows worker pool; keep each bounded.
+    const success = await run(process.execPath, [script, path], { timeout: 10_000, windowsHide: true })
     expect(JSON.parse(success.stdout).status).toBe('dry-run')
     expect(success.stdout + success.stderr).not.toContain(SECRET)
     expect(await readdir(directory)).toHaveLength(1)
     const broken = await fixture(Buffer.from(header + `{"${SECRET}": broken}\n`))
     try {
-      await run(process.execPath, [script, broken.path])
+      await run(process.execPath, [script, broken.path], { timeout: 10_000, windowsHide: true })
       throw new Error('invalid synthetic log was accepted')
     } catch (error: any) {
       expect(error.code).toBe(1)

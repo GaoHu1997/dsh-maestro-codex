@@ -28,14 +28,16 @@
 
 import { useCallback, useEffect, useMemo, useRef, useState, type ComponentType, type ReactNode } from 'react'
 import * as uiPrimitives from '@deepseek-ai/dsh-client-ui-primitives'
-import { IconCodeOutlineRegular, MarkdownText } from '@deepseek-ai/dsh-client-ui-primitives'
+import {
+  IconCodeOutlineRegular, MarkdownText, StateDot, type StateDotState,
+} from '@deepseek-ai/dsh-client-ui-primitives'
 
 import { cancelTask, fetchTaskDetail, fetchTasks, replyTask } from '../api.js'
 import {
-  CLI_LABELS, TERMINAL_PHASES, type MaestroCliId, type MaestroPhase,
+  CLI_LABELS, MAESTRO_STAGE_LABELS, TERMINAL_PHASES, type MaestroCliId, type MaestroPhase,
   type MaestroTaskEvent, type MaestroTaskSummary, type MaestroSessionAccess,
 } from '../../wire.js'
-import { formatClock, formatDuration } from './model.js'
+import { formatClock, formatDuration, formatTokens } from './model.js'
 import { chatT } from './upstream/client/locales.js'
 
 /** 回复轮询与详情轮询的间隔（毫秒）——详情是滚动阅读的主内容，跟得紧一点。 */
@@ -48,6 +50,20 @@ const EVENT_CAP = 800
 /** 看板状态的中文短词（与 Board 共用一套口径）。 */
 const STATUS_LABELS: Record<MaestroPhase, string> = {
   queued: '排队中', running: '运行中', done: '已完成', failed: '失败', cancelled: '已取消', timeout: '已超时', interrupted: '已中断',
+}
+
+/** phase → 宿主 StateDot 的语义色（与看板 cli-detail 的 phaseDot 同一口径）。 */
+function phaseDotState(phase: MaestroPhase | undefined): StateDotState {
+  switch (phase) {
+    case 'queued':
+    case 'running': return 'ongoing'
+    case 'done': return 'done'
+    case 'failed':
+    case 'timeout': return 'error'
+    case 'cancelled':
+    case 'interrupted': return 'idle'
+    default: return 'idle'
+  }
 }
 
 /**
@@ -231,30 +247,36 @@ const SESSION_CSS = `
   color: var(--dsw-alias-label-tertiary, inherit); text-align: center; padding: 24px;
 }
 
-/* --- composer：宿主 InputBar 的卡片画法 --- */
+/* --- composer：与宿主 InputBar 同构的三段 ---
+ * 卡外 dock（notice）→ 卡片（输入行 + 工具行）→ 卡外 footer（状态 + 用量）。
+ * CLI 续发只走文本通道（claude --resume / codex exec resume），所以工具行里
+ * 不放附件、@ 引用、模型选择这些没有协议支撑的控件：左侧只读 CLI 徽标说明
+ * 续发沿用的是哪套服务端配置，右侧是唯一的主操作（运行中 = 停止，否则 = 发送）。 */
 .dms-composer {
-  flex: none; display: flex; flex-direction: column; align-items: center; gap: 6px;
-  padding: 0 var(--dsh-composer-side-clearance) 4px;
+  flex: none; display: flex; flex-direction: column; align-items: stretch; gap: 6px;
+  width: 100%; padding: 0 var(--dsh-composer-side-clearance) 4px;
+  container-type: inline-size; container-name: dms-composer;
 }
 /* 失败提示（宿主 notice 行）：贴在卡片上方，宽度与卡片对齐。 */
 .dms-notice {
-  width: 100%; max-width: var(--dsh-composer-card-max-width);
+  width: 100%; max-width: var(--dsh-composer-card-max-width); align-self: center;
   border-radius: var(--dsw-radius-md, 10px);
   background: var(--dsw-alias-interactive-bg-hover, transparent);
-  color: var(--dsw-alias-state-error-primary, #d92d20);
-  margin-bottom: 2px; padding: 4px 8px; font-size: 12px; line-height: 18px;
+  color: var(--dsw-alias-label-secondary, inherit);
+  margin: 0; padding: 4px 8px; font-size: 12px; line-height: 18px;
 }
+.dms-notice-error { color: var(--dsw-alias-state-error-primary, #d92d20); }
 .dms-card {
-  width: 100%; max-width: var(--dsh-composer-card-max-width);
+  width: 100%; max-width: var(--dsh-composer-card-max-width); align-self: center;
   --dsw-elevation-stroke-color: var(--dsw-alias-border-l2, var(--dsh-border, #2e3440));
   border-radius: var(--dsw-radius-panel, 28px);
   background: var(--dsw-specific-input-major, var(--dsh-bg-input, light-dark(#ffffff, #262b37)));
   box-shadow: var(--dsw-elevation-soft, 0 0 0 1px var(--dsw-elevation-stroke-color));
   font-size: var(--dsh-content-font-size, 14px);
   line-height: calc(24px + var(--dsh-content-font-delta, 0px));
-  display: flex; flex-direction: column; gap: 12px; padding-top: 8px;
+  display: flex; flex-direction: column; gap: 0; padding-top: 8px;
 }
-.dms-inputrow { display: flex; align-items: flex-start; gap: 4px; }
+.dms-inputrow { display: flex; align-items: flex-start; gap: 4px; min-width: 0; }
 .dms-textarea {
   flex: 1 1 auto; min-width: 0; resize: none;
   min-height: 36px; max-height: var(--dsh-composer-text-max-height);
@@ -262,37 +284,26 @@ const SESSION_CSS = `
   padding: 4px 8px 0 14px; border: 0; outline: none;
   background: transparent; color: var(--dsw-alias-label-primary, inherit);
   caret-color: var(--dsw-alias-state-business-primary, var(--dsh-accent, #4b6bfb));
-  scrollbar-width: thin;
+  scrollbar-width: thin; overflow-y: auto;
 }
 .dms-textarea::placeholder { color: var(--dsw-alias-label-caption, inherit); }
 .dms-textarea:disabled { color: var(--dsw-alias-label-tertiary, inherit); cursor: not-allowed; }
-.dms-accessory {
-  display: flex; align-items: center; gap: 8px; min-width: 0; flex-wrap: wrap;
-  padding: 0 12px 10px;
+/* 工具行：宿主 InputBar 的 row（左工具、右主操作，窄栏换行）。 */
+.dms-toolrow {
+  display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between;
+  gap: 8px; min-width: 0; padding: 2px 8px 6px;
 }
-.dms-phase { display: inline-flex; align-items: center; gap: 4px; color: var(--dsw-alias-label-tertiary, inherit); font-size: 12px; }
-.dms-phase i {
-  width: 6px; height: 6px; border-radius: 50%; background: var(--dsw-alias-label-caption, currentColor); flex: none;
+.dms-toolrow-left { display: flex; align-items: center; gap: 12px; min-width: 0; }
+.dms-cli-badge {
+  display: inline-flex; align-items: center; gap: 6px; height: 28px; max-width: 220px;
+  min-width: 0; padding: 0 10px 0 8px; border-radius: 999px;
+  background: var(--dsw-specific-selector, var(--dsw-alias-interactive-bg-hover, transparent));
+  color: var(--dsw-alias-label-primary, inherit);
+  font-size: 13px; line-height: 20px; white-space: nowrap;
 }
-.dms-phase-running i { background: var(--dsw-alias-state-business-primary, var(--dsh-accent, #4b6bfb)); animation: dms-pulse 1.4s ease-in-out infinite; }
-.dms-phase-done i { background: var(--dsw-alias-state-success-primary, #0e8a55); }
-.dms-phase-failed i, .dms-phase-timeout i { background: var(--dsw-alias-state-error-primary, #d92d20); }
-.dms-phase-queued i { background: var(--dsw-alias-state-warning-primary, #b45309); }
-.dms-mono { font-family: var(--dms-mono); }
-.dms-refcopy {
-  appearance: none; border: 0; background: transparent; color: inherit; font: inherit; font-size: 11px;
-  padding: 0; cursor: pointer; display: inline-flex; align-items: center; gap: 3px;
-  min-width: 0; overflow: hidden; color: var(--dsw-alias-label-tertiary, inherit);
-}
-.dms-refcopy:hover .dms-mono { color: var(--dsw-alias-label-primary, inherit); text-decoration: underline; }
-.dms-refcopy svg { flex: none; }
-.dms-spacer { flex: 1 1 0; }
-.dms-cancel {
-  flex: none; font: inherit; font-size: 12px; padding: 3px 10px; border-radius: 999px; cursor: pointer;
-  color: var(--dsw-alias-state-error-primary, #d92d20);
-  background: transparent; border: 1px solid color-mix(in srgb, var(--dsw-alias-state-error-primary, #d92d20) 40%, transparent);
-}
-.dms-cancel:hover { background: color-mix(in srgb, var(--dsw-alias-state-error-primary, #d92d20) 10%, transparent); }
+.dms-cli-badge svg { flex: none; opacity: .85; }
+.dms-cli-badge > span { min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+.dms-toolrow-actions { display: flex; align-items: center; gap: 8px; margin-left: auto; }
 /* 发送：宿主 InputBar 的 primary 圆钮（34px，上箭头）。 */
 .dms-send {
   flex: none; width: 34px; height: 34px; border-radius: 999px; cursor: pointer;
@@ -301,6 +312,45 @@ const SESSION_CSS = `
 }
 .dms-send:hover { filter: brightness(1.08); }
 .dms-send:disabled { opacity: .45; cursor: default; filter: none; }
+/* 停止：运行中主操作换成宿主同位置的停止钮（同一个落点，不并列两个圆钮）。 */
+.dms-stop {
+  flex: none; width: 34px; height: 34px; border-radius: 999px; cursor: pointer;
+  color: var(--dsw-alias-label-secondary, inherit);
+  background: var(--dsw-specific-selector, var(--dsw-alias-interactive-bg-hover, transparent));
+  border: 0; display: grid; place-items: center; padding: 0; transform: translateY(-2px);
+}
+.dms-stop:hover { color: var(--dsw-alias-state-error-primary, #d92d20); }
+.dms-stop i { display: block; width: 10px; height: 10px; border-radius: 2px; background: currentColor; }
+/* 卡外 footer：宿主 StatsPills 的锚点（状态点 + 轮次 + 用量 + 续接引用）。 */
+.dms-stats {
+  width: 100%; max-width: var(--dsh-composer-card-max-width); align-self: center;
+  display: flex; flex-wrap: wrap; align-items: center; gap: 6px; min-width: 0;
+  padding: 0 4px; color: var(--dsw-alias-label-tertiary, inherit);
+  font-size: calc(var(--dsh-content-font-size-secondary, 13px) - 1px);
+  line-height: calc(20px + var(--dsh-content-font-delta-secondary, 0px));
+}
+.dms-stat {
+  display: inline-flex; align-items: center; gap: 5px; white-space: nowrap;
+  font-variant-numeric: tabular-nums;
+}
+.dms-stat-sep { flex: none; width: 1px; height: 10px; background: var(--dsw-alias-border-l1, var(--dsh-border, #2e3440)); }
+.dms-mono { font-family: var(--dms-mono); }
+.dms-refcopy {
+  appearance: none; border: 0; background: transparent; font: inherit; font-size: 11px;
+  padding: 0; cursor: pointer; display: inline-flex; align-items: center; gap: 3px;
+  min-width: 0; overflow: hidden; color: var(--dsw-alias-label-tertiary, inherit);
+}
+.dms-refcopy:hover .dms-mono { color: var(--dsw-alias-label-primary, inherit); text-decoration: underline; }
+.dms-refcopy svg { flex: none; }
+.dms-stats > .dms-refcopy { margin-left: auto; max-width: 46%; }
+@container dms-composer (max-width: 560px) {
+  .dms-toolrow { gap: 6px; }
+  .dms-cli-badge { padding: 0 8px; }
+  .dms-cli-badge > span { display: none; }
+  .dms-stats { gap: 4px; }
+  .dms-stats > .dms-refcopy { margin-left: 0; }
+  .dms-stat-detail { display: none; }
+}
 `
 
 const STYLE_ID = 'dsh-maestro-codex-session-styles'
@@ -973,8 +1023,58 @@ function SessionPageContent(props: Parameters<typeof SessionPage>[0] & { access:
     element.scrollTop = element.scrollHeight
   }, [chain.length, tick])
 
+  // 会话级用量：按回复链上已测量的轮次聚合，未测量的轮次不参与（不把缺失
+  // 当成 0）。四个桶互不重叠，与看板 cli-detail 的 token 口径一致。
+  const usageTotals = useMemo(() => {
+    let input = 0
+    let output = 0
+    let cacheRead = 0
+    let cacheWrite = 0
+    let measured = 0
+    for (const id of chain) {
+      const usage = summaries[id]?.usage
+      if (usage === undefined) continue
+      input += usage.uncachedInputTokens
+      output += usage.outputTokens
+      cacheRead += usage.cacheReadTokens
+      cacheWrite += usage.cacheWriteTokens
+      measured += 1
+    }
+    if (measured === 0) return undefined
+    return { input, output, cacheRead, cacheWrite, measured }
+  }, [chain, summaries])
+  const totalTokens = usageTotals === undefined ? undefined
+    : usageTotals.input + usageTotals.output + usageTotals.cacheRead + usageTotals.cacheWrite
+  const cacheHit = usageTotals !== undefined && usageTotals.input + usageTotals.cacheRead > 0
+    ? Math.round(usageTotals.cacheRead * 100 / (usageTotals.input + usageTotals.cacheRead))
+    : undefined
+  // tok/s 只看最近一轮：本轮输出 / 本轮耗时，跨境聚合没有意义。
+  const lastUsage = lastSummary?.usage
+  const tokensPerSecond = lastUsage !== undefined && lastSummary?.durationMs !== undefined && lastSummary.durationMs >= 500
+    ? Math.round(lastUsage.outputTokens / (lastSummary.durationMs / 1000))
+    : undefined
+  const tokensTip = usageTotals === undefined ? undefined
+    : `入 ${formatTokens(usageTotals.input)} · 缓存读 ${formatTokens(usageTotals.cacheRead)} · 缓存写 ${formatTokens(usageTotals.cacheWrite)} · 出 ${formatTokens(usageTotals.output)}（${String(usageTotals.measured)} 轮已测量）`
+  const tokensPerSecondTip = lastUsage === undefined || lastSummary?.durationMs === undefined ? undefined
+    : `最近一轮：输出 ${formatTokens(lastUsage.outputTokens)} tokens / ${formatDuration(lastSummary.durationMs)}`
+
+  // 输入框随内容增高（宿主 InputBar 的同款行为），上限走宿主变量。
+  const textareaRef = useRef<HTMLTextAreaElement | null>(null)
+  useEffect(() => {
+    const element = textareaRef.current
+    if (element === null) return
+    element.style.height = 'auto'
+    element.style.height = `${String(Math.min(element.scrollHeight, 336))}px`
+  }, [draft])
+
   // 刚发出的回复还没有摘要：头部状态按运行中显示。
   const phase = pendingReplyId !== undefined ? 'running' : lastSummary?.phase
+  // phase 之上的「现在该谁动」；working/idle 与 phase 同义，不重复显示。
+  const stageLabel = pendingReplyId === undefined && lastSummary?.stage !== undefined
+    && lastSummary.stage !== 'working' && lastSummary.stage !== 'working/queued' && lastSummary.stage !== 'idle'
+    ? MAESTRO_STAGE_LABELS[lastSummary.stage]
+    : undefined
+  const notice = sendError ?? (listError === undefined ? undefined : `任务列表读取失败：${listError}`)
   return (
     <div className={place === 'panel' ? 'dms dms-panel' : 'dms'} role="dialog" aria-label="CLI 会话">
       {place === 'panel' ? (
@@ -1021,18 +1121,21 @@ function SessionPageContent(props: Parameters<typeof SessionPage>[0] & { access:
       </div>
 
       <div className="dms-composer">
-        {sendError !== undefined ? <p className="dms-notice" role="alert">{sendError}</p> : undefined}
+        {notice === undefined ? undefined : <p className="dms-notice dms-notice-error" role="alert">{notice}</p>}
         <div className="dms-card">
           <div className="dms-inputrow">
             <textarea
+              ref={textareaRef}
               className="dms-textarea"
               rows={1}
+              title="Enter 发送 · Shift+Enter 换行"
               placeholder={
                 lastRunning
                   ? (pendingReplyId !== undefined ? '回复已发出，等这一轮结束…' : '这一轮还在执行，结束后可以继续发消息…')
                   : replyAnchorId !== undefined
-                    ? '给这个 CLI 会话发一条后续指令…（Enter 发送 · Shift+Enter 换行）'
-                    : '这个会话里没有可续接的 CLI 会话引用，无法续发（重新派发一个可续接的任务吧）'}
+                    ? '给这个 CLI 会话发一条后续指令…'
+                    : '这个会话里没有可续接的 CLI 会话引用，无法续发（重新派发一个可续接的任务吧）'
+              }
               value={draft}
               disabled={lastRunning || replyAnchorId === undefined}
               onChange={event => { setDraft(event.target.value) }}
@@ -1044,37 +1147,91 @@ function SessionPageContent(props: Parameters<typeof SessionPage>[0] & { access:
               }}
             />
           </div>
-          <div className="dms-accessory">
-            <span className={`dms-phase${phase === undefined ? '' : ` dms-phase-${phase}`}`}>
-              <i />{phase === undefined ? '载入中' : STATUS_LABELS[phase]}
-            </span>
-            <span className="dms-chip">{CLI_LABELS[cli]}</span>
-            {anchorRef === '' ? undefined : (
-              <button type="button" className="dms-refcopy" onClick={copyAnchorRef}
-                title={`续接引用（resume 用），点击复制：${anchorRef}`}>
-                <span className="dms-mono">{copiedRef ? '已复制' : anchorRef.slice(0, 12)}</span>
-                <svg width="10" height="10" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.4" aria-hidden>
-                  <rect x="5.5" y="5.5" width="8" height="8" rx="1.5" />
-                  <path d="M10.5 3.5h-7a1 1 0 0 0-1 1v7" />
-                </svg>
-              </button>
-            )}
-            {listError !== undefined ? <span className="dms-truncated">任务列表读取失败：{listError}</span> : undefined}
-            <span className="dms-spacer" />
-            {lastRunning
-              ? <button type="button" className="dms-cancel" onClick={cancelLast}>取消</button>
-              : undefined}
-            <button
-              type="button" className="dms-send" aria-label={sending ? '发送中' : '发送'}
-              disabled={lastRunning || replyAnchorId === undefined || sending || draft.trim() === ''}
-              onClick={() => { void submit() }}
-            >
-              <svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" aria-hidden>
-                <path d="M8 13V3.5" />
-                <path d="M3.5 8L8 3.5 12.5 8" />
+          <div className="dms-toolrow">
+            <div className="dms-toolrow-left">
+              <span
+                className="dms-cli-badge"
+                title={`续发沿用 ${CLI_LABELS[cli]} 的服务端配置（模型与思考档位不在会话页改）；CLI 续发只接受文本，需要文件请把路径写进消息`}
+              >
+                <IconCodeOutlineRegular size={14} />
+                <span>{CLI_LABELS[cli]}</span>
+              </span>
+            </div>
+            <div className="dms-toolrow-actions">
+              {lastRunning
+                ? (
+                  <button
+                    type="button" className="dms-stop" onClick={cancelLast}
+                    title="停止正在执行的这一轮（会取消当前 CLI 进程）" aria-label="停止这一轮"
+                  >
+                    <i aria-hidden />
+                  </button>
+                )
+                : (
+                  <button
+                    type="button" className="dms-send" aria-label={sending ? '发送中' : '发送'}
+                    title={sending ? '发送中…' : '发送（Enter）'}
+                    disabled={replyAnchorId === undefined || sending || draft.trim() === ''}
+                    onClick={() => { void submit() }}
+                  >
+                    <svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" aria-hidden>
+                      <path d="M8 13V3.5" />
+                      <path d="M3.5 8L8 3.5 12.5 8" />
+                    </svg>
+                  </button>
+                )}
+            </div>
+          </div>
+        </div>
+        <div className="dms-stats">
+          <span className="dms-stat" title={phase === undefined ? '正在载入任务摘要' : `任务阶段：${STATUS_LABELS[phase]}`}>
+            <StateDot size={6} state={phaseDotState(phase)} />
+            {phase === undefined ? '载入中' : STATUS_LABELS[phase]}
+          </span>
+          {stageLabel === undefined ? undefined : (
+            <>
+              <span className="dms-stat-sep" />
+              <span className="dms-stat">{stageLabel}</span>
+            </>
+          )}
+          <span className="dms-stat-sep" />
+          <span className="dms-stat" title={`回复链共 ${String(chain.length)} 轮${pendingReplyId === undefined ? '' : '（含刚发出、尚未入库的一轮）'}`}>
+            {chain.length} 轮
+          </span>
+          {totalTokens === undefined ? undefined : (
+            <>
+              <span className="dms-stat-sep" />
+              <span className="dms-stat" {...(tokensTip === undefined ? {} : { title: tokensTip })}>
+                {formatTokens(totalTokens)} tokens
+              </span>
+            </>
+          )}
+          {cacheHit === undefined ? undefined : (
+            <>
+              <span className="dms-stat-sep dms-stat-detail" />
+              <span className="dms-stat dms-stat-detail" title="缓存命中率 = 缓存读 /（未缓存输入 + 缓存读）">
+                缓存 {String(cacheHit)}%
+              </span>
+            </>
+          )}
+          {tokensPerSecond === undefined ? undefined : (
+            <>
+              <span className="dms-stat-sep dms-stat-detail" />
+              <span className="dms-stat dms-stat-detail" {...(tokensPerSecondTip === undefined ? {} : { title: tokensPerSecondTip })}>
+                {String(tokensPerSecond)} tok/s
+              </span>
+            </>
+          )}
+          {anchorRef === '' ? undefined : (
+            <button type="button" className="dms-refcopy" onClick={copyAnchorRef}
+              title={`续接引用（下次 resume 用），点击复制：${anchorRef}`}>
+              <span className="dms-mono">resume · {copiedRef ? '已复制' : anchorRef.slice(0, 8)}</span>
+              <svg width="10" height="10" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.4" aria-hidden>
+                <rect x="5.5" y="5.5" width="8" height="8" rx="1.5" />
+                <path d="M10.5 3.5h-7a1 1 0 0 0-1 1v7" />
               </svg>
             </button>
-          </div>
+          )}
         </div>
       </div>
     </div>

@@ -9,7 +9,7 @@ export default defineConfig({
       '@deepseek-ai/dsh-client-ui-primitives': fileURLToPath(new URL('./tests/upstream-fixtures/host-ui-primitives.tsx', import.meta.url)),
     },
   },
-  esbuild: { jsx: 'automatic', jsxImportSource: 'react' },
+  oxc: { jsx: { runtime: 'automatic', importSource: 'react' } },
   test: {
     environment: 'node',
     include: ['tests/**/*.test.ts', 'tests/**/*.test.tsx'],
