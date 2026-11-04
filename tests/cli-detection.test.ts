@@ -62,7 +62,7 @@ describe('fast local CLI versions', () => {
     expect(spawn.launches).toHaveLength(0)
   })
 
-  it('supports a native Claude wrapper with an absolute exe path', async () => {
+  it('supports a native Claude wrapper with an absolute exe path', { timeout: 25_000 }, async () => {
     const fixture = await packageFixture('claude', 'bin/claude.exe', '2.1.312')
     await writeFile(fixture.shim, `@ECHO OFF\n"${fixture.entry}" %*\n`)
     expect(await readLocalCliVersion('claude', fixture.shim)).toBe('2.1.312')

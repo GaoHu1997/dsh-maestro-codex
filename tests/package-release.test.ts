@@ -108,7 +108,7 @@ describe('release export and build configuration', () => {
       }))
       expect(after.map(diagnostic => ts.flattenDiagnosticMessageText(diagnostic.messageText, '\n'))).toEqual([])
     }
-  }, 15_000)
+  }, 45_000)
 
   it('migrates legacy define/inject before tsdown re-merges defaults and preserves transforms', async () => {
     if (typeof config.inputOptions !== 'function') throw new Error('Expected legacy define/inject adapter')

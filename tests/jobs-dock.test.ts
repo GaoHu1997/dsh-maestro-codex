@@ -12,11 +12,13 @@ function declarations(selector: string): Record<string, string> {
 }
 
 describe('jobs dock stylesheet', () => {
-  it('pins the dock to a fixed fifth of the board height', () => {
+  it('pins the dock to the bottom at a fixed fifth of the board height', () => {
     const dock = declarations(`[${JOBS_DOCK_ATTRIBUTE}]`)
     expect(JOBS_DOCK_SHARE).toBe('20%')
     expect(dock.flex).toBe('0 0 20%')
     expect(dock['min-height']).toBe('28px')
+    // 上方兄弟（`.subagentEmpty`、错误条等）不吸剩余空间，auto margin 把槽位钉在底部。
+    expect(dock['margin-top']).toBe('auto')
     expect(dock.display).toBe('flex')
     expect(dock['flex-direction']).toBe('column')
     expect(dock.overflow).toBe('hidden')

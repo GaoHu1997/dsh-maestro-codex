@@ -167,15 +167,20 @@ describe('BoardTab original renderer integration', () => {
     expect(html).toContain('dsh_maestro_upstream_tasks_graph_jobsDrawerBody')
   })
 
-  it('draws no empty dock when no job belongs to the scoped tree', () => {
+  it('draws an empty dock pinned at the bottom when no job belongs to the scoped tree', () => {
     const html = render({ host: host({ list }) })
-    expect(html).not.toContain('data-maestro-jobs-dock')
+    // 后台任务为空也要保留停靠槽（空态自绘抽屉），固定在看板底部。
+    expect(html).toContain('data-maestro-jobs-dock=""')
+    expect(html).toContain('dsh_maestro_upstream_tasks_graph_jobsDrawer')
+    expect(html).toContain('dsh_maestro_upstream_tasks_graph_jobsDrawerBody')
   })
 
   it('drops roster rows owned outside the scoped tree', () => {
     const html = render({ host: host({ list, jobRows: [{ ownerSessionId: 'nope', job: { ...job, owner: 'nope' } }] }) })
     expect(html).not.toContain('夜间迁移工作流')
-    expect(html).not.toContain('jobsDrawer')
+    // 行被过滤后是空列表：停靠槽照常保留（空态自绘抽屉），但不再渲染任务行。
+    expect(html).toContain('data-maestro-jobs-dock=""')
+    expect(html).not.toContain('jobsRowMain')
   })
 
   it('hides the jobs drawer when the host has no jobs service', () => {

@@ -10,3 +10,9 @@ dist/
 src/client/board/upstream/.types/
 upstream-migration/
 scripts/import-task-renderer.mjs
+
+# Local validation copies and generated session-repair artifacts
+/ccswitchmulti/
+/release-tests/
+/session-history-*.json
+/session-repair-scan-*.json

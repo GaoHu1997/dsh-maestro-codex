@@ -9,6 +9,7 @@ import { CliNodePopover } from './cli-detail.js'
 import { useCliAccess } from '../access.js'
 import { SessionPage } from './Session.js'
 import { injectBoardAccent, watchBoardBadges } from './accent.js'
+import { jobsEmptyLabel } from './copy.js'
 import { JOBS_DOCK_ATTRIBUTE, injectJobsDock } from './jobs-dock.js'
 import { useBoardNative } from './native.js'
 import {
@@ -17,6 +18,7 @@ import {
   type Context, type SidebarTeamTaskView, type TasksAgentNode, type TasksFoldNode, type TasksWorkflowNode,
 } from './upstream/index.js'
 import legacy from './upstream/client/SubagentView.module.css'
+import tg from './upstream/client/tasks-graph.module.css'
 
 export const BOARD_TAB_ID = 'maestro-board'
 export const BOARD_TAB_TITLE = '任务看板'
@@ -254,13 +256,24 @@ function BoardPage(props: BoardTabProps & { readonly rootId: string; readonly li
       ? <TasksGraph {...common} rootId={rootId} onFoldNode={foldNode} />
       : <TasksTree {...common} collapsedIds={collapsedIds} onToggleCollapse={toggleCollapse} onCollapseAll={collapseAll} onExpandAll={expandAll} />}
     {/* 后台任务钉在看板底部，固定占 1/5 高度（见 jobs-dock.ts）。代理多时不再自动收起：
-        收起会让这 1/5 只剩一条 28px 的标题栏；用户点标题栏仍可手动折叠。 */}
-    {jobs.available && jobRows.length > 0 ? <div {...{ [JOBS_DOCK_ATTRIBUTE]: '' }}>
-      <JobsDrawer rows={jobRows} jobs={jobsService} autoCollapse={false}
+        收起会让这 1/5 只剩一条 28px 的标题栏；用户点标题栏仍可手动折叠。
+        列表为空也保留停靠槽（上游 JobsDrawer 空列表直接 return null，空态自绘
+        同结构的抽屉撑满槽位）：「后台任务」面板任何情况下都固定在底部。 */}
+    {jobs.available ? <div {...{ [JOBS_DOCK_ATTRIBUTE]: '' }}>
+      {jobRows.length === 0
+        ? <section className={tg.jobsDrawer} aria-label={t('jobs')}>
+          <div className={tg.jobsDrawerBar}>
+            <span>{t('jobs')}</span>
+            <span className={tg.jobsBigNum}>0</span>
+            <span className={tg.jobsDrawerCount}>{t('jobsCount', { count: 0 })}</span>
+          </div>
+          <div className={tg.jobsDrawerBody}><div className={legacy.subagentEmpty}>{jobsEmptyLabel()}</div></div>
+        </section>
+        : <JobsDrawer rows={jobRows} jobs={jobsService} autoCollapse={false}
         observed={selectedRow === undefined ? undefined : jobs.observed[selectedRow.job.id]}
         agentCount={renderer.byNodeId.size} visible={active}
         {...(selectedRow === undefined ? {} : { openJobId: selectedRow.job.id })}
-        onOpenOutput={(row, anchor) => { setPopover({ kind: 'job', id: row.job.id, anchor }) }} />
+        onOpenOutput={(row, anchor) => { setPopover({ kind: 'job', id: row.job.id, anchor }) }} />}
     </div> : null}
     {active && popover?.kind === 'task' && team !== undefined ? <TaskWindow key={popover.id || 'create'} rootId={rootId}
       task={selectedTask} members={teamMembers} ctx={ctx as unknown as Context} anchor={popover.anchor} onClose={closePopover} /> : null}

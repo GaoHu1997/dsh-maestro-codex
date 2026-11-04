@@ -12,7 +12,15 @@
  *
  * @module dsh-maestro-codex/client/board/copy
  */
-import { en, zh } from './upstream/index.js'
+import { en, zh, t } from './upstream/index.js'
+
+/**
+ * 空后台任务列表的槽位提示（「后台任务」面板常驻底部，列表为空也要显示空态）。
+ * 依赖 {@link applyBoardCopy} 补写的 `jobsEmpty` 键。
+ */
+export function jobsEmptyLabel(): string {
+  return t('jobsEmpty' as Parameters<typeof t>[0])
+}
 
 /** 应用看板词条覆盖（幂等；客户端 apply 时调用一次即可）。 */
 export function applyBoardCopy(): void {
@@ -24,4 +32,7 @@ export function applyBoardCopy(): void {
   zh.subagentEmptyDesc = '当前主智能体派生的子智能体将显示在这里'
   zh.subagentCount = '{count} 个子智能体'
   zh.subagentCountRunning = '{count} 个子智能体 · {running} 运行中'
+  // 新键：上游字典没有空后台任务列表的文案，运行时补（同上就地改写，t() 现读生效）。
+  ;(zh as Record<string, string>).jobsEmpty = '暂无后台任务'
+  ;(en as Record<string, string>).jobsEmpty = 'No background jobs'
 }

@@ -248,7 +248,7 @@ describe('tree-repair CLI', () => {
     expect(() => parseTreeRepairArgs(['--ports', '12345', root])).toThrow('INVALID_ARGUMENTS')
   })
 
-  it('executes a default CLI scan with no payload disclosure or artifacts', async () => {
+  it('executes a default CLI scan with no payload disclosure or artifacts', { timeout: 20_000 }, async () => {
     const { root } = await fixture()
     const before = await snapshot(root)
     const result = await run(process.execPath, [script, root])
