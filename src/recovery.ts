@@ -21,6 +21,7 @@ export interface InterruptedSeed {
   model: string
   sessionId?: string | undefined
   replyTo?: string | undefined
+  replySessionIds?: readonly string[] | undefined
   startedAt?: number | undefined
 }
 
@@ -48,6 +49,7 @@ function seedOf(row: EffectRow): InterruptedSeed | undefined {
     model: typeof record['model'] === 'string' ? record['model'] : '',
     ...(textOf(record['sessionId']) === undefined ? {} : { sessionId: textOf(record['sessionId']) }),
     ...(textOf(record['replyTo']) === undefined ? {} : { replyTo: textOf(record['replyTo']) }),
+    ...(Array.isArray(record['replySessionIds']) ? { replySessionIds: record['replySessionIds'].filter((id): id is string => typeof id === 'string') } : {}),
     ...(typeof record['startedAt'] === 'number' ? { startedAt: record['startedAt'] } : {}),
   }
 }
@@ -82,6 +84,7 @@ export function restoreInterrupted(registry: TaskRegistry, rows: readonly Effect
       note: INTERRUPTED_NOTE,
       ...(seed.sessionId === undefined ? {} : { sessionId: seed.sessionId }),
       ...(seed.replyTo === undefined ? {} : { replyTo: seed.replyTo }),
+      ...(seed.replySessionIds === undefined ? {} : { replySessionIds: seed.replySessionIds }),
     })
     restored.push(seed.taskId)
   }

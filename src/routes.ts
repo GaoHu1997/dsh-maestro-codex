@@ -208,7 +208,7 @@ export interface TaskPrincipal { readonly sessionId: string }
 /** GET tasks — summaries scoped to the authenticated owner. */
 export function handleTasks(deps: RouteDeps, query?: URLSearchParams, principal?: TaskPrincipal): RouteOutcome {
   const sessions = parseSessionFilter(query?.get('sessions') ?? null)
-  return ok({ tasks: deps.registry.list().filter(task => taskVisible(task, sessions, principal)) })
+  return ok({ tasks: deps.registry.list().filter(task => taskVisible(task, sessions, principal, deps.registry)) })
 }
 
 /**
@@ -228,30 +228,30 @@ function parseSessionList(raw: unknown): ReadonlySet<string> | undefined {
   return ids.length === 0 ? undefined : new Set(ids)
 }
 
-/** The CLI child session DSH owns for one task; the id is derived, never stored. */
-function childSessionIdOf(taskId: string): string {
-  return `cli-${taskId}`
-}
-
 /**
- * Whether one task belongs to the caller's session scope. Owner-less tasks
- * (npm installs started from the config card) stay visible everywhere.
- *
- * A task's own CLI child session is an owner too: its session page reads the
- * task it was dispatched from. That id is derived from the task id (dispatch
- * always seeds `cli-<taskId>`), so a child session can only ever name the one
- * task it belongs to — it cannot borrow another conversation's task.
+ * Admission comes from the authenticated principal, never supplied filters.
+ * A CLI child can also follow its own verified continuation branch. The
+ * registry derives bounded ancestor views from admitted tasks and keeps them
+ * across history pruning; sibling roots and different owners stay private.
  */
 function taskVisible(
-  task: { readonly id: string; readonly sessionId?: string | undefined; readonly kind?: 'cli' | 'npm' | undefined },
+  task: {
+    readonly id: string
+    readonly cli: MaestroCliId
+    readonly sessionId?: string | undefined
+    readonly kind?: 'cli' | 'npm' | undefined
+    readonly replyTo?: string | undefined
+    readonly replySessionIds?: readonly string[] | undefined
+  },
   sessions: ReadonlySet<string> | undefined,
-  principal?: TaskPrincipal,
+  principal: TaskPrincipal | undefined,
+  registry: DispatchDeps['registry'],
 ): boolean {
   if (task.sessionId === undefined) return task.kind === 'npm'
   if (principal === undefined) return false
-  const childSessionId = childSessionIdOf(task.id)
-  if (principal.sessionId !== task.sessionId && principal.sessionId !== childSessionId) return false
-  return sessions === undefined || sessions.has(task.sessionId) || sessions.has(childSessionId)
+  const admitted = registry.accessSessionIdsOf(task)
+  if (!admitted.has(principal.sessionId)) return false
+  return sessions === undefined || [...sessions].some(id => admitted.has(id))
 }
 
 /** GET task?id=&cursor=&sessions= — one task's detail plus events after the cursor. */
@@ -263,7 +263,7 @@ export function handleTaskDetail(deps: RouteDeps, query: URLSearchParams, princi
   const page = deps.registry.eventsSince(id, cursor)
   // A task from another conversation reads as absent — the board must not leak
   // that another session's task exists.
-  if (page === undefined || !taskVisible(page.task, sessions, principal)) return fail(404, `任务不存在：${id}`)
+  if (page === undefined || !taskVisible(page.task, sessions, principal, deps.registry)) return fail(404, `任务不存在：${id}`)
   const task = page.task
   const summary: MaestroTaskSummary = deps.registry.summaryOf(task)
   const detail: MaestroTaskDetail = {
@@ -285,7 +285,7 @@ export function handleTaskCancel(deps: RouteDeps, body: unknown, principal?: Tas
   const id = typeof record['id'] === 'string' ? record['id'] : ''
   if (id === '') return fail(400, '"id" 不能为空')
   const task = deps.registry.get(id)
-  if (task === undefined || !taskVisible(task, parseSessionList(record['sessions']), principal)) return fail(404, `任务不存在：${id}`)
+  if (task === undefined || !taskVisible(task, parseSessionList(record['sessions']), principal, deps.registry)) return fail(404, `任务不存在：${id}`)
   if (isTerminalPhase(task.phase)) return fail(409, `任务已结束（${task.phase}），无需取消`)
   const controller = deps.controllers.get(id)
   if (controller === undefined) return fail(409, '任务尚未挂起执行进程，请稍后重试')
@@ -325,7 +325,7 @@ export function handleTaskReply(deps: RouteDeps, body: unknown, principal?: Task
   if (text.length > 100_000) return fail(400, '"text" 超过 100k 字符上限')
   if (!deps.readConfig().enabled) return fail(409, 'CLI 子代理插件已停用（配置页可重新开启）')
   const task = deps.registry.get(id)
-  if (task === undefined || !taskVisible(task, parseSessionList(record['sessions']), principal)) return fail(404, `任务不存在：${id}`)
+  if (task === undefined || !taskVisible(task, parseSessionList(record['sessions']), principal, deps.registry)) return fail(404, `任务不存在：${id}`)
   if (!isTerminalPhase(task.phase)) return fail(409, '任务还在运行中，等它结束再续发')
   // The runner records the CLI session reference inside the extensible stats
   // contract (persisted with the stats); that is the handle a reply resumes.

@@ -12,6 +12,12 @@ export function sessionAccessOf(value: unknown): MaestroSessionAccess | undefine
 interface SessionAccessOwner {
   session: AccessSession | undefined
   readonly access: MaestroSessionAccess
+  unscoped: boolean
+  readonly projections: Set<symbol>
+}
+interface SessionAccessProjectionScope {
+  accessForProjection(trustedSessionId: string): MaestroSessionAccess | null
+  dispose(): void
 }
 type SessionAccessState = { readonly sessionId: string } | null
 
@@ -42,14 +48,48 @@ export class SessionAccessRegistry {
    * A session ID is not an external caller's permission; never expose this as an HTTP lookup.
    */
   accessForProjection(trustedSessionId: string): MaestroSessionAccess | null {
-    if (typeof trustedSessionId !== 'string' || trustedSessionId === '') return null
-    return (this.byOwner.get(trustedSessionId) ?? this.issue(trustedSessionId, undefined)).access
+    return this.projectionAccess(trustedSessionId)
   }
-  private issue(sessionId: string, session: AccessSession | undefined): SessionAccessOwner {
+  /** @internal Each optional installation owns a lease, not the entire registry. */
+  projectionScope(): SessionAccessProjectionScope {
+    const lease = Symbol('session access projection'), sessions = new Set<string>()
+    let active = true
+    return {
+      accessForProjection: trustedSessionId => {
+        if (!active) return null
+        const access = this.projectionAccess(trustedSessionId, lease)
+        if (access !== null) sessions.add(access.sessionId)
+        return access
+      },
+      dispose: () => {
+        if (!active) return
+        // Disable retained host callbacks before revoking their capabilities.
+        active = false
+        for (const sessionId of sessions) {
+          const owner = this.byOwner.get(sessionId)
+          if (owner?.projections.delete(lease) && !owner.unscoped && owner.projections.size === 0) {
+            this.byOwner.delete(sessionId)
+            this.byToken.delete(owner.access.token)
+          }
+        }
+        sessions.clear()
+      },
+    }
+  }
+  private projectionAccess(trustedSessionId: string, lease?: symbol): MaestroSessionAccess | null {
+    if (typeof trustedSessionId !== 'string' || trustedSessionId === '') return null
+    const owner = this.byOwner.get(trustedSessionId) ?? this.issue(trustedSessionId, undefined, lease === undefined)
+    if (lease === undefined) owner.unscoped = true
+    else owner.projections.add(lease)
+    return owner.access
+  }
+  private issue(sessionId: string, session: AccessSession | undefined, unscoped = true): SessionAccessOwner {
     const access = Object.freeze({ sessionId, token: randomBytes(32).toString('hex') })
     const previous = this.byOwner.get(sessionId)
     if (previous !== undefined) this.byToken.delete(previous.access.token)
-    const owner = { session, access }
+    // Live replacement rotates the token, not the installation's ownership.
+    const owner = { session, access, unscoped: previous?.unscoped ?? unscoped,
+      projections: previous?.projections ?? new Set<symbol>() }
     this.byOwner.set(sessionId, owner)
     this.byToken.set(access.token, sessionId)
     return owner
@@ -64,9 +104,14 @@ export class SessionAccessRegistry {
 
 /** Wire delivery inherits the host's session-read authorization, never an event's identity. */
 export function installSessionAccessProjection(host: unknown, registry = new SessionAccessRegistry()): (() => void) | undefined {
-  if (typeof host !== 'object' || host === null) return undefined
-  const service = (host as { sessionProjections?: { register(definition: unknown): unknown } }).sessionProjections
-  if (service === undefined || service === null || typeof service.register !== 'function') return undefined
+  let service: unknown, register: unknown
+  try {
+    service = typeof host === 'object' && host !== null ? (host as { sessionProjections?: unknown }).sessionProjections : undefined
+    if (typeof service !== 'object' || service === null) return undefined
+    register = (service as { register?: unknown }).register
+    if (typeof register !== 'function') return undefined
+  } catch { return undefined }
+  const scope = registry.projectionScope()
   const stateSchema = { parse(value: unknown): SessionAccessState {
     if (value === null) return null
     // Reject token-bearing v1 cache entries so they must be rebuilt from the trusted header.
@@ -92,8 +137,22 @@ export function installSessionAccessProjection(host: unknown, registry = new Ses
       state === null ? null : { sessionId: state.sessionId },
     // snapshot invokes view each time, even when its persisted state has not changed.
     wire: { viewSchema, view: (state: unknown): MaestroSessionAccess | null =>
-      isAccessState(state) ? registry.accessForProjection(state.sessionId) : null },
+      isAccessState(state) ? scope.accessForProjection(state.sessionId) : null },
   }
-  const dispose = service.register(definition)
-  return typeof dispose === 'function' ? () => { (dispose as () => void)() } : () => {}
+  try {
+    const dispose = (register as (definition: unknown) => unknown).call(service, definition)
+    let disposed = false
+    return () => {
+      if (disposed) return
+      disposed = true
+      // A host may retain the definition or throw while unregistering. Neither
+      // may keep this installation's capability delivery or leases alive.
+      scope.dispose()
+      try { if (typeof dispose === 'function') dispose() } catch { /* Optional host cleanup was rejected; local access is already revoked. */ }
+    }
+  } catch {
+    // register() may have evaluated views before rejecting the definition.
+    scope.dispose()
+    return undefined
+  }
 }

@@ -20,6 +20,20 @@ const FAILURE_PHASES: readonly MaestroPhase[] = ['failed', 'timeout']
 /** Finished-task cap before the oldest ones are pruned. */
 const TASKS_CAP = 60
 
+/** Keep the original view plus recent ancestor views without unbounded history. */
+const REPLY_SESSION_IDS_CAP = TASKS_CAP
+
+function boundedReplySessionIds(value: unknown): readonly string[] | undefined {
+  if (!Array.isArray(value)) return undefined
+  const ids = [...new Set(value.filter((id): id is string =>
+    typeof id === 'string' && id.startsWith('cli-') && id.length > 4 && id.length <= 260))]
+  if (ids.length === 0) return undefined
+  const bounded = ids.length <= REPLY_SESSION_IDS_CAP
+    ? ids
+    : ids.slice(0, 1).concat(ids.slice(-(REPLY_SESSION_IDS_CAP - 1)))
+  return Object.freeze(bounded)
+}
+
 export interface MaestroTask {
   readonly id: string
   readonly cli: MaestroCliId
@@ -35,6 +49,8 @@ export interface MaestroTask {
   readonly sessionId: string | undefined
   /** The task this one continues (a session-page reply); undefined = a root turn. */
   readonly replyTo: string | undefined
+  /** Trusted ancestor CLI views; bounded and never taken from dispatch JSON. */
+  readonly replySessionIds?: readonly string[] | undefined
   phase: MaestroPhase
   startedAt: number
   endedAt: number | undefined
@@ -101,6 +117,8 @@ export class TaskRegistry {
     sessionId?: string | undefined
     prompt?: string | undefined
     replyTo?: string | undefined
+    /** Server-written recovery metadata; ordinary create ignores this input. */
+    replySessionIds?: readonly string[] | undefined
     /** 起始阶段：正常派发是 `queued`，启动恢复直接用 `interrupted`。 */
     phase?: MaestroPhase | undefined
     /** 恢复任务的说明（写进事件流，人能看到"这不是它自己失败的"）。 */
@@ -116,6 +134,7 @@ export class TaskRegistry {
       model: input.model,
       sessionId: input.sessionId,
       replyTo: input.replyTo,
+      replySessionIds: this.replySessionIdsFor(input),
       phase: input.phase ?? 'queued',
       startedAt: Date.now(),
       endedAt: input.phase !== undefined && isTerminalPhase(input.phase) ? Date.now() : undefined,
@@ -218,6 +237,8 @@ export class TaskRegistry {
     model?: string | undefined
     sessionId?: string | undefined
     replyTo?: string | undefined
+    /** Server-written recovery metadata; ordinary create ignores this input. */
+    replySessionIds?: readonly string[] | undefined
     phase: MaestroPhase
     startedAt: number
     endedAt?: number | undefined
@@ -241,6 +262,9 @@ export class TaskRegistry {
       model: record.model ?? '',
       sessionId: record.sessionId,
       replyTo: record.replyTo,
+      replySessionIds: record.kind !== 'npm' && typeof record.sessionId === 'string' && record.sessionId !== ''
+        && typeof record.replyTo === 'string' && record.replyTo !== ''
+        ? boundedReplySessionIds(record.replySessionIds) : undefined,
       phase: record.phase,
       startedAt: record.startedAt,
       endedAt: record.endedAt ?? record.startedAt,
@@ -274,6 +298,72 @@ export class TaskRegistry {
 
   get(id: string): MaestroTask | undefined {
     return this.tasks.get(id)
+  }
+
+  /** Runtime-admitted views of one task; request filters cannot add authority. */
+  accessSessionIdsOf(task: {
+    readonly id: string
+    readonly cli: MaestroCliId
+    readonly kind?: 'cli' | 'npm' | undefined
+    readonly sessionId?: string | undefined
+    readonly replyTo?: string | undefined
+    readonly replySessionIds?: readonly string[] | undefined
+  }): ReadonlySet<string> {
+    if (typeof task.sessionId !== 'string' || task.sessionId === '') return new Set()
+    const ownChild = `cli-${task.id}`
+    const direct = new Set([task.sessionId, ownChild])
+    if (task.kind !== 'cli' || typeof task.replyTo !== 'string' || task.replyTo === '') return direct
+    const ancestors: string[] = []
+    const seen = new Set([task.id])
+    let parentId: string | undefined = task.replyTo
+    while (parentId !== undefined) {
+      if (seen.has(parentId)) return direct
+      seen.add(parentId)
+      const parent = this.tasks.get(parentId)
+      if (parent === undefined) break
+      if (parent.kind !== 'cli' || parent.cli !== task.cli || parent.sessionId !== task.sessionId) return direct
+      ancestors.unshift(`cli-${parent.id}`)
+      parentId = parent.replyTo
+    }
+    // Legacy records use the checked chain. New records retain a bounded
+    // server-derived snapshot so pruning or restart does not hide the reply.
+    const saved = task.replySessionIds ?? []
+    const knownAncestors = new Set(ancestors)
+    const inherited = boundedReplySessionIds([
+      ...saved.slice(0, 1),
+      ...saved.slice(1).filter(id => !knownAncestors.has(id)),
+      ...ancestors,
+    ]) ?? []
+    for (const id of inherited) {
+      if (id === ownChild) return direct
+      const known = this.tasks.get(id.slice(4))
+      if (known !== undefined && (known.kind !== 'cli' || known.cli !== task.cli || known.sessionId !== task.sessionId
+        || (parentId === undefined && !seen.has(known.id)))) return direct
+    }
+    return new Set([task.sessionId, ...inherited, ownChild])
+  }
+
+  private replySessionIdsFor(input: {
+    readonly cli: MaestroCliId
+    readonly kind?: 'cli' | 'npm' | undefined
+    readonly sessionId?: string | undefined
+    readonly replyTo?: string | undefined
+    readonly phase?: MaestroPhase | undefined
+    readonly replySessionIds?: readonly string[] | undefined
+  }): readonly string[] | undefined {
+    if (input.kind === 'npm' || typeof input.sessionId !== 'string' || input.sessionId === ''
+      || typeof input.replyTo !== 'string' || input.replyTo === '') return undefined
+    const anchor = this.tasks.get(input.replyTo)
+    if (anchor !== undefined) {
+      if (anchor.kind !== 'cli' || anchor.cli !== input.cli || anchor.sessionId !== input.sessionId) return undefined
+      return boundedReplySessionIds([
+        ...(input.phase === 'interrupted' ? input.replySessionIds ?? [] : []),
+        ...[...this.accessSessionIdsOf(anchor)].filter(id => id !== input.sessionId),
+      ])
+    }
+    // Only interrupted launch recovery may restore an already server-written
+    // snapshot. Ordinary create/dispatch ignores any supplied alias array.
+    return input.phase === 'interrupted' ? boundedReplySessionIds(input.replySessionIds) : undefined
   }
 
   /**
@@ -333,6 +423,7 @@ export class TaskRegistry {
       ...(usage === undefined ? {} : { usage }),
       ...(sessionRef === '' ? {} : { sessionRef }),
       ...(task.replyTo === undefined || task.replyTo === '' ? {} : { replyTo: task.replyTo }),
+      ...(task.replySessionIds === undefined ? {} : { replySessionIds: task.replySessionIds }),
       ...(task.truncated ? { truncated: true } : {}),
     }
   }

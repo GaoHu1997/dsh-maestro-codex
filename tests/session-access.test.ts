@@ -140,6 +140,227 @@ describe('trusted Session capability registry positive security regressions', ()
   })
 })
 
+describe('optional access projection installation and lease cleanup', () => {
+  it('returns not-installed on a throwing host getter without disturbing existing capabilities', () => {
+    const registry = new SessionAccessRegistry(), healthy = authorizedProjection(registry)
+    const existing = healthy.forHeader('healthy-owner'), getter = vi.fn(() => { throw new Error('service not injected') })
+    const host = Object.defineProperty({}, 'sessionProjections', { get: getter })
+    expect(installSessionAccessProjection(host, registry)).toBeUndefined()
+    expect(getter).toHaveBeenCalledOnce()
+    expect(registry.authorize(existing.token)).toEqual({ sessionId: 'healthy-owner' })
+    expect(healthy.forHeader('healthy-owner')).toEqual(existing)
+  })
+  it('returns not-installed on a throwing register getter', () => {
+    const getter = vi.fn(() => { throw new Error('register not available') })
+    const service = Object.defineProperty({}, 'register', { get: getter })
+    expect(installSessionAccessProjection({ sessionProjections: service })).toBeUndefined()
+    expect(getter).toHaveBeenCalledOnce()
+  })
+  it('does not pretend a refused registration was installed', () => {
+    const register = vi.fn(() => { throw new Error('projection key conflict') })
+    expect(installSessionAccessProjection({ sessionProjections: { register } })).toBeUndefined()
+    expect(register).toHaveBeenCalledOnce()
+  })
+  it('revokes capabilities delivered during a partially failed registration and disables retained views', () => {
+    const registry = new SessionAccessRegistry(), delivered: MaestroSessionAccess[] = []
+    let retained: Definition | undefined
+    const host = { sessionProjections: { register(value: unknown) {
+      retained = value as Definition
+      for (const id of ['partial-A', 'partial-B']) {
+        const access = retained.wire.view(retained.init({ id }, 0))!
+        delivered.push(access)
+        expect(registry.authorize(access.token)).toEqual({ sessionId: id })
+      }
+      throw new Error('host failed after initial view delivery')
+    } } }
+    expect(installSessionAccessProjection(host, registry)).toBeUndefined()
+    expect(delivered).toHaveLength(2)
+    for (const access of delivered) expect(registry.authorize(access.token)).toBeUndefined()
+    expect(retained!.wire.view({ sessionId: 'partial-A' })).toBeNull()
+    expect(retained!.wire.view({ sessionId: 'new-after-failure' })).toBeNull()
+    const healthy = authorizedProjection(registry), fresh = healthy.forHeader('partial-A')
+    expect(fresh.token).not.toBe(delivered[0]!.token)
+    expect(registry.authorize(fresh.token)).toEqual({ sessionId: 'partial-A' })
+  })
+  it('revokes a partially installed cold capability after live binding and token replacement', () => {
+    const registry = new SessionAccessRegistry(), delivered: MaestroSessionAccess[] = []
+    const session = trustedSession('partial-owner')
+    const host = { sessionProjections: { register(value: unknown) {
+      const definition = value as Definition, state = definition.init({ id: session.id }, 0)
+      const cold = definition.wire.view(state)!
+      delivered.push(cold)
+      registry.publish(session.id, session)
+      expect(definition.wire.view(state)).toEqual(cold)
+      registry.publish(session.id, trustedSession(session.id))
+      const replacement = definition.wire.view(state)!
+      delivered.push(replacement)
+      expect(replacement.token).not.toBe(cold.token)
+      expect(registry.authorize(replacement.token)).toEqual({ sessionId: session.id })
+      throw new Error('host failed after live binding')
+    } } }
+    expect(installSessionAccessProjection(host, registry)).toBeUndefined()
+    expect(delivered).toHaveLength(2)
+    for (const access of delivered) expect(registry.authorize(access.token)).toBeUndefined()
+    expect(session.append).not.toHaveBeenCalled()
+  })
+  it('does not revoke an existing live owner or another healthy installation on registration failure', () => {
+    const registry = new SessionAccessRegistry(), healthy = authorizedProjection(registry)
+    const live = trustedSession('live-owner')
+    registry.publish(live.id, live)
+    const shared = healthy.forHeader('shared-owner'), liveAccess = healthy.forHeader(live.id)
+    let orphan: MaestroSessionAccess | null = null
+    const host = { sessionProjections: { register(value: unknown) {
+      const definition = value as Definition
+      expect(definition.wire.view({ sessionId: 'shared-owner' })).toEqual(shared)
+      expect(definition.wire.view({ sessionId: live.id })).toEqual(liveAccess)
+      orphan = definition.wire.view({ sessionId: 'failed-only-owner' })
+      throw new Error('refused after observing existing owners')
+    } } }
+    expect(installSessionAccessProjection(host, registry)).toBeUndefined()
+    expect(registry.authorize(orphan!.token)).toBeUndefined()
+    expect(registry.authorize(shared.token)).toEqual({ sessionId: 'shared-owner' })
+    expect(registry.authorize(liveAccess.token)).toEqual({ sessionId: live.id })
+    expect(healthy.forHeader('shared-owner')).toEqual(shared)
+    expect(healthy.forHeader(live.id)).toEqual(liveAccess)
+    healthy.unregister?.()
+    expect(registry.authorize(shared.token)).toBeUndefined()
+    expect(registry.authorize(liveAccess.token)).toEqual({ sessionId: live.id })
+  })
+  it('preserves an unscoped compatibility capability when a failed installation observes it', () => {
+    const registry = new SessionAccessRegistry(), existing = registry.accessForProjection('compatibility-owner')!
+    let observed: MaestroSessionAccess | null = null
+    const host = { sessionProjections: { register(value: unknown) {
+      observed = (value as Definition).wire.view({ sessionId: 'compatibility-owner' })
+      throw new Error('rejected after observing an unscoped owner')
+    } } }
+    expect(installSessionAccessProjection(host, registry)).toBeUndefined()
+    expect(observed).toEqual(existing)
+    expect(registry.authorize(existing.token)).toEqual({ sessionId: 'compatibility-owner' })
+    const healthy = authorizedProjection(registry)
+    expect(healthy.forHeader('compatibility-owner')).toEqual(existing)
+    healthy.unregister?.()
+    expect(registry.authorize(existing.token)).toEqual({ sessionId: 'compatibility-owner' })
+  })
+  it('preserves an unscoped caller that adopts a capability before registration fails', () => {
+    const registry = new SessionAccessRegistry()
+    let delivered: MaestroSessionAccess | null = null, adopted: MaestroSessionAccess | null = null
+    const host = { sessionProjections: { register(value: unknown) {
+      delivered = (value as Definition).wire.view({ sessionId: 'adopted-compatibility-owner' })
+      adopted = registry.accessForProjection('adopted-compatibility-owner')
+      throw new Error('rejected after unscoped capability adoption')
+    } } }
+    expect(installSessionAccessProjection(host, registry)).toBeUndefined()
+    expect(adopted).toEqual(delivered)
+    expect(registry.authorize(adopted!.token)).toEqual({ sessionId: 'adopted-compatibility-owner' })
+  })
+  it('preserves a reentrant successful installation that adopts a token before the first register throws', () => {
+    const registry = new SessionAccessRegistry()
+    let healthy: ReturnType<typeof authorizedProjection> | undefined, shared: MaestroSessionAccess | null = null
+    const host = { sessionProjections: { register(value: unknown) {
+      shared = (value as Definition).wire.view({ sessionId: 'adopted-owner' })
+      healthy = authorizedProjection(registry)
+      expect(healthy.forHeader('adopted-owner')).toEqual(shared)
+      throw new Error('outer registration rejected')
+    } } }
+    expect(installSessionAccessProjection(host, registry)).toBeUndefined()
+    expect(registry.authorize(shared!.token)).toEqual({ sessionId: 'adopted-owner' })
+    expect(healthy!.forHeader('adopted-owner')).toEqual(shared)
+    healthy!.unregister?.()
+    expect(registry.authorize(shared!.token)).toBeUndefined()
+  })
+  it('releases only its own leases on a normal idempotent disposer', () => {
+    const registry = new SessionAccessRegistry(), first = authorizedProjection(registry), second = authorizedProjection(registry)
+    const firstOnly = first.forHeader('first-only'), shared = first.forHeader('shared-owner')
+    expect(second.forHeader('shared-owner')).toEqual(shared)
+    first.unregister?.()
+    first.unregister?.()
+    expect(first.dispose).toHaveBeenCalledOnce()
+    expect(registry.authorize(firstOnly.token)).toBeUndefined()
+    expect(first.definition.wire.view({ sessionId: 'first-only' })).toBeNull()
+    expect(first.definition.wire.view({ sessionId: 'shared-owner' })).toBeNull()
+    expect(second.forHeader('shared-owner')).toEqual(shared)
+    expect(registry.authorize(shared.token)).toEqual({ sessionId: 'shared-owner' })
+    second.unregister?.()
+    expect(registry.authorize(shared.token)).toBeUndefined()
+    expect(second.dispose).toHaveBeenCalledOnce()
+  })
+  it('revokes its latest replacement without another view from that installation', () => {
+    const registry = new SessionAccessRegistry(), projection = authorizedProjection(registry)
+    const cold = projection.forHeader('rotating-owner'), first = trustedSession('rotating-owner')
+    registry.publish(first.id, first)
+    registry.publish(first.id, trustedSession(first.id))
+    // Acquire through another installation, not the unscoped compatibility API.
+    const observer = authorizedProjection(registry), rotated = observer.forHeader(first.id)
+    observer.unregister?.()
+    projection.unregister?.()
+    expect(registry.authorize(cold.token)).toBeUndefined()
+    expect(registry.authorize(rotated.token)).toBeUndefined()
+    expect(projection.definition.wire.view({ sessionId: first.id })).toBeNull()
+  })
+  it('finishes local cleanup before a throwing host disposer and remains reentrant/idempotent', () => {
+    const registry = new SessionAccessRegistry(), healthy = authorizedProjection(registry)
+    const shared = healthy.forHeader('shared-owner')
+    let retained: Definition | undefined, unregister: (() => void) | undefined, own: MaestroSessionAccess | null = null
+    const duringDispose = vi.fn(), hostDispose = vi.fn(() => {
+      duringDispose(registry.authorize(own!.token), retained!.wire.view({ sessionId: 'own-owner' }))
+      unregister?.()
+      throw new Error('host unregister rejected')
+    })
+    unregister = installSessionAccessProjection({ sessionProjections: { register(value: unknown) {
+      retained = value as Definition
+      own = retained.wire.view({ sessionId: 'own-owner' })
+      expect(retained.wire.view({ sessionId: 'shared-owner' })).toEqual(shared)
+      return hostDispose
+    } } }, registry)
+    expect(unregister).toBeTypeOf('function')
+    expect(() => unregister!()).not.toThrow()
+    expect(() => unregister!()).not.toThrow()
+    expect(hostDispose).toHaveBeenCalledOnce()
+    expect(duringDispose).toHaveBeenCalledOnce()
+    expect(duringDispose).toHaveBeenCalledWith(undefined, null)
+    expect(registry.authorize(own!.token)).toBeUndefined()
+    expect(registry.authorize(shared.token)).toEqual({ sessionId: 'shared-owner' })
+    expect(retained!.wire.view({ sessionId: 'new-owner' })).toBeNull()
+    expect(healthy.forHeader('shared-owner')).toEqual(shared)
+  })
+  it('does not revoke fresh owners after a clear when an old installation disposes', () => {
+    const registry = new SessionAccessRegistry(), old = authorizedProjection(registry), stale = old.forHeader('same-id')
+    registry.clear()
+    const healthy = authorizedProjection(registry), fresh = healthy.forHeader('same-id')
+    old.unregister?.()
+    expect(registry.authorize(stale.token)).toBeUndefined()
+    expect(registry.authorize(fresh.token)).toEqual({ sessionId: 'same-id' })
+    expect(healthy.forHeader('same-id')).toEqual(fresh)
+    healthy.unregister?.()
+    expect(registry.authorize(fresh.token)).toBeUndefined()
+  })
+  it('captures a register getter once and preserves its service receiver', () => {
+    const dispose = vi.fn(), register = vi.fn(function (this: unknown, value: unknown) {
+      expect(this).toBe(service)
+      expect((value as Definition).key).toBe(CLI_ACCESS_PROJECTION_KEY)
+      return dispose
+    })
+    const getter = vi.fn(() => register), service = Object.defineProperty({}, 'register', { get: getter })
+    const unregister = installSessionAccessProjection({ sessionProjections: service })
+    expect(unregister).toBeTypeOf('function')
+    unregister?.()
+    expect(getter).toHaveBeenCalledOnce()
+    expect(register).toHaveBeenCalledOnce()
+    expect(dispose).toHaveBeenCalledOnce()
+  })
+  it('still revokes local access when an accepted host registration returns no disposer', () => {
+    const registry = new SessionAccessRegistry()
+    let retained: Definition | undefined
+    const unregister = installSessionAccessProjection({ sessionProjections: { register(value: unknown) { retained = value as Definition } } }, registry)
+    const token = retained!.wire.view({ sessionId: 'no-host-disposer' })!.token
+    expect(unregister).toBeTypeOf('function')
+    unregister?.()
+    unregister?.()
+    expect(registry.authorize(token)).toBeUndefined()
+    expect(retained!.wire.view({ sessionId: 'no-host-disposer' })).toBeNull()
+  })
+})
+
 describe('wire-only authorization never changes the real Session log or model surface', () => {
   it.each([false, true])('does not add ANY event to a real Session (existing conversation: %s)', withConversation => {
     const real = Session.create('real-cap-owner')

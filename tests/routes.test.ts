@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest'
+import { describe, expect, it, vi } from 'vitest'
 import { effectiveOf, type EffectiveConfig } from '../src/config.js'
 import { CliPathCache } from '../src/dispatch.js'
 import { Limiter, TaskRegistry } from '../src/task-registry.js'
@@ -232,8 +232,7 @@ describe('handleCliNpmJob', () => {
     const outcome = handleCliNpmJob(deps, 'install', { cli: 'codex', version: '0.152.1' })
     expect(outcome.status).toBe(200)
     const ref = outcome.body as { id: string }
-    await new Promise(resolvePromise => setTimeout(resolvePromise, 50))
-    expect(registry.get(ref.id)?.phase).toBe('done')
+    await vi.waitFor(() => expect(registry.get(ref.id)?.phase).toBe('done'))
     const install = launches.find(child => npmOperationOf(child.spawnArgs) === 'install')
     expect(install?.spawnArgs.join(' ')).toContain('@openai/codex@0.152.1')
   })
@@ -247,7 +246,7 @@ describe('handleCliNpmJob', () => {
   it('uninstall ignores a version and spells the bare package', async () => {
     const { deps, launches } = makeDeps()
     expect(handleCliNpmJob(deps, 'uninstall', { cli: 'claude', version: '0.3.312' }).status).toBe(200)
-    await new Promise(resolvePromise => setTimeout(resolvePromise, 50))
+    await vi.waitFor(() => expect(launches.some(child => npmOperationOf(child.spawnArgs) === 'uninstall')).toBe(true))
     const uninstall = launches.find(child => npmOperationOf(child.spawnArgs) === 'uninstall')
     expect(uninstall?.spawnArgs.join(' ')).toContain('@anthropic-ai/claude-code')
     expect(uninstall?.spawnArgs.join(' ')).not.toContain('@anthropic-ai/claude-code@0.3.312')

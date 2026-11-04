@@ -42,6 +42,7 @@ export interface PersistedTask {
   readonly model: string
   readonly sessionId?: string | undefined
   readonly replyTo?: string | undefined
+  readonly replySessionIds?: readonly string[] | undefined
   readonly phase: MaestroPhase
   readonly startedAt: number
   readonly endedAt?: number | undefined
@@ -67,6 +68,7 @@ export interface PersistInput {
   readonly model: string
   readonly sessionId?: string | undefined
   readonly replyTo?: string | undefined
+  readonly replySessionIds?: readonly string[] | undefined
   readonly phase: MaestroPhase
   readonly startedAt: number
   readonly endedAt?: number | undefined
@@ -92,6 +94,7 @@ export function persistedOf(task: PersistInput, savedAt: number, eventTail: numb
     model: task.model,
     ...(task.sessionId === undefined ? {} : { sessionId: task.sessionId }),
     ...(task.replyTo === undefined || task.replyTo === '' ? {} : { replyTo: task.replyTo }),
+    ...(task.replySessionIds === undefined || task.replySessionIds.length === 0 ? {} : { replySessionIds: [...task.replySessionIds] }),
     phase: task.phase,
     startedAt: task.startedAt,
     ...(task.endedAt === undefined ? {} : { endedAt: task.endedAt }),

@@ -26,7 +26,7 @@ import { EXECUTOR_BRANDS } from './board/accent.js'
 import { needsPerson } from '../stage.js'
 import { useUsageSummary } from './usage-panel.js'
 import {
-  cleanLogText, CLI_LABELS, CLI_PACKAGES, MAESTRO_CLI_IDS, MAESTRO_STAGE_LABELS, TASK_TYPE_CATALOG, TASK_TYPE_DESCRIPTIONS, TERMINAL_PHASES,
+  cleanLogText, CLI_LABELS, CLI_PACKAGES, MAESTRO_CLI_IDS, MAESTRO_STAGE_LABELS, summarizeError, TASK_TYPE_CATALOG, TASK_TYPE_DESCRIPTIONS, TERMINAL_PHASES,
   type DshProviderModels, type MaestroCliId, type MaestroCliStatus, type MaestroCliVersions, type MaestroOverview, type MaestroPhase,
   type MaestroStage, type MaestroTaskDetail, type MaestroTaskSummary,
 } from '../wire.js'
@@ -212,14 +212,6 @@ const CARD_CSS = `
 .dmc-dirty { width: 6px; height: 6px; border-radius: 999px; background: var(--dmc-warn); flex: none; }
 .dmc-hint { font-size: 11.5px; color: var(--dmc-fg3); line-height: 1.5; }
 
-/* --- advanced (collapsed connection settings) --- */
-.dmc-advanced { border-top: 1px dashed var(--dmc-border); padding-top: 12px; display: flex; flex-direction: column; gap: 10px; }
-.dmc-advanced > summary { font-size: 12.5px; font-weight: 550; color: var(--dmc-fg2); cursor: pointer; list-style: none; display: flex; align-items: center; gap: 6px; user-select: none; }
-.dmc-advanced > summary::-webkit-details-marker { display: none; }
-.dmc-advanced > summary::before { content: '▸'; font-size: 10px; color: var(--dmc-fg3); transition: transform .15s; }
-.dmc-advanced[open] > summary::before { transform: rotate(90deg); }
-.dmc-advanced[open] > summary { margin-bottom: 2px; }
-
 /* --- inputs --- */
 .dmc-input, .dmc-select, .dmc-textarea {
   font: inherit; font-size: 13px; color: var(--dmc-fg);
@@ -293,11 +285,20 @@ const CARD_CSS = `
 
 /* --- log, code, banners --- */
 .dmc-code { font-family: ui-monospace, SFMono-Regular, Consolas, 'Courier New', monospace; font-size: 11.5px; }
+.dmc-chart { display: flex; align-items: flex-end; gap: 8px; height: 120px; padding: 8px 4px 0; border-bottom: 1px solid var(--dmc-border); }
+.dmc-chart-col { flex: 1; display: flex; flex-direction: column; align-items: center; justify-content: flex-end; gap: 4px; height: 100%; min-width: 0; }
+.dmc-chart-stack { width: 70%; max-width: 32px; display: flex; flex-direction: column-reverse; border-radius: 3px 3px 0 0; overflow: hidden; background: var(--dmc-track, rgba(127,127,127,.12)); }
+.dmc-chart-ok { background: var(--dmc-ok); min-height: 2px; }
+.dmc-chart-fail { background: var(--dmc-danger); min-height: 2px; }
+.dmc-chart-day { font-size: 10px; color: var(--dmc-fg3); white-space: nowrap; }
 .dmc-log { max-height: 240px; overflow: auto; background: var(--dmc-input); border: 1px solid var(--dmc-border); border-radius: 8px; padding: 8px 10px; font-family: ui-monospace, SFMono-Regular, Consolas, 'Courier New', monospace; font-size: 11.5px; line-height: 1.65; white-space: pre-wrap; word-break: break-word; color: var(--dmc-fg2); }
 .dmc-log-final { margin-top: 8px; padding-top: 8px; border-top: 1px dashed var(--dmc-border); color: var(--dmc-fg); }
 .dmc-banner { padding: 8px 12px; border-radius: 8px; font-size: 12px; line-height: 1.5; }
 .dmc-banner-err { color: var(--dmc-danger); background: color-mix(in srgb, var(--dmc-danger) 8%, transparent); border: 1px solid color-mix(in srgb, var(--dmc-danger) 28%, transparent); }
 .dmc-banner-info { color: var(--dmc-fg2); background: color-mix(in srgb, var(--dmc-accent) 8%, transparent); border: 1px solid color-mix(in srgb, var(--dmc-accent) 26%, transparent); }
+.dmc-errdetail { margin-top: 6px; }
+.dmc-errdetail > summary { font-size: 11.5px; cursor: pointer; opacity: .85; user-select: none; }
+.dmc-errdetail > pre { margin: 6px 0 0; max-height: 200px; }
 .dmc-notice { position: fixed; right: 24px; bottom: 80px; z-index: 90; max-width: min(420px, calc(100vw - 48px)); display: flex; align-items: flex-start; gap: 8px; box-shadow: 0 8px 24px rgba(0, 0, 0, .18); }
 .dmc-notice-text { flex: 1; min-width: 0; }
 
@@ -563,11 +564,29 @@ export function UsageGroup(props: { ctx: BoardHost | undefined }): ReactNode {
               </div>
             )
           })}
-          {usage.recent.map(record => (
-            <div key={record.taskId} className="dmc-code">
-              {`${new Date(record.startedAt).toLocaleTimeString()}  ${CLI_LABELS[record.cli]}${record.model === '' ? '' : ` · ${record.model}`} · ${record.phase === 'done' ? '成功' : record.phase === 'cancelled' ? '已取消' : '失败'} · ${formatDuration(record.durationMs)}`}
-            </div>
-          ))}
+          {(() => {
+            const max = Math.max(1, ...usage.daily.map(entry => entry.requests))
+            return (
+              <div className="dmc-chart">
+                {usage.daily.map(entry => {
+                  const label = new Date(entry.day).toLocaleDateString(undefined, { month: 'numeric', day: 'numeric' })
+                  return (
+                    <div
+                      key={entry.day}
+                      className="dmc-chart-col"
+                      title={`${label}：调用 ${String(entry.requests)}（成功 ${String(entry.ok)} / 失败 ${String(entry.failed)}）`}
+                    >
+                      <div className="dmc-chart-stack" style={{ height: `${String(Math.max(4, (entry.requests / max) * 100))}%` }}>
+                        {entry.ok > 0 && <div className="dmc-chart-ok" style={{ flexGrow: entry.ok }} />}
+                        {entry.failed > 0 && <div className="dmc-chart-fail" style={{ flexGrow: entry.failed }} />}
+                      </div>
+                      <span className="dmc-chart-day">{label}</span>
+                    </div>
+                  )
+                })}
+              </div>
+            )
+          })()}
         </>
       )}
       <span className="dmc-hint">重启后仍可翻看的结果保存在 $DSH_HOME/maestro/tasks（可在「调度设置」关闭）。</span>
@@ -711,6 +730,7 @@ export function MaestroCard(props: MaestroCardProps): ReactNode {
   const [versionDraft, setVersionDraft] = useState<Partial<Record<MaestroCliId, string>>>({})
 
   const [selectedId, setSelectedId] = useState('')
+  const [showAllTasks, setShowAllTasks] = useState(false)
   const [detail, setDetail] = useState<MaestroTaskDetail | undefined>(undefined)
   const [hint, setHint] = useState<{ text: string; error: string }>({ text: '', error: '' })
 
@@ -843,6 +863,9 @@ export function MaestroCard(props: MaestroCardProps): ReactNode {
 
   const tasks = overview?.tasks ?? []
   const activeCount = tasks.filter(task => task.phase === 'running' || task.phase === 'queued').length
+  const recentTasks = tasks.filter(task => task.phase !== 'running' && task.phase !== 'queued').slice(0, 8)
+  const visibleTasks = showAllTasks ? tasks : [...tasks.filter(task => task.phase === 'running' || task.phase === 'queued'), ...recentTasks]
+  const hiddenTaskCount = tasks.length - visibleTasks.length
 
   // Retire an optimistic npm click once the overview reports its task settled,
   // then share the host's post-install refresh. Never probe while npm is writing.
@@ -1068,52 +1091,6 @@ export function MaestroCard(props: MaestroCardProps): ReactNode {
                 )}
               </div>
             </div>
-
-            <details className="dmc-advanced">
-              <summary>高级连接设置（一般不需要改）</summary>
-              <div className="dmc-grid">
-                <StagedInput
-                  label="API 地址"
-                  field={cli === 'claude' ? 'claudeBaseUrl' : 'codexBaseUrl'}
-                  state={form}
-                  actions={actions}
-                  placeholder={cli === 'claude' ? '可选，ANTHROPIC_BASE_URL（复用 dsh 兼容端点）' : '可选，OPENAI_BASE_URL（OpenAI 兼容端点）'}
-                />
-                <StagedInput
-                  label={cli === 'claude' ? 'Auth Token' : 'API Key'}
-                  field={cli === 'claude' ? 'claudeAuthToken' : 'codexApiKey'}
-                  state={form}
-                  actions={actions}
-                  placeholder={cli === 'claude' ? '可选，ANTHROPIC_AUTH_TOKEN' : '可选，OPENAI_API_KEY'}
-                  password
-                />
-                <StagedInput
-                  label="CLI 路径"
-                  field={cli === 'claude' ? 'claudeCliPath' : 'codexCliPath'}
-                  state={form}
-                  actions={actions}
-                  placeholder={`可选，${cli} 可执行文件完整路径`}
-                />
-                <StagedInput
-                  label="连续无输出超时（分钟）"
-                  field={cli === 'claude' ? 'claudeTimeoutMinutes' : 'codexTimeoutMinutes'}
-                  state={form}
-                  actions={actions}
-                  placeholder="20"
-                  hint="1–240，连续无 stdout/stderr 输出达到该时长才终止；不是总运行时限"
-                />
-                {cli === 'codex' && (
-                  <StagedArea
-                    label="-c 覆盖项"
-                    field="codexConfigOverrides"
-                    state={form}
-                    actions={actions}
-                    placeholder={'每行一个 codex -c 覆盖，如：\nmodel_instructions_file="C:\\path\\AGENTS.md"'}
-                  />
-                )}
-              </div>
-              <span className="dmc-hint">API 地址 / Token 让 CLI 走自定义兼容端点；CLI 路径留空自动从 PATH 检测；CLI 非空输出会重置无输出超时计时，不因总运行时长到点强制终止。</span>
-            </details>
           </div>
         )}
       </div>
@@ -1430,11 +1407,27 @@ export function MaestroCard(props: MaestroCardProps): ReactNode {
                     state={form}
                     actions={actions}
                     placeholder="0"
-                    hint="普通失败后自动重跑的次数（0–2，默认 0）。会改文件的任务保持 0：重试可能叠加改动；超时与手动取消不重试。"
+                    hint="失败后自动重跑次数（0–2）。会改文件的任务不重试；超时与取消不重试。"
+                  />
+                  <StagedInput
+                    label="Claude 连续无输出超时（分钟）"
+                    field="claudeTimeoutMinutes"
+                    state={form}
+                    actions={actions}
+                    placeholder="20"
+                    hint="1–240，连续无输出达到该时长才终止；不是总运行时限"
+                  />
+                  <StagedInput
+                    label="Codex 连续无输出超时（分钟）"
+                    field="codexTimeoutMinutes"
+                    state={form}
+                    actions={actions}
+                    placeholder="20"
+                    hint="1–240，连续无输出达到该时长才终止；不是总运行时限"
                   />
                 </div>
                 <span className="dmc-hint">
-                  最低任务难度在「CLI 管理」的 Claude / Codex 中分别设置。主代理先判断任务是否需要开子代理，不需要就自己完成；需要时再评估难度并给出理由，按任务类型选择 CLI，达到该 CLI 的门槛才启动；未达门槛改用 dsh 子代理，不改选门槛更低的 CLI 绕过限制。仅指定 CLI 名称也不能绕过门槛。低：问答、查询、小范围编辑；中：常规多步骤任务；高：跨模块重构、复杂调试；极高：系统级设计或迁移。关键词只用于选 CLI，不用于抬高难度。
+                  最低任务难度在「CLI 管理」按 CLI 设置；未达门槛自动改用 dsh 子代理，不换门槛更低的 CLI 绕过。低=问答/小改，中=多步任务，高=跨模块重构，极高=系统级设计。
                 </span>
               </div>
               <div className="dmc-group">
@@ -1445,7 +1438,7 @@ export function MaestroCard(props: MaestroCardProps): ReactNode {
                     label="桥接 dsh 的 MCP 服务器到子代理"
                     onChange={value => { actions.setImmediate('bridgeMcp', value) }}
                   />
-                  <span className="dmc-hint">开启后，派发的子代理能看到 dsh 自身配置的 MCP 服务器（stdio）。</span>
+                  <span className="dmc-hint">子代理可访问 dsh 配置的 MCP 服务器（stdio）。</span>
                 </div>
                 <div className="dmc-field">
                   <Toggle
@@ -1453,7 +1446,7 @@ export function MaestroCard(props: MaestroCardProps): ReactNode {
                     label="桥接 dsh 技能到子代理"
                     onChange={value => { actions.setImmediate('bridgeSkills', value) }}
                   />
-                  <span className="dmc-hint">派发时把 dsh 技能目录（名称 + 摘要）注入任务开头，子代理经 dsh_bridge 工具按需加载全文；只暴露「模型可调用」的技能。</span>
+                  <span className="dmc-hint">把技能目录（名称+摘要）注入任务，子代理经 dsh_bridge 按需加载全文。</span>
                 </div>
                 <div className="dmc-grid">
                   <SelectField
@@ -1465,7 +1458,7 @@ export function MaestroCard(props: MaestroCardProps): ReactNode {
                       { value: 'off', label: '关闭' },
                     ]}
                     onChange={value => { actions.setImmediate('bridgeTools', value) }}
-                    hint="子代理经 dsh_bridge 调用 dsh 宿主工具（走完整审批流水线）；MCP 工具不重复桥接（stdio 已原生桥接）。"
+                    hint="子代理经 dsh_bridge 调用宿主工具（走审批）；MCP 工具不重复桥接。"
                   />
                   <SelectField
                     label="claude 技能加载方式"
@@ -1475,7 +1468,7 @@ export function MaestroCard(props: MaestroCardProps): ReactNode {
                       { value: 'native', label: '原生技能目录（--add-dir）' },
                     ]}
                     onChange={value => { actions.setImmediate('claudeSkillsMode', value) }}
-                    hint="原生模式把技能暂存成临时 .claude/skills 树挂给 claude，用 claude 自带的 Skill 工具与 /技能名 加载；暂存失败自动回退 dsh_bridge。"
+                    hint="原生模式挂临时 .claude/skills 树给 claude；失败自动回退 dsh_bridge。"
                   />
                 </div>
                 {values.bridgeTools === 'custom' && (
@@ -1485,7 +1478,7 @@ export function MaestroCard(props: MaestroCardProps): ReactNode {
                     state={form}
                     actions={actions}
                     placeholder={'web_search\nmcp__http_server__tool'}
-                    hint="自定义模式按名单精确匹配；http 传输的 MCP 工具（mcp__服务器__工具）只能从这里桥接给子代理。"
+                    hint="按名单精确匹配；http MCP 工具只能从这里桥接。"
                   />
                 )}
                 <div className="dmc-field">
@@ -1494,7 +1487,7 @@ export function MaestroCard(props: MaestroCardProps): ReactNode {
                     label="保存任务结果到本地"
                     onChange={value => { actions.setImmediate('persistTasks', value) }}
                   />
-                  <span className="dmc-hint">每次派发结算后把摘要与最终文本写入 $DSH_HOME/maestro/tasks（最多 200 条）；重启后「任务监视」仍能翻看历史。</span>
+                  <span className="dmc-hint">结算后写入 $DSH_HOME/maestro/tasks（最多 200 条），重启后可翻看。</span>
                 </div>
                 <div className="dmc-field">
                   <Toggle
@@ -1502,7 +1495,7 @@ export function MaestroCard(props: MaestroCardProps): ReactNode {
                     label="自动注入 git 工作区快照"
                     onChange={value => { actions.setImmediate('injectGitContext', value) }}
                   />
-                  <span className="dmc-hint">派发前把 cwd 的分支与未提交改动（git status 只读快照）拼在任务开头，CLI 子代理少猜一轮工作区状态。</span>
+                  <span className="dmc-hint">派发前附上分支与未提交改动快照，减少子代理猜测。</span>
                 </div>
                 <div className="dmc-field">
                   <Toggle
@@ -1510,7 +1503,7 @@ export function MaestroCard(props: MaestroCardProps): ReactNode {
                     label="记录为原生子会话"
                     onChange={value => { actions.setImmediate('recordChildSessions', value) }}
                   />
-                  <span className="dmc-hint">每次派发在 dsh 里建一条真实子会话：用量进 tokenUsage 等标准投影（统计类插件可直接读取），顶部子智能体下拉与看板按同一目录行去重。关闭后仅任务看板可见。</span>
+                  <span className="dmc-hint">派发时建真实子会话，用量进 tokenUsage 投影；关闭后仅任务看板可见。</span>
                 </div>
               </div>
             </div>
@@ -1547,7 +1540,7 @@ export function MaestroCard(props: MaestroCardProps): ReactNode {
                 </div>
                 {overviewError !== '' && <div className="dmc-banner dmc-banner-err">无法连接宿主路由：{overviewError}</div>}
                 <div className="dmc-stack" style={{ gap: 6 }}>
-                  {tasks.map(task => (
+                  {visibleTasks.map(task => (
                     <div
                       key={task.id}
                       className={task.id === selectedId ? 'dmc-taskrow dmc-taskrow-active' : 'dmc-taskrow'}
@@ -1573,6 +1566,14 @@ export function MaestroCard(props: MaestroCardProps): ReactNode {
                     </div>
                   ))}
                   {tasks.length === 0 && <div className="dmc-hint">暂无任务记录</div>}
+                  {hiddenTaskCount > 0 && (
+                    <button type="button" className="dmc-btn dmc-btn-sm" onClick={() => { setShowAllTasks(true) }}>
+                      {`展开其余 ${String(hiddenTaskCount)} 条`}
+                    </button>
+                  )}
+                  {showAllTasks && tasks.length > 8 && (
+                    <button type="button" className="dmc-btn dmc-btn-sm" onClick={() => { setShowAllTasks(false) }}>收起</button>
+                  )}
                 </div>
                 {detail !== undefined && (
                   <div>
@@ -1590,7 +1591,15 @@ export function MaestroCard(props: MaestroCardProps): ReactNode {
                         {`收尾：${detail.summary.result.state}${detail.summary.result.humanAction === undefined ? '' : `；需要你：${detail.summary.result.humanAction}`}`}
                       </div>
                     )}
-                    {detail.error !== undefined && <div className="dmc-banner dmc-banner-err" style={{ marginTop: 8 }}>{detail.error}</div>}
+                    {detail.error !== undefined && (
+                      <div className="dmc-banner dmc-banner-err" style={{ marginTop: 8 }}>
+                        <div>{summarizeError(detail.error)}</div>
+                        <details className="dmc-errdetail">
+                          <summary>查看完整错误</summary>
+                          <pre className="dmc-log">{cleanLogText(detail.error)}</pre>
+                        </details>
+                      </div>
+                    )}
                     {detail.stats !== undefined && Object.keys(detail.stats).length > 0 && (
                       <div className="dmc-chips" style={{ marginTop: 8 }}>
                         {Object.entries(detail.stats).map(([key, stat]) => (
@@ -1618,7 +1627,7 @@ export function MaestroCard(props: MaestroCardProps): ReactNode {
       {form.dirty.length > 0 && (
         <div className="dmc-savebar">
           <span className="dmc-savebar-text">
-            {`有 ${String(form.dirty.length)} 处文本改动待保存 — 模型 / 路径 / 超时等保存后生效；开关、下拉与任务类型即时生效。`}
+            {`有 ${String(form.dirty.length)} 处文本改动待保存 — 保存后生效；开关、下拉与任务类型即时生效。`}
             {form.invalid !== undefined && <span style={{ color: 'var(--dmc-danger)' }}>{`（${form.invalid.message}）`}</span>}
             {form.failed && <span style={{ color: 'var(--dmc-danger)' }}>上次保存未生效，请重试。</span>}
           </span>

@@ -472,6 +472,7 @@ export async function runDispatch(deps: DispatchDeps, params: DispatchParams, si
       model,
       ...(params.sessionId === undefined ? {} : { sessionId: params.sessionId }),
       ...(params.replyTo === undefined ? {} : { replyTo: params.replyTo }),
+      ...(task.replySessionIds === undefined ? {} : { replySessionIds: [...task.replySessionIds] }),
       startedAt: task.startedAt,
     })
   } catch { deps.registry.push(task, 'note', '副作用队列不可用，本次派发无法在重启后恢复') }

@@ -31,6 +31,15 @@ export interface UsageCliBucket {
   readonly durationMs: number
 }
 
+/** 一天的调用分布（看板柱状图用，本地时区 0 点对齐）。 */
+export interface UsageDayBucket {
+  /** 当天 0 点时间戳。 */
+  readonly day: number
+  readonly requests: number
+  readonly ok: number
+  readonly failed: number
+}
+
 /** 近 7 天汇总。 */
 export interface UsageSummary {
   readonly requests: number
@@ -47,6 +56,8 @@ export interface UsageSummary {
   readonly recent: readonly CliUsageRecord[]
   /** 有调用记录的会话数。 */
   readonly sessions: number
+  /** 近 7 个自然日（本地 0 点对齐）的每日分布，旧→新。 */
+  readonly daily: readonly UsageDayBucket[]
 }
 
 const EMPTY_BUCKET: UsageCliBucket = { requests: 0, ok: 0, failed: 0, inputTokens: 0, outputTokens: 0, durationMs: 0 }
@@ -58,10 +69,18 @@ const ZERO_SUMMARY: UsageSummary = {
   perCli: { claude: EMPTY_BUCKET, codex: EMPTY_BUCKET },
   recent: [],
   sessions: 0,
+  daily: [],
 }
 
 function finitePositive(value: unknown): number {
   return typeof value === 'number' && Number.isFinite(value) && value > 0 ? value : 0
+}
+
+/** 本地 0 点时间戳。 */
+function dayStart(timestamp: number): number {
+  const date = new Date(timestamp)
+  date.setHours(0, 0, 0, 0)
+  return date.getTime()
 }
 
 /** 折叠各会话的 CLI 用量投影（窗口 = [now - windowMs, now] 内的记录）。 */
@@ -83,6 +102,7 @@ export function summarizeUsage(
   let cacheWriteTokens = 0
   let sessions = 0
   const recent: CliUsageRecord[] = []
+  const dailyMap = new Map<number, { requests: number; ok: number; failed: number }>()
   for (const state of states) {
     if (state === undefined) continue
     const records = state.recent ?? []
@@ -113,15 +133,29 @@ export function summarizeUsage(
         durationMs: bucket.durationMs + duration,
       }
       recent.push(record)
+      const day = dayStart(record.startedAt)
+      const dayBucket = dailyMap.get(day) ?? { requests: 0, ok: 0, failed: 0 }
+      dayBucket.requests += 1
+      if (isOk) dayBucket.ok += 1
+      else if (isFailed) dayBucket.failed += 1
+      dailyMap.set(day, dayBucket)
     }
   }
   recent.sort((left, right) => right.startedAt - left.startedAt)
+  const today = dayStart(now)
+  const daily: UsageDayBucket[] = []
+  for (let index = 6; index >= 0; index -= 1) {
+    const day = today - index * 24 * 60 * 60 * 1000
+    const bucket = dailyMap.get(day) ?? { requests: 0, ok: 0, failed: 0 }
+    daily.push({ day, ...bucket })
+  }
   return {
     requests, ok, failed, cancelled, durationMs,
     inputTokens, outputTokens, cachedInputTokens, cacheWriteTokens,
     perCli,
     recent: recent.slice(0, USAGE_RECENT_SHOWN),
     sessions,
+    daily,
   }
 }
 

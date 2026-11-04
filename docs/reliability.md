@@ -94,6 +94,33 @@ node scripts/maestro-status.mjs --url http://127.0.0.1:11061
 - `interrupted` 是新阶段：新客户端显示「已中断」，老客户端会落到未知分支，但不会崩。
 - 落盘文件都带 `version` 字段，读到未来版本时按"不认识的当空"处理并 `warn`，不抛。
 
+## 发布资产的失败恢复
+
+当前发版先发布 npm，再创建 GitHub Release / 上传资产。如果 npm 已成功而 GitHub 步骤失败，**不要盲目重跑整条发布任务**：同版本再次发布会被 npm 拒绝，无法推进到上传阶段。
+
+1. 保留失败运行生成的原始 tarball；不要另行重建替代它。
+2. 核对 tag 对应的提交、包名和版本；用官方 registry 查询已发布版本的 `dist.integrity`，与原始 tarball 的 SHA-512 完全一致才继续。
+3. 确认 GitHub Release 是不存在，还是已存在但缺少资产。权限、认证或网络错误不能当成“不存在”。仅恢复创建/上传步骤，不重新执行 npm publish。
+
+```bash
+# 在失败运行的精确 tag checkout 中执行；artifact 指向那次运行保留的 tarball。
+set -euo pipefail
+artifact=./dist/dsh-maestro-codex-0.1.8.tgz
+name=$(node -p 'require("./package.json").name')
+version=$(node -p 'require("./package.json").version')
+tag="v$version"
+git rev-parse --verify "$tag"
+actual=$(node -e 'const fs=require("node:fs"),crypto=require("node:crypto");process.stdout.write("sha512-"+crypto.createHash("sha512").update(fs.readFileSync(process.argv[1])).digest("base64"))' "$artifact")
+published=$(npm view "$name@$version" dist.integrity --registry=https://registry.npmjs.org/)
+test "$actual" = "$published"
+# 确认 Release 不存在时执行：
+# gh release create "$tag" "$artifact" --verify-tag --title "$tag" --generate-notes
+# 确认 Release 已存在时执行：
+# gh release upload "$tag" "$artifact" --clobber
+```
+
+这是显式资产恢复路径，不意味着发布工作流自动具备跨 npm / GitHub 的事务回滚或重跑幂等性。恢复命令需要操作者已有的正式权限；验收测试不执行这些发布操作。
+
 ## 测试
 
 都是常规 vitest，跟源码同层：

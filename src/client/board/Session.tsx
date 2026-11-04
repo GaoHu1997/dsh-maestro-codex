@@ -34,7 +34,7 @@ import {
 
 import { cancelTask, fetchTaskDetail, fetchTasks, replyTask } from '../api.js'
 import {
-  CLI_LABELS, TERMINAL_PHASES, type MaestroCliId,
+  CLI_LABELS, cleanLogText, summarizeError, TERMINAL_PHASES, type MaestroCliId,
   type MaestroTaskEvent, type MaestroTaskSummary, type MaestroSessionAccess,
 } from '../../wire.js'
 import { EXECUTOR_BRANDS } from './accent.js'
@@ -158,6 +158,9 @@ const SESSION_CSS = `
   color: var(--dsw-alias-state-error-primary, #d92d20); padding: 0 2px;
   white-space: pre-wrap; word-break: break-word;
 }
+.dms-errdetail { display: inline; }
+.dms-errdetail > summary { display: inline; margin-left: 6px; font-size: 12px; cursor: pointer; opacity: .75; user-select: none; }
+.dms-errdetail > pre { margin: 6px 0 0; max-height: 220px; overflow: auto; white-space: pre-wrap; word-break: break-word; font-size: 12px; opacity: .9; }
 .dms-stage { align-items: center; gap: 8px; min-width: 0; }
 /* flex-basis 0：文本宽度由容器分给（内容长度不参与 sizing），长路径才会换行
  * 而不是把整行撑出面板。 */
@@ -452,6 +455,12 @@ function useTurnDetail(id: string, active: boolean, sessionIds?: readonly string
  * 它自己的轮次详情仍会去取。
  */
 export function buildChain(rootId: string, summaries: Readonly<Record<string, MaestroTaskSummary>>): string[] {
+  if (summaries[rootId] === undefined) {
+    const viewId = `cli-${rootId}`
+    const available = Object.values(summaries).filter(task => task.replySessionIds?.includes(viewId))
+    available.sort((left, right) => right.startedAt - left.startedAt)
+    rootId = available[0]?.id ?? rootId
+  }
   const byReplyTo = new Map<string, MaestroTaskSummary[]>()
   for (const task of Object.values(summaries)) {
     if (task.replyTo === undefined) continue
@@ -467,6 +476,7 @@ export function buildChain(rootId: string, summaries: Readonly<Record<string, Ma
   for (;;) {
     const parent = summaries[current]?.replyTo
     if (parent === undefined || seen.has(parent)) break
+    if (summaries[parent] === undefined && summaries[current]?.replySessionIds !== undefined) break
     ancestors.push(parent)
     seen.add(parent)
     current = parent
@@ -834,7 +844,13 @@ function TurnView(props: {
         ? (
           <div className="dms-errline">
             <span className="dms-tool-mark">✖</span>
-            <span>{turn.error}</span>
+            <span>
+              {summarizeError(turn.error)}
+              <details className="dms-errdetail">
+                <summary>完整错误</summary>
+                <pre>{cleanLogText(turn.error)}</pre>
+              </details>
+            </span>
           </div>
         )
         : undefined}

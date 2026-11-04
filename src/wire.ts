@@ -322,6 +322,29 @@ export function cleanLogText(text: string): string {
     .replace(/[\u0000-\u0008\u000B-\u001F\u007F]/g, '')
 }
 
+/**
+ * Turn a raw CLI failure blob (command dumps, stderr tails, provider errors)
+ * into one short cause line — 「限流 / 超时 / 网络错误 …」 — for the places where
+ * the user only wants to know *why* it failed. The full text stays available
+ * (task detail / collapsed原文), so nothing is lost; the cause is classified,
+ * not abbreviated. First matching cause wins: a cancellation or rate-limit
+ * sentence buried in a stderr tail is the real reason even when the blob also
+ * carries a bare exit code.
+ */
+export function summarizeError(text: string): string {
+  const first = cleanLogText(text).trim()
+  if (first === '') return '任务失败（原因未知）'
+  if (/任务已取消|已取消，进程|cancel+ed|abort/i.test(first)) return '任务已取消'
+  if (/连续无输出|超时|timed? ?out|ETIMEDOUT|TimeoutError/i.test(first)) return '任务失败：超时'
+  if (/429|rate ?limit|too many requests|RESOURCE_EXHAUSTED|quota|额度|限流/i.test(first)) return '任务失败：限流'
+  if (/ECONN|ENOTFOUND|EAI_AGAIN|EPIPE|EHOSTUNREACH|ENETUNREACH|UND_ERR|CERT_|DEPTH_ZERO|UNABLE_TO_VERIFY|socket hang up|网络或传输/i.test(first)) return '任务失败：网络错误'
+  const exit = /进程退出码\s*(\d+)/.exec(first)
+  if (exit !== null) return `任务失败：退出码 ${exit[1]}`
+  if (/未返回文本|未返回最终答复|缺少非空|result 帧缺失/i.test(first)) return '任务失败：CLI 未返回结果'
+  const head = first.split(/\r?\n/, 1)[0] ?? ''
+  return `任务失败：${head.length > 80 ? `${head.slice(0, 80)}…` : head}`
+}
+
 /** Detected install state of one CLI. */
 export interface MaestroCliStatus {
   readonly installed: boolean
@@ -403,6 +426,8 @@ export interface MaestroTaskSummary {
   readonly sessionRef?: string
   /** The task this one continues (a session-page reply); absent = a root turn. */
   readonly replyTo?: string
+  /** Server-derived CLI ancestor views; never accepted from a request's scope. */
+  readonly replySessionIds?: readonly string[]
   /** The event ring dropped older entries: a client must not trust gaps as idle time. */
   readonly truncated?: boolean
 }

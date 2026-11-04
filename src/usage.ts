@@ -296,9 +296,12 @@ export function cliUsageProjectionDefinition(readCanonical: (sessionId: string) 
 export interface ProjectionRegistryLike { register(definition: ProjectionDefinitionLike): unknown }
 export function projectionRegistryOf(host: unknown): ProjectionRegistryLike | undefined {
   let service: unknown
-  try { service = typeof host === 'object' && host !== null ? (host as { sessionProjections?: unknown }).sessionProjections : undefined } catch { return undefined }
-  if (typeof service !== 'object' || service === null) return undefined
-  const register = (service as { register?: unknown }).register
+  let register: unknown
+  try {
+    service = typeof host === 'object' && host !== null ? (host as { sessionProjections?: unknown }).sessionProjections : undefined
+    if (typeof service !== 'object' || service === null) return undefined
+    register = (service as { register?: unknown }).register
+  } catch { return undefined }
   if (typeof register !== 'function') return undefined
   return { register: definition => (register as (value: ProjectionDefinitionLike) => unknown).call(service, definition) }
 }

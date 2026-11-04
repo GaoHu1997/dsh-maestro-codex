@@ -2,13 +2,14 @@ import { afterEach, describe, expect, it } from 'vitest'
 import { execFile } from 'node:child_process'
 import { promisify } from 'node:util'
 import { constants, zstdCompressSync } from 'node:zlib'
-import { link, mkdtemp, readFile, readdir, realpath, rm, symlink, writeFile } from 'node:fs/promises'
+import { link, lstat, readFile, readdir, realpath, symlink, writeFile } from 'node:fs/promises'
 import { createServer } from 'node:net'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { decodeSessionLog, repairSessionLogBytes, scanZstdFrames, sha256 } from '../scripts/session-log-codec.mjs'
 import { parseRepairArgs, repairSessionLogFile } from '../scripts/repair-maestro-session-logs.mjs'
+import { createOwnedTestFixture, type OwnedTestFixture } from './owned-test-fixture.js'
 
 const SECRET = 'SYNTHETIC_ONLY_NEVER_PRINT_THIS_VALUE'
 const header = '{"type":"session","version":4,"id":"synthetic-session","createdAt":1,"isSeeded":false,"delegationDepth":0}\r\n'
@@ -28,10 +29,11 @@ const mark = (line: string) => {
 const expectedPlain = Buffer.from(header + rows.map((row, i) => i >= 1 && i <= 3 ? mark(row) : row).join(''))
 const compress = (bytes: Buffer) => zstdCompressSync(bytes)
 const encoded = () => Buffer.concat([compress(Buffer.from(header)), compress(Buffer.from(rows[0])), compress(Buffer.from(rows.slice(1).join('')))])
-const directories: string[] = []
+const directories: OwnedTestFixture[] = []
 async function fixture(bytes = original, filename = 'session.v4.jsonl') {
-  const directory = await mkdtemp(join(await realpath(tmpdir()), 'maestro-log-repair-test-'))
-  directories.push(directory)
+  const owned = createOwnedTestFixture(await realpath(tmpdir()), 'maestro-log-repair-test-')
+  directories.push(owned)
+  const directory = owned.path
   const path = join(directory, filename)
   await writeFile(path, bytes, { flag: 'wx', mode: 0o600 })
   return { directory, path }
@@ -45,8 +47,8 @@ async function vacantPort() {
   await new Promise<void>((resolve, reject) => server.close(error => error ? reject(error) : resolve()))
   return port
 }
-afterEach(async () => {
-  for (const directory of directories.splice(0)) await rm(directory, { recursive: true, force: true })
+afterEach(() => {
+  for (const directory of directories.splice(0)) directory.remove()
 })
 
 describe('bounded byte-preserving Maestro metadata codec', () => {
@@ -227,13 +229,39 @@ describe('offline file repair with exclusive verified backups', () => {
     expect(await readdir(directory)).toHaveLength(2)
   })
 
-  it('refuses path links/junctions and hard-linked log files', async () => {
+  it('refuses path links/junctions before applying changes or creating backups', async () => {
     const { path, directory } = await fixture()
     const alias = join(directory, 'alias')
     await symlink(directory, alias, process.platform === 'win32' ? 'junction' : 'dir')
-    await expect(repairSessionLogFile(join(alias, 'session.v4.jsonl'))).rejects.toThrow('LINK_REFUSED')
-    await link(path, join(directory, 'hard.jsonl'))
-    await expect(repairSessionLogFile(path)).rejects.toThrow('HARD_LINK_REFUSED')
+    const aliasStat = await lstat(alias)
+    // Node22.19 on Windows reports some junctions as ordinary directories.
+    // checkedPath must then refuse the realpath alias, not accept the log.
+    const refusal = aliasStat.isSymbolicLink() ? 'LINK_REFUSED' : 'NONCANONICAL_PATH_REFUSED'
+    if (!aliasStat.isSymbolicLink()) {
+      expect(process.platform).toBe('win32')
+      expect(aliasStat.isDirectory()).toBe(true)
+    }
+    expect(await realpath(alias)).toBe(directory)
+    const apply = { apply: true, expectSha256: sha256(original), confirmDshFullyExited: true, ports: [await vacantPort()] }
+    for (const options of [{}, apply]) {
+      await expect(repairSessionLogFile(join(alias, 'session.v4.jsonl'), options)).rejects.toMatchObject({ code: refusal })
+      expect((await readFile(path)).equals(original)).toBe(true)
+      expect((await readdir(directory)).sort()).toEqual(['alias', 'session.v4.jsonl'])
+    }
+  })
+
+  it('independently refuses hard-linked logs without modifying either name or creating backups', async () => {
+    const { path, directory } = await fixture()
+    const alias = join(directory, 'hard.jsonl')
+    await link(path, alias)
+    expect((await lstat(path)).nlink).toBe(2)
+    const apply = { apply: true, expectSha256: sha256(original), confirmDshFullyExited: true, ports: [await vacantPort()] }
+    for (const options of [{}, apply]) {
+      await expect(repairSessionLogFile(path, options)).rejects.toMatchObject({ code: 'HARD_LINK_REFUSED' })
+      expect((await readFile(path)).equals(original)).toBe(true)
+      expect((await readFile(alias)).equals(original)).toBe(true)
+      expect((await readdir(directory)).sort()).toEqual(['hard.jsonl', 'session.v4.jsonl'])
+    }
   })
 
   it('runs the CLI as a default read-only command with redacted success and failure output', { timeout: 25_000 }, async () => {

@@ -1,34 +1,31 @@
 import { afterEach, describe, expect, it } from 'vitest'
 import { execFileSync } from 'node:child_process'
-import { existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
+import { existsSync, lstatSync, mkdirSync, readFileSync, realpathSync, symlinkSync, writeFileSync } from 'node:fs'
+import { tmpdir } from 'node:os'
 import { dirname, isAbsolute, join, parse, relative, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import ts from 'typescript'
 import type { UserConfig } from 'tsdown'
 import clientConfig, { cjsDeclarationTypeImports, excludeDtsVirtualModules } from '../tsdown.config.js'
 import { cleanBuildOutputs } from '../scripts/clean-build.mjs'
+import { createOwnedTestFixture, type OwnedTestFixture } from './owned-test-fixture.js'
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), '..')
 const config = clientConfig as UserConfig
 const pkg = JSON.parse(readFileSync(join(root, 'package.json'), 'utf8'))
-const fixtures: string[] = []
+const temporaryRoot = realpathSync.native(tmpdir())
+const temporaryRelative = relative(root, temporaryRoot)
+const fixtureParent = !isAbsolute(temporaryRelative) && temporaryRelative !== '..' && !/^\.\.[\\/]/.test(temporaryRelative)
+  ? temporaryRoot : join(root, 'tests')
+const fixtures: OwnedTestFixture[] = []
 function fixture() {
-  const path = mkdtempSync(join(root, 'tests', '.package-release-clean-'))
-  fixtures.push(path)
-  return path
+  const owned = createOwnedTestFixture(fixtureParent, '.package-release-clean-')
+  fixtures.push(owned)
+  return owned.path
 }
 
 afterEach(() => {
-  for (const path of fixtures.splice(0)) {
-    const rest = relative(join(root, 'tests'), path)
-    if (isAbsolute(rest) || !rest.startsWith('.package-release-clean-') || /[\\/]/.test(rest)) {
-      throw new Error(`Unsafe fixture cleanup: ${path}`)
-    }
-    if (lstatSync(path).isSymbolicLink() || realpathSync.native(path).toLowerCase() !== path.toLowerCase()) {
-      throw new Error(`Redirected fixture cleanup: ${path}`)
-    }
-    rmSync(path, { recursive: true, force: false })
-  }
+  for (const owned of fixtures.splice(0)) owned.remove()
 })
 
 describe('release export and build configuration', () => {
@@ -160,6 +157,12 @@ describe('release export and build configuration', () => {
 })
 
 describe('controlled build cleanup', () => {
+  it('refuses unsafe fixture prefixes before creating any directory', () => {
+    for (const prefix of ['.', '..', '../escape', '..\\escape', 'C:escape']) {
+      expect(() => createOwnedTestFixture(fixtureParent, prefix)).toThrow('Invalid fixture prefix')
+    }
+  })
+
   it('removes stale outputs before either build half while leaving source intact', () => {
     const path = fixture()
     mkdirSync(join(path, 'src'))
@@ -215,9 +218,24 @@ describe('controlled build cleanup', () => {
   it('rejects a linked plugin-root component even when no lib exists', () => {
     const path = fixture()
     mkdirSync(join(path, 'protected'))
+    writeFileSync(join(path, 'protected', 'keep'), 'untouched')
     symlinkSync(join(path, 'protected'), join(path, 'redirect'), 'junction')
     expect(() => cleanBuildOutputs(join(path, 'redirect'))).toThrow()
     expect(existsSync(join(path, 'protected'))).toBe(true)
+    expect(readFileSync(join(path, 'protected', 'keep'), 'utf8')).toBe('untouched')
+  })
+
+  it('cleans its exact owned fixture without following a junction to a protected target', () => {
+    const path = fixture()
+    const owned = fixtures[fixtures.length - 1]
+    const protectedPath = fixture()
+    writeFileSync(join(protectedPath, 'keep'), 'untouched')
+    mkdirSync(join(path, 'nested'))
+    writeFileSync(join(path, 'nested', 'own-file'), 'owned')
+    symlinkSync(protectedPath, join(path, 'nested', 'redirect'), 'junction')
+    owned.remove()
+    expect(existsSync(path)).toBe(false)
+    expect(readFileSync(join(protectedPath, 'keep'), 'utf8')).toBe('untouched')
   })
 })
 

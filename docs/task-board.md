@@ -23,13 +23,17 @@
 | 原生子代理状态 | `sidebar/api/subagents.live` | 沿用原版 3s 刷新，实时 activity / done / error 不由 CLI 状态覆盖 |
 | 工作流 | `sidebar/api/workflows.list` | 沿用原版 5s 刷新、工作流卡片、成员节点与详情/导航 |
 | Agent Team | `agentTeam` 投影与原生 live | 原版 TeamBoard / TaskWindow，创建与 CAS 更新复用已有 teams API |
-| 后台任务 | 宿主 `jobs.state`、`watchRows`、`observe`、`kill` | 独立原版 JobsDrawer，钉在看板底部、固定占 1/5 高度（`jobs-dock.ts` 注入槽位样式）；没有任务时不占位 |
+| 后台任务 | 宿主 `jobs.state`、`watchRows`、`observe`、`kill` | 独立原版 JobsDrawer，钉在看板底部、固定占 1/5 高度（`jobs-dock.ts` 注入槽位样式）；有 jobs 服务时常驻，空列表显示中英文空态，仅缺少该服务时不渲染 |
 
 不新增 host 路由，不修改模型路由、难度门槛、权限或续接契约。CLI 超时保护的修正见下文。隐藏看板时停止列表/日志轮询及作业观察。看板读取原版 SidebarStore 的图/树与自动折叠偏好；后台任务抽屉不再跟随「代理较多自动收起」偏好——槽位固定占 1/5 高度，若在 8 个子智能体后自动折叠就只剩 28px 标题栏，所以抽屉默认展开，点标题栏仍可手动折叠（折叠时槽位退回标题栏高度，不留空白）。保留原版 `<768px` 窄屏默认树视图。
 
 团队任务的正文、编辑控件与窗口使用原版组件。Markdown 的宿主文件导航是显式兼容适配：只有宿主提供 `openMarkdownFile` 时才打开本地 Markdown 链接，不伪造 explorer 路由或完整跨文件锚点能力。
 
 ## CLI 接入边界
+
+任务仍归属于最初的父会话，续接不会把 owner 改成当前 CLI 子会话。已授权的父会话、任务自己的 CLI 子会话，以及该任务真实续接链上的祖先视图可读取和控制该分支；同一父会话下的兄弟任务或另一条分支不能因此借权。`sessions` 仅收窄范围，不增加权限。
+
+新任务的 `replySessionIds` 是服务器根据已登记锚点派生的非秘密视图标识，最多 60 项，保留最初视图与最近祖先，以支持内存裁剪、结算历史恢复和中断队列恢复。普通派发不能提供该字段来增加权限；运行时 capability token 不进入任务历史或投影 checkpoint。旧记录只沿当前可验证的同 owner、同 CLI 链兼容读取，缺失祖先不猜测授权。
 
 [model.ts](https://github.com/GaoHu1997/dsh-maestro-codex/blob/master/src/client/board/model.ts) 的 `buildSessionTree` 构建骨架，`attachRows` 按 `MaestroTaskSummary.sessionId` 挂接 CLI 节点：
 
@@ -92,7 +96,7 @@ Codex 的 `input_tokens` 是包含缓存读/写的输入。归一化为不相交
 
 - 缺少 sessions：保留当前会话根节点。
 - 缺少 jobs：不渲染后台任务停靠槽，画布占满剩余高度。
-- 看板范围里没有后台任务：不渲染停靠槽，不预留空的 1/5 空间。
+- 看板范围里没有后台任务：只要宿主 jobs 服务存在，停靠槽仍保留，显示“暂无后台任务” / “No background jobs”；目录就绪空态、投影错误或 CLI 列表错误不会隐藏该槽。
 - 缺少原生会话打开能力：不提供无效跳转。
 - 血缘环由模型的祖先访问集合剪枝。
 - CLI 续接同时支持 `dispatch_cli_task(resume=sessionRef)` 与上述 GUI `/task/reply`；两者都验证父归属、执行器及真实会话链锁。

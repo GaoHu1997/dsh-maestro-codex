@@ -597,18 +597,46 @@ export function apply(ctx: Context, config: Config = {}): void {
   ;(ctx as unknown as { inject(deps: readonly string[], callback: (inner: Context) => void): void })
     .inject(['sessionProjections'], (projectionCtx) => {
       projectionCtx.effect(() => {
-        projectionHost = projectionCtx
-        projectionFace = (projectionCtx as unknown as { sessionProjections?: unknown }).sessionProjections
+        let face: unknown
+        try { face = (projectionCtx as unknown as { sessionProjections?: unknown }).sessionProjections }
+        catch { log('warn', 'session projection registry getter rejected; optional projections remain unavailable') }
+        // Read the optional getter once and give every installer the same face.
+        // Retain the host method receiver through the captured service object.
+        const installedHost = { sessionProjections: face }
+        projectionHost = installedHost
+        projectionFace = face
         nativeBindingVersion++
-        const recordDispose = installCliRecordProjection(projectionCtx)
-        if (recordDispose === undefined) log('warn', 'native CLI identity projection unavailable; no positive mirror verification assumed')
-        const accessDispose = installSessionAccessProjection(projectionCtx, sessionAccess)
-        const dispose = installCliUsageProjection(projectionCtx, sessionId => usageJournal.recordsFor(sessionId))
-        if (dispose === undefined) {
-          log('warn', 'CLI usage projection unavailable; canonical public accounting service remains authoritative')
-          return () => { accessDispose?.(); recordDispose?.(); projectionHost = undefined; projectionFace = undefined; nativeBindingVersion++; recoveryCache.clear() }
+        recoveryCache.clear()
+        const install = (installer: () => (() => void) | undefined, warning: string): (() => void) | undefined => {
+          try {
+            const disposer = installer()
+            if (disposer === undefined) log('warn', warning)
+            return disposer
+          } catch { log('warn', warning); return undefined }
         }
-        return () => { accessDispose?.(); dispose(); recordDispose?.(); projectionHost = undefined; projectionFace = undefined; nativeBindingVersion++; recoveryCache.clear() }
+        const recordDispose = install(() => installCliRecordProjection(installedHost),
+          'native CLI identity projection unavailable; no positive mirror verification assumed')
+        const accessDispose = install(() => installSessionAccessProjection(installedHost, sessionAccess),
+          'session-access projection unavailable; scoped task requests remain fail-closed')
+        const usageDispose = install(() => installCliUsageProjection(installedHost, sessionId => usageJournal.recordsFor(sessionId)),
+          'CLI usage projection unavailable; canonical public accounting service remains authoritative')
+        let released = false
+        return () => {
+          if (released) return
+          released = true
+          for (const disposer of [accessDispose, usageDispose, recordDispose]) {
+            try {
+              if (disposer !== undefined) void Promise.resolve(disposer()).catch(() => log('warn', 'optional session projection disposer rejected'))
+            } catch { log('warn', 'optional session projection disposer rejected') }
+          }
+          // An old injection may finish unloading after its replacement starts.
+          if (projectionHost === installedHost) {
+            projectionHost = undefined
+            projectionFace = undefined
+            nativeBindingVersion++
+            recoveryCache.clear()
+          }
+        }
       }, 'maestro-codex: cli usage projection')
     })
 }
