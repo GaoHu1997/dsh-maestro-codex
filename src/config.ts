@@ -65,14 +65,12 @@ export const CONFIG_DEFAULTS = {
   claudeBaseUrl: '',
   claudeAuthToken: '',
   claudeCliPath: '',
-  claudeTimeoutMinutes: 20,
   codexEnabled: true,
   codexTaskTypes: ['功能开发', '缺陷修复', '测试验证', '代码审查', '数据处理'],
   codexSandbox: 'workspace-write',
   codexBaseUrl: '',
   codexApiKey: '',
   codexCliPath: '',
-  codexTimeoutMinutes: 20,
   codexConfigOverrides: [],
   codexDshModel: '',
   claudeDshModel: '',
@@ -88,6 +86,8 @@ export const CONFIG_DEFAULTS = {
   claudeSkillsMode: 'bridge',
   mcpDiagnostics: false,
   npmRegistry: '',
+  /** 连续无 stdout/stderr 输出的统一超时（分钟）；所有 CLI 共用，不是总运行时限。 */
+  timeoutMinutes: 20,
   maxConcurrentTasks: 2,
   persistTasks: true,
   injectGitContext: true,
@@ -110,14 +110,12 @@ export interface Config {
   claudeBaseUrl?: Volatile<string> | string
   claudeAuthToken?: Volatile<string> | string
   claudeCliPath?: Volatile<string> | string
-  claudeTimeoutMinutes?: Volatile<number> | number
   codexEnabled?: Volatile<boolean> | boolean
   codexTaskTypes?: Volatile<string[]> | string[]
   codexSandbox?: Volatile<string> | string
   codexBaseUrl?: Volatile<string> | string
   codexApiKey?: Volatile<string> | string
   codexCliPath?: Volatile<string> | string
-  codexTimeoutMinutes?: Volatile<number> | number
   codexConfigOverrides?: Volatile<string[]> | string[]
   codexDshModel?: Volatile<string> | string
   claudeDshModel?: Volatile<string> | string
@@ -139,6 +137,14 @@ export interface Config {
   claudeSkillsMode?: Volatile<string> | string
   mcpDiagnostics?: Volatile<boolean> | boolean
   npmRegistry?: Volatile<string> | string
+  /** 连续无 stdout/stderr 输出的超时（分钟），所有 CLI 共用；不是总运行时限。 */
+  timeoutMinutes?: Volatile<number> | number
+  /**
+   * 已废弃：旧版按 CLI 各自的超时。只为读取存量配置而保留，不再出现在表单里；
+   * `timeoutMinutes` 未设置时按迁移规则取值（见 `resolveTimeoutMinutes`）。
+   */
+  claudeTimeoutMinutes?: Volatile<number> | number
+  codexTimeoutMinutes?: Volatile<number> | number
   maxConcurrentTasks?: Volatile<number> | number
   /** Persist settled dispatch results under $DSH_HOME/maestro/tasks (default on). */
   persistTasks?: Volatile<boolean> | boolean
@@ -172,14 +178,15 @@ export const Config: z = z.object({
   claudeBaseUrl: z.string().default(CONFIG_DEFAULTS.claudeBaseUrl).volatile(),
   claudeAuthToken: z.string().default(CONFIG_DEFAULTS.claudeAuthToken).volatile(),
   claudeCliPath: z.string().default(CONFIG_DEFAULTS.claudeCliPath).volatile(),
-  claudeTimeoutMinutes: z.number().default(CONFIG_DEFAULTS.claudeTimeoutMinutes).volatile(),
+  // 旧版按 CLI 的超时：没有 default，否则「未设置」会被投影成一个值，看不出迁移来源。
+  claudeTimeoutMinutes: z.number().volatile(),
   codexEnabled: z.boolean().default(CONFIG_DEFAULTS.codexEnabled).volatile(),
   codexTaskTypes: z.array(z.string()).default([...CONFIG_DEFAULTS.codexTaskTypes]).volatile(),
   codexSandbox: z.string().default(CONFIG_DEFAULTS.codexSandbox).volatile(),
   codexBaseUrl: z.string().default(CONFIG_DEFAULTS.codexBaseUrl).volatile(),
   codexApiKey: z.string().default(CONFIG_DEFAULTS.codexApiKey).volatile(),
   codexCliPath: z.string().default(CONFIG_DEFAULTS.codexCliPath).volatile(),
-  codexTimeoutMinutes: z.number().default(CONFIG_DEFAULTS.codexTimeoutMinutes).volatile(),
+  codexTimeoutMinutes: z.number().volatile(),
   codexConfigOverrides: z.array(z.string()).default([]).volatile(),
   codexDshModel: z.string().default(CONFIG_DEFAULTS.codexDshModel).volatile(),
   claudeDshModel: z.string().default(CONFIG_DEFAULTS.claudeDshModel).volatile(),
@@ -195,6 +202,9 @@ export const Config: z = z.object({
   claudeSkillsMode: z.string().default(CONFIG_DEFAULTS.claudeSkillsMode).volatile(),
   mcpDiagnostics: z.boolean().default(CONFIG_DEFAULTS.mcpDiagnostics).volatile(),
   npmRegistry: z.string().default(CONFIG_DEFAULTS.npmRegistry).volatile(),
+  // Preserve absence through public schema parsing; effectiveOf supplies the default
+  // only after legacy migration. An explicit 20 remains distinct from missing.
+  timeoutMinutes: z.number().volatile(),
   maxConcurrentTasks: z.number().default(CONFIG_DEFAULTS.maxConcurrentTasks).volatile(),
   persistTasks: z.boolean().default(CONFIG_DEFAULTS.persistTasks).volatile(),
   injectGitContext: z.boolean().default(CONFIG_DEFAULTS.injectGitContext).volatile(),
@@ -205,9 +215,12 @@ export const Config: z = z.object({
 
 const CONFIG_KEYS = Object.keys(CONFIG_DEFAULTS) as readonly (keyof typeof CONFIG_DEFAULTS)[]
 
+/** 已废弃但仍接受写入的键：只用于把存量配置迁到 `timeoutMinutes`。 */
+const LEGACY_CONFIG_KEYS = ['claudeTimeoutMinutes', 'codexTimeoutMinutes'] as const
+
 /** Reject stale or misspelled config keys before defaults can hide them. */
 export function validateConfig(config: Config): void {
-  const known = new Set<string>(CONFIG_KEYS)
+  const known = new Set<string>([...CONFIG_KEYS, ...LEGACY_CONFIG_KEYS])
   const unknown = Object.keys(config).find(key => !known.has(key))
   if (unknown !== undefined) {
     throw new Error(`MaestroConfig: unknown key "${unknown}"`)
@@ -238,6 +251,7 @@ export function validateConfig(config: Config): void {
   if (claudeSkillsMode !== undefined && !(CLAUDE_SKILLS_MODES as readonly string[]).includes(claudeSkillsMode)) {
     throw new Error(`MaestroConfig: "claudeSkillsMode" must be one of ${CLAUDE_SKILLS_MODES.join(' | ')}`)
   }
+  validateTimeout('timeoutMinutes', readVolatile(config.timeoutMinutes))
   validateTimeout('claudeTimeoutMinutes', readVolatile(config.claudeTimeoutMinutes))
   validateTimeout('codexTimeoutMinutes', readVolatile(config.codexTimeoutMinutes))
   const claudeDshModel = readVolatile(config.claudeDshModel)
@@ -313,7 +327,6 @@ export interface EffectiveConfig {
     baseUrl: string
     authToken: string
     cliPath: string
-    timeoutMinutes: number
   }
   codex: {
     enabled: boolean
@@ -326,7 +339,6 @@ export interface EffectiveConfig {
     baseUrl: string
     apiKey: string
     cliPath: string
-    timeoutMinutes: number
     /** Raw `-c key=value` overrides passed to every codex invocation. */
     configOverrides: string[]
   }
@@ -336,6 +348,8 @@ export interface EffectiveConfig {
     taskTypes: string[]
   }
   npmRegistry: string
+  /** 连续无 stdout/stderr 输出的超时（分钟），所有 CLI 共用；不是总运行时限。 */
+  timeoutMinutes: number
   maxConcurrentTasks: number
   /** Persist settled dispatch results under $DSH_HOME/maestro/tasks. */
   persistTasks: boolean
@@ -366,6 +380,22 @@ function thinkingOf(config: Config, field: 'claudeThinking' | 'codexThinking'): 
   return readVolatile(config[field]) ?? ''
 }
 
+/**
+ * 统一的无输出超时：`timeoutMinutes` 优先；旧版按 CLI 的两个键只作迁移来源，
+ * 两者不同时取较大值（宁可多等，也不缩短原本更宽松的那个窗口）。
+ */
+export function resolveTimeoutMinutes(config: Config): number {
+  const explicit = readVolatile(config.timeoutMinutes)
+  if (isTimeoutMinutes(explicit)) return explicit
+  const legacy = [readVolatile(config.claudeTimeoutMinutes), readVolatile(config.codexTimeoutMinutes)]
+    .filter(isTimeoutMinutes)
+  return legacy.length === 0 ? CONFIG_DEFAULTS.timeoutMinutes : Math.max(...legacy)
+}
+
+function isTimeoutMinutes(value: number | undefined): value is number {
+  return value !== undefined && Number.isInteger(value) && value >= 1 && value <= 240
+}
+
 /** Layer the (possibly volatile) config over the shipped defaults. */
 export function effectiveOf(config: Config): EffectiveConfig {
   const defaultCli = readVolatile(config.defaultCli) ?? CONFIG_DEFAULTS.defaultCli
@@ -390,7 +420,6 @@ export function effectiveOf(config: Config): EffectiveConfig {
       baseUrl: readVolatile(config.claudeBaseUrl) ?? '',
       authToken: readVolatile(config.claudeAuthToken) ?? '',
       cliPath: readVolatile(config.claudeCliPath) ?? '',
-      timeoutMinutes: readVolatile(config.claudeTimeoutMinutes) ?? CONFIG_DEFAULTS.claudeTimeoutMinutes,
     },
     codex: {
       enabled: readVolatile(config.codexEnabled) ?? CONFIG_DEFAULTS.codexEnabled,
@@ -404,7 +433,6 @@ export function effectiveOf(config: Config): EffectiveConfig {
       baseUrl: readVolatile(config.codexBaseUrl) ?? '',
       apiKey: readVolatile(config.codexApiKey) ?? '',
       cliPath: readVolatile(config.codexCliPath) ?? '',
-      timeoutMinutes: readVolatile(config.codexTimeoutMinutes) ?? CONFIG_DEFAULTS.codexTimeoutMinutes,
       configOverrides: readVolatile(config.codexConfigOverrides) ?? [],
     },
     dsh: {
@@ -415,6 +443,7 @@ export function effectiveOf(config: Config): EffectiveConfig {
       taskTypes: normalizeTaskTypes(readVolatile(config.dshTaskTypes) ?? [...CONFIG_DEFAULTS.dshTaskTypes]),
     },
     npmRegistry: readVolatile(config.npmRegistry) ?? '',
+    timeoutMinutes: resolveTimeoutMinutes(config),
     maxConcurrentTasks: readVolatile(config.maxConcurrentTasks) ?? CONFIG_DEFAULTS.maxConcurrentTasks,
     persistTasks: readVolatile(config.persistTasks) ?? CONFIG_DEFAULTS.persistTasks,
     injectGitContext: readVolatile(config.injectGitContext) ?? CONFIG_DEFAULTS.injectGitContext,

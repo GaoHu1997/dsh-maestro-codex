@@ -50,8 +50,7 @@ const rawAssessment = { task_difficulty: 'medium', difficulty_reason: assessment
 type Ending = 'done' | 'failed' | 'timeout' | 'cancelled'
 function fixture(cli: 'codex' | 'claude' = 'codex', ending: Ending = 'done', withRef = true) {
   const config = withTestDshRoutes(effectiveOf({ claudeCliPath: process.execPath, codexCliPath: process.execPath, injectGitContext: false, failureRetries: 0 }))
-  config.claude.timeoutMinutes = 0.001
-  config.codex.timeoutMinutes = 0.001
+  config.timeoutMinutes = 0.001
   const controller = new AbortController()
   const state = { ending, withRef }
   const spawn = scriptedSpawn(child => {

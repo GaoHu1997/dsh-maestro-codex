@@ -7,7 +7,7 @@
  * No fake offline load/storeappend or unsupported header keys are used here.
  */
 import { MessageId } from '@deepseek-ai/dsh-llm'
-import { SessionSeq, SessionLogOffset, type SessionEvent } from '@deepseek-ai/dsh-session'
+import { SessionSeq, SessionLogOffset, type SessionEvent, type TurnEndReason } from '@deepseek-ai/dsh-session'
 import { cliTokenCountOf } from './usage.js'
 import type { MaestroCliId } from './wire.js'
 
@@ -47,14 +47,24 @@ export interface ChildSessionStartInput {
 export interface ChildSessionSettleInput {
   readonly taskId: string
   readonly ok: boolean
+  /** Optional for old callers, which only distinguished success from failure. */
+  readonly phase?: string | undefined
   readonly stats: ChildSessionUsageStats
   readonly route?: { readonly provider: string; readonly model: string } | undefined
   readonly finalText?: string | undefined
 }
+/** Preserve the actual terminal outcome without inventing a cancellation cause. */
+export function cliChildTurnEndReason(ok: boolean, phase?: string): TurnEndReason {
+  if (phase === 'cancelled') return { kind: 'aborted', reason: { kind: 'legacy' } }
+  if (phase === 'interrupted') return { kind: 'interrupted' }
+  if (ok) return { kind: 'completed' }
+  return { kind: 'error', error: { code: phase === 'timeout' ? 'CLI_TIMEOUT' : 'CLI_FAILED',
+    message: phase === 'timeout' ? 'CLI task timed out' : 'CLI task did not complete' } }
+}
 export interface ChildSessionRecorder {
   start(input: ChildSessionStartInput): void
   settle(input: ChildSessionSettleInput): void
-  /** Retry parent catalog publication against live get only; NOT a disk replay. */
+  /** Retry pending terminal appends and parent publication; NOT a disk replay. */
   flushPending?(): number
 }
 export interface ChildSessionRecorderParts {
@@ -71,8 +81,14 @@ interface LiveRecord {
   readonly usageId: string
   readonly label: string
   readonly startedAt: number
-  stepStarted: boolean
-  settled: boolean
+  pending?: readonly PendingAppend[]
+  nextAppend: number
+  appending: boolean
+}
+interface PendingAppend {
+  readonly type: string
+  readonly data: unknown
+  readonly opts?: { surfaceOp: 'append' }
 }
 interface NativeUsage {
   inputTokens: number
@@ -116,8 +132,25 @@ export function createChildSessionRecorder(parts: ChildSessionRecorderParts): Ch
   const warn = (stage: string, error: unknown): void => {
     parts.logger?.warn(`dsh-maestro-codex: child session ${stage} skipped: ${error instanceof Error ? error.message : String(error)}`)
   }
+  function drain(record: LiveRecord): boolean {
+    if (record.pending === undefined || record.appending) return false
+    record.appending = true
+    try {
+      // Session.append validates before commit and contains observer failures.
+      // Advance only after acceptance; a failed closer never repeats the usage.
+      while (record.nextAppend < record.pending.length) {
+        const event = record.pending[record.nextAppend]!
+        record.session.append(event.type, event.data, event.opts)
+        record.nextAppend++
+      }
+      live.delete(record.taskId)
+      return true
+    } catch (error) { warn('settle', error); return false }
+    finally { record.appending = false }
+  }
   function flushPending(): number {
     let count = 0
+    for (const record of live.values()) if (drain(record)) count++
     for (const [id, row] of catalogPending) {
       try {
         const parent = parts.store()?.get?.(row.parentSessionId)
@@ -140,6 +173,7 @@ export function createChildSessionRecorder(parts: ChildSessionRecorderParts): Ch
         if (store === undefined) return
         flushPending()
         const id = `cli-${input.taskId}`
+        const title = input.label.trim() || id
         const now = Date.now()
         const source = `cli:${input.cli ?? 'unknown'}`
         const usageId = JSON.stringify([source, input.taskId, input.startedAt ?? now])
@@ -156,6 +190,12 @@ export function createChildSessionRecorder(parts: ChildSessionRecorderParts): Ch
             nativeInputSemantics: 'uncached',
             ...(input.cli === undefined ? {} : { cli: input.cli }),
           } },
+          // Standard log-only title: readers of the child need not load its
+          // parent's catalog. Its declaration belongs to the optional host
+          // title plugin, so bridge the SDK type without adding a runtime dep.
+          { seq: SessionSeq(2), time: now, type: 'session/title', data: {
+            title, messageSeqs: [], source: { kind: 'user' },
+          } } as unknown as SessionEvent,
         ]
         const session = store.create(id, { seed, inheritedEventCount: SessionLogOffset(0),
           meta: { cwd: input.cwd, parentSession: parentSessionId, origin: 'subagent' } })
@@ -164,7 +204,7 @@ export function createChildSessionRecorder(parts: ChildSessionRecorderParts): Ch
         live.set(input.taskId, {
           session, taskId: input.taskId, parentSessionId, childSessionId: id, source, usageId,
           label: input.label, startedAt: input.startedAt ?? now,
-          stepStarted: false, settled: false,
+          nextAppend: 0, appending: false,
         })
         const data = { version: 0, childId: id, childCreatedAt: createdAt, mode: 'one-shot', label: input.label }
         const parent = input.parentSession ?? store.get?.(parentSessionId)
@@ -185,38 +225,38 @@ export function createChildSessionRecorder(parts: ChildSessionRecorderParts): Ch
     },
     settle(input) {
       const record = live.get(input.taskId)
-      if (record === undefined || record.settled) return
+      if (record === undefined) return
+      if (record.pending !== undefined) { drain(record); return }
       try {
         flushPending()
         const identityMatches = (input.stats?.['usageSource'] === undefined || input.stats['usageSource'] === record.source)
           && (input.stats?.['usageAttemptId'] === undefined || input.stats['usageAttemptId'] === record.usageId)
-        // The seed owns immutable linkage. If settlement changes identity, keep
-        // its spend in the canonical journal rather than misattribute a mirror.
-        const usage = identityMatches ? usageSampleOf(input.stats) : undefined
         if (!identityMatches) warn('native usage', new Error('settlement identity changed; canonical ledger remains authoritative'))
         const route = usableRoute(input.route)
-        // request/context is the real host attribution contract for attempts;
-        // assistant/attempt itself has no source/provider/model field.
-        if (route !== undefined) record.session.append('request/context', route)
-        if (!record.stepStarted) { record.session.append('step/start', { turn: 1, step: 1 }); record.stepStarted = true }
+        // No route means no native attribution. Preserve those counters only in
+        // the canonical ledger, rather than publishing an unowned native charge.
+        const usage = identityMatches && route !== undefined ? usageSampleOf(input.stats) : undefined
+        const events: PendingAppend[] = [{ type: 'turn/start', data: { turn: 1 } }]
+        if (route !== undefined) events.push({ type: 'request/context', data: route })
+        events.push({ type: 'step/start', data: { turn: 1, step: 1 } })
         const finalText = input.finalText?.trim() ?? ''
         if (input.ok && route !== undefined && finalText !== '') {
-          record.session.append('assistant/message', {
+          events.push({ type: 'assistant/message', data: {
             message: { id: `${input.taskId}-answer`, role: 'assistant', content: [{ type: 'text', text: input.finalText ?? '' }], source: { kind: 'model', ...route } },
             turn: 1, step: 1, stream: [], ...(usage === undefined ? {} : { usage }),
-          }, { surfaceOp: 'append' })
+          }, opts: { surfaceOp: 'append' } })
         } else {
-          record.session.append('assistant/attempt', { turn: 1, step: 1,
+          events.push({ type: 'assistant/attempt', data: { turn: 1, step: 1,
             stream: usage === undefined ? [] : [{ type: 'chunk', time: Date.now(), chunk: { type: 'usage', usage } }],
-          })
+          } })
         }
-        // No private settlement row is appended to the child or the parent: the
-        // canonical usage journal owns durable CLI spend, and an unmarked
-        // `maestro/*` append would make the parent log unloadable.
-        record.settled = true
-        // Drop append faces after settlement. Duplicate starts are also blocked
-        // by the host's real duplicate-id guard, duplicate settles by this removal.
-        live.delete(input.taskId)
+        events.push({ type: 'step/end', data: { turn: 1, step: 1 } },
+          { type: 'turn/end', data: { turn: 1, reason: cliChildTurnEndReason(input.ok, input.phase) } })
+        // CLI streaming updates are cumulative snapshots in the channels. Publish
+        // their final sample once, and freeze this plan before any append so a
+        // later retry cannot replace it with another cumulative charge.
+        record.pending = events
+        drain(record)
       } catch (error) { warn('settle', error) }
     },
   }

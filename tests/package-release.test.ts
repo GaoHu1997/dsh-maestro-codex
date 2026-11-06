@@ -244,10 +244,11 @@ describe('release delivery whitelist', () => {
     const added = [
       'docs/cli-safety.md', 'docs/task-board.md', 'docs/session-history-recovery-guide.md',
       'docs/reliability.md', 'scripts/maestro-status.mjs',
+      'scripts/repair-cli-session-logs.mjs', 'scripts/session-log-codec.mjs', 'scripts/lib/session-artifact-runtime.mjs',
     ]
     expect(pkg.files).toEqual([
       'lib', '!lib/**/*.map', 'cordis.patch.yml', 'README.md', 'LICENSE', 'icon.svg',
-      'locale/*.json', ...added, 'THIRD_PARTY_NOTICES',
+      'locale/*.json', "docs/images/config-cli-management.png", "docs/images/config-sdk-management.png", "docs/images/session-task-list.png", "docs/images/cli-subsession-page.png", "docs/images/task-board-tree.png", ...added, 'THIRD_PARTY_NOTICES',
     ])
     for (const path of added) {
       expect(pkg.files).toContain(path)

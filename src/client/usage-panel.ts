@@ -11,7 +11,7 @@
 
 import { useCallback, useSyncExternalStore } from 'react'
 
-import type { CliUsageRecord, CliUsageState } from '../usage.js'
+import type { CliUsageRecord, CliUsageState, CliKnownTokens } from '../usage.js'
 import type { MaestroCliId } from '../wire.js'
 import { sessionsFaceOf, type BoardSessionsFace, type BoardSessionList } from './board/data.js'
 
@@ -26,8 +26,11 @@ export interface UsageCliBucket {
   readonly requests: number
   readonly ok: number
   readonly failed: number
-  readonly inputTokens: number
-  readonly outputTokens: number
+  readonly inputTokens: number | null
+  readonly outputTokens: number | null
+  readonly cachedInputTokens: number | null
+  readonly cacheWriteTokens: number | null
+  readonly knownTokens: CliKnownTokens
   readonly durationMs: number
 }
 
@@ -46,11 +49,12 @@ export interface UsageSummary {
   readonly ok: number
   readonly failed: number
   readonly cancelled: number
-  readonly inputTokens: number
-  readonly outputTokens: number
-  readonly cachedInputTokens: number
-  readonly cacheWriteTokens: number
+  readonly inputTokens: number | null
+  readonly outputTokens: number | null
+  readonly cachedInputTokens: number | null
+  readonly cacheWriteTokens: number | null
   readonly durationMs: number
+  readonly knownTokens: CliKnownTokens
   readonly perCli: Readonly<Record<MaestroCliId, UsageCliBucket>>
   /** 合并后的最近调用（新→旧，最多 {@link USAGE_RECENT_SHOWN} 条）。 */
   readonly recent: readonly CliUsageRecord[]
@@ -60,12 +64,12 @@ export interface UsageSummary {
   readonly daily: readonly UsageDayBucket[]
 }
 
-const EMPTY_BUCKET: UsageCliBucket = { requests: 0, ok: 0, failed: 0, inputTokens: 0, outputTokens: 0, durationMs: 0 }
+const EMPTY_BUCKET: UsageCliBucket = { requests: 0, ok: 0, failed: 0, inputTokens: 0, outputTokens: 0, cachedInputTokens: 0, cacheWriteTokens: 0, knownTokens: {}, durationMs: 0 }
 
 const ZERO_SUMMARY: UsageSummary = {
   requests: 0, ok: 0, failed: 0, cancelled: 0,
   inputTokens: 0, outputTokens: 0, cachedInputTokens: 0, cacheWriteTokens: 0,
-  durationMs: 0,
+  durationMs: 0, knownTokens: {},
   perCli: { claude: EMPTY_BUCKET, codex: EMPTY_BUCKET },
   recent: [],
   sessions: 0,
@@ -83,13 +87,20 @@ function dayStart(timestamp: number): number {
   return date.getTime()
 }
 
-/** 折叠各会话的 CLI 用量投影（窗口 = [now - windowMs, now] 内的记录）。 */
+/** 默认窗口为今天及前六个本地自然日，截止 now；非默认 windowMs 使用滚动窗口。 */
 export function summarizeUsage(
   states: ReadonlyArray<CliUsageState | undefined>,
   now: number,
   windowMs: number = USAGE_WINDOW_MS,
 ): UsageSummary {
-  const since = now - windowMs
+  const todayDate = new Date(now)
+  todayDate.setHours(0, 0, 0, 0)
+  const firstDate = new Date(todayDate)
+  firstDate.setDate(firstDate.getDate() - 6)
+  // Default: today and the previous six local calendar days, up to now.
+  const since = windowMs === USAGE_WINDOW_MS ? firstDate.getTime() : now - windowMs
+  const knownTokens: Record<TokenKey, number> = { inputTokens: 0, outputTokens: 0, cachedInputTokens: 0, cacheWriteTokens: 0 }
+  const unknown = new Set<TokenKey>()
   const perCli: Record<MaestroCliId, UsageCliBucket> = { claude: { ...EMPTY_BUCKET }, codex: { ...EMPTY_BUCKET } }
   let requests = 0
   let ok = 0
@@ -108,9 +119,14 @@ export function summarizeUsage(
     const records = state.recent ?? []
     if (records.length > 0) sessions += 1
     for (const record of records) {
-      if (record == null || typeof record.startedAt !== 'number' || record.startedAt < since) continue
+      if (record == null || typeof record.startedAt !== 'number' || !Number.isFinite(record.startedAt) || record.startedAt < since || record.startedAt > now || (record.cli !== 'claude' && record.cli !== 'codex')) continue
       const isOk = record.phase === 'done'
       const isFailed = record.phase === 'failed' || record.phase === 'timeout'
+      for (const key of TOKEN_KEYS) {
+        const value = record[key]
+        if (typeof value !== 'number' || !Number.isFinite(value) || value < 0) unknown.add(key)
+        knownTokens[key] += finitePositive(value ?? record.knownTokens?.[key])
+      }
       const input = finitePositive(record.inputTokens)
       const output = finitePositive(record.outputTokens)
       const duration = Math.max(0, finitePositive(record.durationMs))
@@ -124,12 +140,16 @@ export function summarizeUsage(
       cachedInputTokens += finitePositive(record.cachedInputTokens)
       cacheWriteTokens += finitePositive(record.cacheWriteTokens)
       const bucket = perCli[record.cli] ?? { ...EMPTY_BUCKET }
+      const bucketKnown = { ...bucket.knownTokens }
+      for (const key of TOKEN_KEYS) bucketKnown[key] = (bucketKnown[key] ?? 0) + finitePositive(record[key] ?? record.knownTokens?.[key])
+      const sum = (key: TokenKey): number | null => bucket[key] === null || record[key] === null || !Number.isFinite(record[key]) ? null : (bucket[key] ?? 0) + finitePositive(record[key])
       perCli[record.cli] = {
         requests: bucket.requests + 1,
         ok: bucket.ok + (isOk ? 1 : 0),
         failed: bucket.failed + (isFailed ? 1 : 0),
-        inputTokens: bucket.inputTokens + input,
-        outputTokens: bucket.outputTokens + output,
+        inputTokens: sum('inputTokens'),
+        outputTokens: sum('outputTokens'),
+        cachedInputTokens: sum('cachedInputTokens'), cacheWriteTokens: sum('cacheWriteTokens'), knownTokens: bucketKnown,
         durationMs: bucket.durationMs + duration,
       }
       recent.push(record)
@@ -144,19 +164,29 @@ export function summarizeUsage(
   recent.sort((left, right) => right.startedAt - left.startedAt)
   const today = dayStart(now)
   const daily: UsageDayBucket[] = []
-  for (let index = 6; index >= 0; index -= 1) {
-    const day = today - index * 24 * 60 * 60 * 1000
+  const date = new Date(dayStart(since))
+  while (date.getTime() <= today) {
+    const day = date.getTime()
     const bucket = dailyMap.get(day) ?? { requests: 0, ok: 0, failed: 0 }
     daily.push({ day, ...bucket })
+    date.setDate(date.getDate() + 1)
   }
   return {
     requests, ok, failed, cancelled, durationMs,
-    inputTokens, outputTokens, cachedInputTokens, cacheWriteTokens,
+    inputTokens: unknown.has('inputTokens') ? null : inputTokens, outputTokens: unknown.has('outputTokens') ? null : outputTokens,
+    cachedInputTokens: unknown.has('cachedInputTokens') ? null : cachedInputTokens, cacheWriteTokens: unknown.has('cacheWriteTokens') ? null : cacheWriteTokens, knownTokens,
     perCli,
     recent: recent.slice(0, USAGE_RECENT_SHOWN),
     sessions,
     daily,
   }
+}
+
+export const TOKEN_KEYS = ['inputTokens', 'outputTokens', 'cachedInputTokens', 'cacheWriteTokens'] as const
+export type TokenKey = (typeof TOKEN_KEYS)[number]
+/** Unknown is never rendered as a measured zero. */
+export function usageTokenLabel(value: number | null, known: number | undefined): string {
+  return value === null ? known !== undefined && known > 0 ? '至少 ' + String(known) + '（部分未知）' : '未知' : String(value)
 }
 
 const EMPTY_SNAPSHOT: BoardSessionList = { byId: {} }

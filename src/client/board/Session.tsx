@@ -979,8 +979,22 @@ function SessionPageContent(props: Parameters<typeof SessionPage>[0] & { access:
     setDraft('')
   }, [draft, sending, lastRunning, replyAnchorId, scopeKey, access])
 
-  const cancelLast = useCallback(() => {
-    void cancelTask(lastId, scopeKey === '' ? undefined : scopeKey.split(','), access)
+  const cancellingRef = useRef(false)
+  const [cancelling, setCancelling] = useState(false)
+  const [cancelError, setCancelError] = useState<string | undefined>()
+  const cancelLast = useCallback(async (): Promise<void> => {
+    if (cancellingRef.current) return
+    cancellingRef.current = true
+    setCancelling(true)
+    setCancelError(undefined)
+    try {
+      const result = await cancelTask(lastId, scopeKey === '' ? undefined : scopeKey.split(','), access)
+      if (mountedRef.current && !result.ok) setCancelError(result.error)
+    } catch (error) {
+      if (mountedRef.current) setCancelError(error instanceof Error ? error.message : String(error))
+    } finally {
+      if (mountedRef.current) { cancellingRef.current = false; setCancelling(false) }
+    }
   }, [lastId, scopeKey, access])
 
   // 滚动跟随：贴底时新内容一到就滚到底；用户往上翻了就不打扰。
@@ -1094,6 +1108,7 @@ function SessionPageContent(props: Parameters<typeof SessionPage>[0] & { access:
       </div>
 
       <div className="dms-composer">
+        {cancelError === undefined ? null : <p className="dms-notice dms-notice-error" role="alert">{cancelError}</p>}
         {notice === undefined ? undefined : <p className="dms-notice dms-notice-error" role="alert">{notice}</p>}
         <div className="dms-card">
           <div className="dms-inputrow">
@@ -1133,7 +1148,7 @@ function SessionPageContent(props: Parameters<typeof SessionPage>[0] & { access:
               {lastRunning
                 ? (
                   <button
-                    type="button" className="dms-stop" onClick={cancelLast}
+                    type="button" className="dms-stop" disabled={cancelling} onClick={() => { void cancelLast() }}
                     title="停止正在执行的这一轮（会取消当前 CLI 进程）" aria-label="停止这一轮"
                   >
                     <i aria-hidden />

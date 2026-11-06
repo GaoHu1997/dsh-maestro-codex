@@ -105,9 +105,9 @@ node scripts/maestro-status.mjs --url http://127.0.0.1:11061
 ```bash
 # 在失败运行的精确 tag checkout 中执行；artifact 指向那次运行保留的 tarball。
 set -euo pipefail
-artifact=./dist/dsh-maestro-codex-0.1.8.tgz
 name=$(node -p 'require("./package.json").name')
 version=$(node -p 'require("./package.json").version')
+artifact="./dist/$name-$version.tgz"
 tag="v$version"
 git rev-parse --verify "$tag"
 actual=$(node -e 'const fs=require("node:fs"),crypto=require("node:crypto");process.stdout.write("sha512-"+crypto.createHash("sha512").update(fs.readFileSync(process.argv[1])).digest("base64"))' "$artifact")

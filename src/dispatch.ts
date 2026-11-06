@@ -392,7 +392,7 @@ export async function runDispatch(deps: DispatchDeps, params: DispatchParams, si
     ]
   if (decision.note !== undefined) notes.push(decision.note)
   const model = params.model ?? ''
-  const timeoutMinutes = params.timeoutMinutes ?? (decision.cli === 'claude' ? config.claude.timeoutMinutes : config.codex.timeoutMinutes)
+  const timeoutMinutes = params.timeoutMinutes ?? config.timeoutMinutes
   // A missing cwd used to travel as `undefined`, silently inheriting whatever
   // directory the host process happened to be in. Resolve it once, say which
   // directory the run really used, and hand that same path to the child.
@@ -992,6 +992,7 @@ export async function runDispatch(deps: DispatchDeps, params: DispatchParams, si
         deps.childSessions?.settle({
           taskId: id,
           ok: task.phase === 'done',
+          phase: task.phase,
           stats: task.stats,
           ...(resolvedRoute === undefined ? {} : { route: resolvedRoute }),
           ...(task.finalText === undefined ? {} : { finalText: task.finalText }),

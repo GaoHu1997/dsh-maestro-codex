@@ -5,6 +5,7 @@
  * agent. The configured sandbox IS the permission axis of the run.
  */
 
+import { fileURLToPath } from 'node:url'
 import { runProcess, type ChildOutcome } from '../spawn.js'
 import { CODEX_REASONING_EFFORTS, type MaestroChannelEvent } from '../wire.js'
 import type { CodexSandboxMode } from '../config.js'
@@ -168,16 +169,19 @@ const CODEX_MCP_APPROVAL_MODE = 'approve'
  */
 export function codexMcpArgs(servers: ReadonlyArray<{ name: string; transport?: 'stdio' | 'http'; command: string; args: readonly string[]; env: Readonly<Record<string, string>> }>): string[] {
   const args: string[] = []
-  for (const server of servers) {
+  for (const [index, server] of servers.entries()) {
     // `http` transport rows carry no command — codex cannot spawn them, and an
     // empty `command = ""` would make codex reject the whole override.
     if (server.transport === 'http' || server.command.trim() === '') continue
-    const parts = [`command = ${tomlString(server.command)}`]
-    if (server.args.length > 0) parts.push(`args = [${server.args.map(tomlString).join(', ')}]`)
-    const envEntries = Object.entries(server.env)
-    if (envEntries.length > 0) {
-      parts.push(`env = { ${envEntries.map(([key, value]) => `${tomlKey(key)} = ${tomlString(value)}`).join(', ')} }`)
-    }
+    const keys = Object.keys(server.env)
+    const aliases = keys.map((_, keyIndex) => mcpSecretAlias(index, keyIndex))
+    // Codex env_vars copies named environment values, it does not interpolate TOML.
+    // Each server gets disjoint aliases; the shim restores only its own key names.
+    const command = keys.length === 0 ? server.command : process.execPath
+    const serverArgs = keys.length === 0 ? server.args : [fileURLToPath(new URL('../mcp-env-shim.js', import.meta.url)), JSON.stringify({ command: server.command, args: server.args, keys, aliases })]
+    const parts = [`command = ${tomlString(command)}`]
+    if (serverArgs.length > 0) parts.push(`args = [${serverArgs.map(tomlString).join(', ')}]`)
+    if (aliases.length > 0) parts.push(`env_vars = [${aliases.map(tomlString).join(', ')}]`)
     // `codex exec` is non-interactive: its approval policy is `never`, so an MCP
     // tool call that asks for approval can never be granted and every bridge
     // call dies with `MCP tool call requires approval, but approval policy is
@@ -192,6 +196,20 @@ export function codexMcpArgs(servers: ReadonlyArray<{ name: string; transport?: 
     args.push('-c', `mcp_servers.${tomlKey(server.name)}={ ${parts.join(', ')} }`)
   }
   return args
+}
+
+export function mcpSecretAlias(serverIndex: number, keyIndex: number): string {
+  return 'MAESTRO_MCP_SECRET_' + String(serverIndex) + '_' + String(keyIndex)
+}
+
+/** Values travel only in the Codex process environment; never argv or disk. */
+export function codexMcpEnv(servers: Parameters<typeof codexMcpArgs>[0]): Record<string, string> {
+  const env: Record<string, string> = {}
+  for (const [index, server] of servers.entries()) {
+    if (server.transport === 'http' || server.command.trim() === '') continue
+    Object.values(server.env).forEach((value, keyIndex) => { env[mcpSecretAlias(index, keyIndex)] = value })
+  }
+  return env
 }
 
 /** Environment overlays for pointing codex at an OpenAI-compatible provider. */
@@ -382,7 +400,7 @@ export async function runCodexTask(options: {
   if (options.thinking !== undefined && options.thinking !== '' && !(CODEX_REASONING_EFFORTS as readonly string[]).includes(options.thinking)) {
     options.onEvent('note', `思考档位 "${options.thinking}" 不受 codex model_reasoning_effort 支持，已忽略（沿用 CLI 默认）`)
   }
-  const env = codexEnv(options.baseUrl, options.apiKey)
+  const env = { ...codexEnv(options.baseUrl, options.apiKey), ...codexMcpEnv(options.mcpServers ?? []) }
   if (options.dshModel !== undefined) env['MAESTRO_DSH_PROVIDER_KEY'] = options.dshModel.apiKey
 
   let finalText = ''

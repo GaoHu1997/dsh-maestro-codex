@@ -14,9 +14,9 @@
  * readable contrast on both light and dark shells.
  */
 
-import { useCallback, useEffect, useState, useSyncExternalStore, type CSSProperties, type ReactNode } from 'react'
+import { useCallback, useEffect, useRef, useState, useSyncExternalStore, type CSSProperties, type ReactNode } from 'react'
 import {
-  cancelTask, fetchCliVersions, fetchHint, fetchModels, fetchOverview, fetchTaskDetail,
+  cancelTask, fetchTasks, fetchCliVersions, fetchHint, fetchModels, fetchOverview, fetchTaskDetail,
   installCli, refreshCli, uninstallCli, type Call,
 } from './api.js'
 import { cliMinTaskDifficulty, fieldText, type MaestroFormActions, type MaestroFormState, type MaestroStore, type SectionValue, type StagedField } from './form.js'
@@ -24,7 +24,8 @@ import { formatDuration, formatTokens } from './board/model.js'
 import type { BoardHost } from './board/data.js'
 import { EXECUTOR_BRANDS } from './board/accent.js'
 import { needsPerson } from '../stage.js'
-import { useUsageSummary } from './usage-panel.js'
+import { useActiveCliAccess } from './access.js'
+import { usageTokenLabel, useUsageSummary } from './usage-panel.js'
 import {
   cleanLogText, CLI_LABELS, CLI_PACKAGES, MAESTRO_CLI_IDS, MAESTRO_STAGE_LABELS, summarizeError, TASK_TYPE_CATALOG, TASK_TYPE_DESCRIPTIONS, TERMINAL_PHASES,
   type DshProviderModels, type MaestroCliId, type MaestroCliStatus, type MaestroCliVersions, type MaestroOverview, type MaestroPhase,
@@ -537,7 +538,8 @@ export function UsageGroup(props: { ctx: BoardHost | undefined }): ReactNode {
   const usage = useUsageSummary(props.ctx ?? NO_HOST)
   return (
     <div className="dmc-group">
-      <p className="dmc-grouptitle">用量统计（最近 7 天）</p>
+      <p className="dmc-grouptitle">用量统计（最近 7 个自然日）</p>
+      <span className="dmc-hint">有限可见样本：每会话仅最近 20 次结算；调用和用量为可见样本下限，不代表完整周总量。各 token 桶独立统计，不重复相加。</span>
       {usage.requests === 0 ? (
         <span className="dmc-hint">近 7 天还没有 CLI 调用。每次派发结算后计入所属会话的 maestroCliUsage 投影（每会话保留最近 20 次明细）。</span>
       ) : (
@@ -547,7 +549,7 @@ export function UsageGroup(props: { ctx: BoardHost | undefined }): ReactNode {
             <StateChip tone="ok">{`成功 ${String(usage.ok)}`}</StateChip>
             {usage.failed > 0 && <StateChip tone="err">{`失败 ${String(usage.failed)}`}</StateChip>}
             {usage.cancelled > 0 && <StateChip tone="idle">{`取消 ${String(usage.cancelled)}`}</StateChip>}
-            <StateChip tone="idle">{`入 ${formatTokens(usage.inputTokens)} · 出 ${formatTokens(usage.outputTokens)} · 缓存 ${formatTokens(usage.cachedInputTokens)}`}</StateChip>
+            <StateChip tone="idle">{`入 ${usageTokenLabel(usage.inputTokens, usage.knownTokens.inputTokens)} · 出 ${usageTokenLabel(usage.outputTokens, usage.knownTokens.outputTokens)} · 缓存读 ${usageTokenLabel(usage.cachedInputTokens, usage.knownTokens.cachedInputTokens)} · 缓存写 ${usageTokenLabel(usage.cacheWriteTokens, usage.knownTokens.cacheWriteTokens)}`}</StateChip>
             <StateChip tone="idle">{`总耗时 ${formatDuration(usage.durationMs)}`}</StateChip>
           </div>
           {MAESTRO_CLI_IDS.map(cli => {
@@ -559,7 +561,7 @@ export function UsageGroup(props: { ctx: BoardHost | undefined }): ReactNode {
                 <span>{`调用 ${String(bucket.requests)}`}</span>
                 <span>{`成功 ${String(bucket.ok)}`}</span>
                 {bucket.failed > 0 && <span style={{ color: 'var(--dmc-danger)' }}>{`失败 ${String(bucket.failed)}`}</span>}
-                <span>{`入 ${formatTokens(bucket.inputTokens)} · 出 ${formatTokens(bucket.outputTokens)}`}</span>
+                <span>{`入 ${usageTokenLabel(bucket.inputTokens, bucket.knownTokens.inputTokens)} · 出 ${usageTokenLabel(bucket.outputTokens, bucket.knownTokens.outputTokens)} · 缓存读 ${usageTokenLabel(bucket.cachedInputTokens, bucket.knownTokens.cachedInputTokens)} · 缓存写 ${usageTokenLabel(bucket.cacheWriteTokens, bucket.knownTokens.cacheWriteTokens)}`}</span>
                 <span>{`累计 ${formatDuration(bucket.durationMs)}`}</span>
               </div>
             )
@@ -698,8 +700,18 @@ export function sdkActionButtons(input: {
 }
 
 export function MaestroCard(props: MaestroCardProps): ReactNode {
+  const access = useActiveCliAccess()
+  return <MaestroCardContent key={JSON.stringify([access?.sessionId, access?.token])} {...props} />
+}
+
+function MaestroCardContent(props: MaestroCardProps): ReactNode {
   useStyles()
   const form = useStore(props.maestroStore)
+  const access = useActiveCliAccess()
+  const accessKey = JSON.stringify([access?.sessionId, access?.token])
+  const currentAccess = useRef(accessKey)
+  currentAccess.current = accessKey
+  const [authorized, setAuthorized] = useState<{ key: string; tasks: MaestroTaskSummary[] } | undefined>()
   const actions = props.maestro
   const values = form.values
 
@@ -750,6 +762,26 @@ export function MaestroCard(props: MaestroCardProps): ReactNode {
     const timer = setInterval(() => { void pollOverview() }, 4000)
     return () => { clearInterval(timer) }
   }, [pollOverview])
+
+  useEffect(() => {
+    let disposed = false
+    setAuthorized(undefined)
+    setSelectedId('')
+    setDetail(undefined)
+    setNotice('')
+    setBusy('')
+    if (access === undefined) return
+    const controller = new AbortController()
+    const tick = async (): Promise<void> => {
+      const result = await fetchTasks(undefined, access, controller.signal)
+      if (disposed || currentAccess.current !== accessKey) return
+      if (result.ok) setAuthorized({ key: accessKey, tasks: result.tasks })
+      else { setAuthorized(undefined); setNotice(result.error) }
+    }
+    void tick()
+    const timer = setInterval(() => { void tick() }, 4000)
+    return () => { disposed = true; controller.abort(); clearInterval(timer) }
+  }, [accessKey])
 
   // The dsh model catalog: loaded once per card mount (the pickers' options).
   useEffect(() => {
@@ -802,8 +834,8 @@ export function MaestroCard(props: MaestroCardProps): ReactNode {
     let cursor = 0
     let timer: ReturnType<typeof setInterval> | undefined
     const tick = async (): Promise<void> => {
-      const result = await fetchTaskDetail(selectedId, cursor)
-      if (disposed || !result.ok) return
+      const result = await fetchTaskDetail(selectedId, cursor, undefined, access)
+      if (disposed || currentAccess.current !== accessKey || !result.ok) return
       const { ok: _ok, ...rest } = result
       cursor = rest.nextCursor
       setDetail(previous => mergeTaskDetail(previous, rest))
@@ -815,13 +847,15 @@ export function MaestroCard(props: MaestroCardProps): ReactNode {
     void tick()
     timer = setInterval(() => { void tick() }, 2000)
     return () => { disposed = true; if (timer !== undefined) clearInterval(timer) }
-  }, [selectedId])
+  }, [selectedId, accessKey])
 
   /** Run one route call under the global busy flag; errors land in `notice`. */
   async function withBusy<T>(label: string, run: () => Promise<Call<T>>): Promise<Call<T>> {
+    const requestAccess = accessKey
     setBusy(label)
     setNotice('')
     const result = await run()
+    if (currentAccess.current !== requestAccess) return result
     setBusy('')
     if (result.ok) void pollOverview()
     else setNotice(result.error)
@@ -861,7 +895,8 @@ export function MaestroCard(props: MaestroCardProps): ReactNode {
 
   const refreshAll = (): void => { void withBusy('refresh', () => refreshCli()) }
 
-  const tasks = overview?.tasks ?? []
+  const privateTasks = authorized?.key === accessKey ? authorized.tasks : []
+  const tasks = [...privateTasks, ...(overview?.tasks ?? []).filter(task => !privateTasks.some(entry => entry.id === task.id))]
   const activeCount = tasks.filter(task => task.phase === 'running' || task.phase === 'queued').length
   const recentTasks = tasks.filter(task => task.phase !== 'running' && task.phase !== 'queued').slice(0, 8)
   const visibleTasks = showAllTasks ? tasks : [...tasks.filter(task => task.phase === 'running' || task.phase === 'queued'), ...recentTasks]
@@ -1410,25 +1445,14 @@ export function MaestroCard(props: MaestroCardProps): ReactNode {
                     hint="失败后自动重跑次数（0–2）。会改文件的任务不重试；超时与取消不重试。"
                   />
                   <StagedInput
-                    label="Claude 连续无输出超时（分钟）"
-                    field="claudeTimeoutMinutes"
+                    label="连续无输出超时（分钟）"
+                    field="timeoutMinutes"
                     state={form}
                     actions={actions}
                     placeholder="20"
-                    hint="1–240，连续无输出达到该时长才终止；不是总运行时限"
-                  />
-                  <StagedInput
-                    label="Codex 连续无输出超时（分钟）"
-                    field="codexTimeoutMinutes"
-                    state={form}
-                    actions={actions}
-                    placeholder="20"
-                    hint="1–240，连续无输出达到该时长才终止；不是总运行时限"
+                    hint="1–240，claude / codex 共用；连续无输出达到该时长才终止，不是总运行时限"
                   />
                 </div>
-                <span className="dmc-hint">
-                  最低任务难度在「CLI 管理」按 CLI 设置；未达门槛自动改用 dsh 子代理，不换门槛更低的 CLI 绕过。低=问答/小改，中=多步任务，高=跨模块重构，极高=系统级设计。
-                </span>
               </div>
               <div className="dmc-group">
                 <p className="dmc-grouptitle">工具注入</p>
@@ -1558,7 +1582,7 @@ export function MaestroCard(props: MaestroCardProps): ReactNode {
                             className="dmc-btn dmc-btn-sm dmc-btn-danger"
                             onClick={event => {
                               event.stopPropagation()
-                              void withBusy(`cancel-${task.id}`, () => cancelTask(task.id))
+                              void withBusy(`cancel-${task.id}`, () => cancelTask(task.id, undefined, access))
                             }}
                           >取消</button>
                         )

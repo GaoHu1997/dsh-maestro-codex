@@ -8,11 +8,23 @@ const RECORD: CliUsageRecord = { taskId: 'task-1', cli: 'codex', model: 'm', pha
 const MARKER = { version: 1, kind: 'cli-record', executor: 'external-cli', taskId: 'task-1', parentSessionId: 'parent-A', childSessionId: 'cli-task-1', usageId: 'usage-1', source: 'cli:codex', nativeInputSemantics: 'uncached', nativeUsageAvailable: true }
 const HEADER: SessionHeader = { version: 4, id: SessionId('cli-task-1'), parentSession: SessionId('parent-A'), origin: 'subagent', isSeeded: false, createdAt: 888 }
 const USAGE = { inputTokens: 10, outputTokens: 3, cacheReadTokens: 2 }
-const event = (seq: number, type: string, data: unknown, surface = false): SessionEvent => ({ seq, time: 1000 + seq, type, data, ...(surface ? { surfaceOp: 'append' } : {}) }) as SessionEvent
+const event = (seq: number, type: string, data: unknown, surface = false): SessionEvent => ({ seq, time: 1000 + seq, type, data, ...(surface ? { surfaceOp: 'append' } : {}), ...(type === 'maestro/cli-child' ? { ignorable: true } : {}) }) as SessionEvent
 interface Snapshot { session: SessionHeader; inheritedEventCount: number; events: SessionEvent[] }
 function cold(withUsage = true): Snapshot {
-  return { session: HEADER, inheritedEventCount: 0, events: [event(0, 'user/message', { id: 'original-task', role: 'user', content: [{ type: 'text', text: 'real historical task' }], source: { kind: 'user' } }, true), event(1, 'request/context', { provider: 'p', model: 'm' }), event(2, 'maestro/cli-child', MARKER), ...(withUsage ? [event(3, 'step/start', { turn: 1, step: 1 }), event(4, 'assistant/attempt', { turn: 1, step: 1, stream: [{ type: 'chunk', time: 1004, chunk: { type: 'usage', usage: USAGE } }] })] : [])] }
+  const events = [
+    event(0, 'user/message', { id: 'original-task', role: 'user', content: [{ type: 'text', text: 'real historical task' }], source: { kind: 'user' } }, true),
+    event(1, 'maestro/cli-child', MARKER),
+  ]
+  if (withUsage) events.push(
+    event(2, 'turn/start', { turn: 1 }), event(3, 'request/context', { provider: 'p', model: 'm' }),
+    event(4, 'step/start', { turn: 1, step: 1 }),
+    event(5, 'assistant/attempt', { turn: 1, step: 1, stream: [{ type: 'chunk', time: 1005, chunk: { type: 'usage', usage: USAGE } }] }),
+    event(6, 'step/end', { turn: 1, step: 1 }), event(7, 'turn/end', { turn: 1, reason: { kind: 'completed' } }),
+  )
+  return { session: HEADER, inheritedEventCount: 0, events }
 }
+const OBSERVATION_TYPES = ['turn/start', 'request/context', 'maestro/cli-child', 'step/start', 'assistant/attempt', 'step/end', 'turn/end']
+function reseq(events: SessionEvent[]): SessionEvent[] { return events.map((entry, seq) => ({ ...entry, seq } as SessionEvent)) }
 /** M public faces plus real Session schema; NOT an actual backend/host R test.
  * The fake no-overwrite/flush barrier is explicit and cannot certify the SDK. */
 function harness() {
@@ -118,15 +130,96 @@ function withRead(h: ReturnType<typeof harness>, readSession: NativeRecoveryQuer
 }
 
 describe('M: plugin-only recovery with explicit public writer barrier (not deployed host R)', () => {
-  it('writes only four real count observations, flushes, closes, verifies query, then makes live', async () => {
+  it.each([
+    ['done', { kind: 'completed' }],
+    ['failed', { kind: 'error', error: { code: 'CLI_FAILED' } }],
+    ['timeout', { kind: 'error', error: { code: 'CLI_TIMEOUT' } }],
+    ['cancelled', { kind: 'aborted', reason: { kind: 'legacy' } }],
+  ] as const)('closes the new observation with the actual %s terminal reason', async (phase, reason) => {
+    const h = harness()
+    expect((await new NativeRecovery(h.parts).recover({ ...RECORD, phase })).status).toBe('recovered')
+    const saved = h.physical.get(HEADER.id) as Snapshot
+    expect(saved.session.delegationDepth).toBe(0)
+    expect(saved.events.at(-1)).toMatchObject({ type: 'turn/end', data: { turn: 1, reason } })
+    expect(h.states.get(HEADER.id)?.acceptedUsages).toHaveLength(1)
+  })
+  it.each([6, 7])('closes a matching usage prefix of length %s without appending another charge', async length => {
+    const h = harness(), prior = cold()
+    prior.events = prior.events.slice(0, length)
+    const before = structuredClone(prior); h.physical.set(HEADER.id, prior)
+    expect((await new NativeRecovery(h.parts).recover(RECORD)).status).toBe('recovered')
+    const saved = h.physical.get(HEADER.id) as Snapshot
+    expect(saved.session).toEqual(before.session); expect(saved.inheritedEventCount).toBe(before.inheritedEventCount)
+    expect(saved.events.slice(0, length)).toEqual(before.events)
+    expect(saved.events.slice(length).map(e => e.type)).toEqual(length === 6 ? ['step/end', 'turn/end'] : ['turn/end'])
+    expect(saved.events.at(-1)).toMatchObject({ data: { turn: 1, reason: { kind: 'completed' } } })
+    expect(h.states.get(HEADER.id)?.usageEventCount).toBe(1)
+    expect(h.states.get(HEADER.id)?.acceptedUsages).toHaveLength(1)
+    const finished = structuredClone(saved), counts = h.counts(); h.live.delete(HEADER.id)
+    expect((await new NativeRecovery(h.parts).recover(RECORD)).reason).toBe('preserved-old-seed-no-recharge')
+    expect(h.physical.get(HEADER.id)).toEqual(finished)
+    expect(h.counts().opens).toBe(counts.opens); expect(h.counts().writerCreates).toBe(0)
+  })
+  it.each([4, 5, 8])('supplements a valid zero-usage prefix of length %s in the next turn', async length => {
+    const h = harness(), prior = cold()
+    prior.events[5] = event(5, 'assistant/attempt', { turn: 1, step: 1, stream: [] })
+    prior.events = prior.events.slice(0, length)
+    const before = structuredClone(prior); h.physical.set(HEADER.id, prior)
+    expect((await new NativeRecovery(h.parts).recover(RECORD)).status).toBe('recovered')
+    const saved = h.physical.get(HEADER.id) as Snapshot
+    expect(saved.events.slice(0, length)).toEqual(before.events)
+    const closers = length === 4 ? ['turn/end'] : length === 5 ? ['step/end', 'turn/end'] : []
+    const suffix = saved.events.slice(length)
+    expect(suffix.map(e => e.type)).toEqual([...closers, ...OBSERVATION_TYPES])
+    if (closers.length) expect(suffix[closers.length - 1]).toMatchObject({ data: { turn: 1, reason: { kind: 'interrupted' } } })
+    expect(suffix[closers.length]).toMatchObject({ type: 'turn/start', data: { turn: 2 } })
+    expect(suffix.find(e => e.type === 'step/start')).toMatchObject({ data: { turn: 2, step: 1 } })
+    expect(h.states.get(HEADER.id)?.usageEventCount).toBe(1)
+    expect(h.states.get(HEADER.id)?.acceptedUsages).toHaveLength(1)
+  })
+  it.each(['legacy-four-events', 'context-outside-turn', 'nested-turn', 'mismatched-step-end'])('requires migration for invalid stored lifecycle %s without any writer', async kind => {
+    const h = harness(), prior = cold()
+    if (kind === 'legacy-four-events') prior.events = reseq([prior.events[3]!, prior.events[1]!, prior.events[4]!, prior.events[5]!])
+    if (kind === 'context-outside-turn') prior.events = reseq([...cold(false).events, prior.events[3]!])
+    if (kind === 'nested-turn') prior.events = reseq([...prior.events.slice(0, 3), event(3, 'turn/start', { turn: 2 })])
+    if (kind === 'mismatched-step-end') prior.events[6] = event(6, 'step/end', { turn: 1, step: 2 })
+    const before = structuredClone(prior); h.physical.set(HEADER.id, prior)
+    expect(await new NativeRecovery(h.parts).recover(RECORD)).toMatchObject({ status: 'failed', reason: 'stored-session-lifecycle-invalid-migration-required' })
+    expect(h.physical.get(HEADER.id)).toEqual(before)
+    expect(h.trace).toEqual(['query']); expect(h.creations).toHaveLength(0)
+  })
+  it.each([
+    { name: 'SessionFormatError', message: 'request/context is outside an open turn' },
+    { code: 'SESSION_FORMAT_ERROR' },
+    { code: 'M_QUERY_NOT_FOUND', cause: new Error('wrapped decoder failure', { cause: { name: 'SessionFormatError' } }) },
+  ])('reports a decoder format failure even when NotFound is claimed: %j', async error => {
+    const h = harness(), before = cold(); h.physical.set(HEADER.id, before)
+    const parts = { ...withRead(h, async () => { throw error }), isNotFound: () => true }
+    expect(await new NativeRecovery(parts).recover(RECORD)).toMatchObject({ status: 'failed', reason: 'stored-session-format-invalid-migration-required' })
+    expect(h.physical.get(HEADER.id)).toEqual(before)
+    expect(h.counts().writerCreates).toBe(0); expect(h.counts().opens).toBe(0); expect(h.creations).toHaveLength(0)
+  })
+  it.each([{ usageId: 'different-spend' }, { source: 'cli:claude' }])('refuses changed cold marker identity %j before a writer', async fields => {
+    const h = harness(), prior = cold()
+    prior.events[1] = event(1, 'maestro/cli-child', { ...MARKER, ...fields }); h.physical.set(HEADER.id, prior)
+    expect((await new NativeRecovery(h.parts).recover(RECORD)).reason).toBe('cold-identity-or-seed-invalid')
+    expect(h.counts().opens).toBe(0); expect(h.creations).toHaveLength(0)
+  })
+  it('never appends a different cumulative sample to an already charged open prefix', async () => {
+    const h = harness(), prior = cold(); prior.events = prior.events.slice(0, 6)
+    const before = structuredClone(prior); h.physical.set(HEADER.id, prior)
+    expect((await new NativeRecovery(h.parts).recover({ ...RECORD, inputTokens: 999 })).reason).toBe('cold-native-usage-unknown-or-conflicting')
+    expect(h.physical.get(HEADER.id)).toEqual(before); expect(h.counts().opens).toBe(0); expect(h.creations).toHaveLength(0)
+  })
+  it('writes a complete native observation turn, flushes, closes, verifies query, then makes live', async () => {
     const h = harness(), result = await new NativeRecovery(h.parts).recover(RECORD)
     expect(result).toMatchObject({ status: 'recovered', mode: 'canonical-observation', nativeUsageAccepted: true, nativeWriteFlushed: true })
     expect(h.trace).toEqual(['query', 'create', 'append', 'flush', 'close', 'verify', 'store:create'])
     const events = h.logs.get('cli-task-1') ?? []
-    expect(events.map(e => e.type)).toEqual(['request/context', 'maestro/cli-child', 'step/start', 'assistant/attempt'])
-    expect(events[1]?.ignorable).toBe(true)
+    expect(events.map(e => e.type)).toEqual(OBSERVATION_TYPES)
+    expect(events[2]?.ignorable).toBe(true)
     expect(events.filter(e => e.ignorable === true).map(e => e.type)).toEqual(['maestro/cli-child'])
-    expect(events[1]?.data).toMatchObject({ recoveredFrom: 'canonical', transcriptRecovered: false, parentAndNativeSameSpend: true, usageId: 'usage-1' })
+    expect(events[2]?.data).toMatchObject({ recoveredFrom: 'canonical', transcriptRecovered: false, parentAndNativeSameSpend: true, usageId: 'usage-1' })
     expect(h.states.get('cli-task-1')?.acceptedUsages).toHaveLength(1)
     expect(events.find(e => e.type === 'assistant/message' || e.type === 'user/message')).toBeUndefined()
     expect(h.counts()).toMatchObject({ released: 1, writerCreates: 1, opens: 0 }); expect(h.owned.size).toBe(0)
@@ -146,7 +239,7 @@ describe('M: plugin-only recovery with explicit public writer barrier (not deplo
   it('serialises repeated/concurrent child recovery without extra native charge or writer', async () => {
     const h = harness(), r = new NativeRecovery(h.parts)
     expect((await Promise.all([r.recover(RECORD), r.recover(RECORD), r.recover(RECORD)])).map(x => x.status)).toEqual(['recovered', 'already-present', 'already-present'])
-    expect(h.creations).toHaveLength(1); expect(h.logs.get('cli-task-1')).toHaveLength(4); expect(h.counts().writerCreates).toBe(1)
+    expect(h.creations).toHaveLength(1); expect(h.logs.get('cli-task-1')).toHaveLength(7); expect(h.counts().writerCreates).toBe(1)
   })
   it.each([{ inputTokens: null }, { outputTokens: null }, { inputSemantics: 'unknown' }, { provider: '' }, { parentSessionId: 'other' }, { childSessionId: 'cli-other' }, { inputTokens: 1.5 }])('skips partial/invalid canonical fields %j', async fields => {
     const h = harness()
@@ -168,8 +261,8 @@ describe('M: plugin-only recovery with explicit public writer barrier (not deplo
     const now = h.physical.get(HEADER.id) as Snapshot
     expect(now.session).toEqual(before.session); expect(now.inheritedEventCount).toBe(before.inheritedEventCount)
     expect(now.events.slice(0, before.events.length)).toEqual(before.events)
-    expect(now.events.slice(before.events.length).map(e => e.seq)).toEqual([3, 4, 5, 6])
-    expect(now.events.slice(before.events.length).map(e => e.type)).toEqual(['request/context', 'maestro/cli-child', 'step/start', 'assistant/attempt'])
+    expect(now.events.slice(before.events.length).map(e => e.seq)).toEqual([2, 3, 4, 5, 6, 7, 8])
+    expect(now.events.slice(before.events.length).map(e => e.type)).toEqual(OBSERVATION_TYPES)
     expect(h.creations[0]?.seed).toEqual(now.events); expect(h.states.get(HEADER.id)?.acceptedUsages).toHaveLength(1)
     expect(h.counts()).toMatchObject({ released: 1, opens: 1, writerCreates: 0 })
   })
@@ -190,7 +283,9 @@ describe('M: plugin-only recovery with explicit public writer barrier (not deplo
   })
   it('one matching cold sample cannot mask duplicate or unknown extra usage', async () => {
     for (const usage of [USAGE, { inputTokens: null, outputTokens: 3 }]) {
-      const h = harness(), prior = cold(); prior.events.push(event(5, 'assistant/attempt', { stream: [{ type: 'chunk', time: 1004, chunk: { type: 'usage', usage } }] })); h.physical.set(HEADER.id, prior)
+      const h = harness(), prior = cold()
+      prior.events = reseq([...prior.events.slice(0, 6), event(6, 'assistant/attempt', { turn: 1, step: 1, stream: [{ type: 'chunk', time: 1006, chunk: { type: 'usage', usage } }] }), ...prior.events.slice(6)])
+      h.physical.set(HEADER.id, prior)
       expect((await new NativeRecovery(h.parts).recover(RECORD)).reason).toBe('cold-native-usage-unknown-or-conflicting')
       expect(h.creations).toHaveLength(0)
     }
@@ -222,7 +317,7 @@ describe('M: plugin-only recovery with explicit public writer barrier (not deplo
     const h = harness()
     const results = await Promise.all([new NativeRecovery(h.parts).recover(RECORD), new NativeRecovery(h.parts).recover(RECORD)])
     expect(results.map(x => x.status).sort()).toEqual(['failed', 'recovered'])
-    expect(h.creations).toHaveLength(1); expect((h.physical.get(HEADER.id) as Snapshot).events).toHaveLength(4)
+    expect(h.creations).toHaveLength(1); expect((h.physical.get(HEADER.id) as Snapshot).events).toHaveLength(7)
     expect(h.counts().released).toBe(1); expect(h.owned.size).toBe(0)
   })
   it('a final publish competitor after create is not overwritten', async () => {
@@ -271,7 +366,7 @@ describe('M: plugin-only recovery with explicit public writer barrier (not deplo
       return value
     })
     expect((await new NativeRecovery(parts).recover(RECORD)).reason).toBe('flushed-observation-query-mismatch')
-    expect((h.physical.get(HEADER.id) as Snapshot).events).toHaveLength(4); expect(h.creations).toHaveLength(0)
+    expect((h.physical.get(HEADER.id) as Snapshot).events).toHaveLength(7); expect(h.creations).toHaveLength(0)
   })
   it.each(['query', 'create', 'append', 'flush', 'close', 'verify'])('checks monotonic binding epoch after await at %s', async stage => {
     const h = harness(); h.onStage(name => { if (name === stage) h.bumpVersion() })
@@ -315,7 +410,11 @@ describe('M: plugin-only recovery with explicit public writer barrier (not deplo
   })
   it('preserves existing final text and never invents a task/final response in the suffix', async () => {
     const h = harness(), prior = cold(false)
-    prior.events.push(event(3, 'assistant/message', { message: { id: 'kept-final', role: 'assistant', content: [{ type: 'text', text: 'existing final text' }], source: { kind: 'model', provider: 'p', model: 'm' } }, turn: 1, step: 1, stream: [] }, true))
+    prior.events.push(
+      event(2, 'turn/start', { turn: 1 }), event(3, 'request/context', { provider: 'p', model: 'm' }), event(4, 'step/start', { turn: 1, step: 1 }),
+      event(5, 'assistant/message', { message: { id: 'kept-final', role: 'assistant', content: [{ type: 'text', text: 'existing final text' }], source: { kind: 'model', provider: 'p', model: 'm' } }, turn: 1, step: 1, stream: [] }, true),
+      event(6, 'step/end', { turn: 1, step: 1 }), event(7, 'turn/end', { turn: 1, reason: { kind: 'completed' } }),
+    )
     const before = structuredClone(prior); h.physical.set(HEADER.id, prior)
     const result = await new NativeRecovery(h.parts).recover(RECORD)
     expect(result, `${h.schemaErrors.join('\n')}\n${h.trace.join(',')}`).toMatchObject({ status: 'recovered' })
@@ -334,7 +433,7 @@ describe('M: plugin-only recovery with explicit public writer barrier (not deplo
     const h = harness(); h.physical.set(HEADER.id, cold(false))
     const results = await Promise.all([new NativeRecovery(h.parts).recover(RECORD), new NativeRecovery(h.parts).recover(RECORD)])
     expect(results.map(x => x.status).sort()).toEqual(['failed', 'recovered'])
-    expect((h.physical.get(HEADER.id) as Snapshot).events).toHaveLength(7); expect(h.counts().released).toBe(1)
+    expect((h.physical.get(HEADER.id) as Snapshot).events).toHaveLength(9); expect(h.counts().released).toBe(1)
   })
   it('native writer busy respects foreign ownership without appending or claiming success', async () => {
     const h = harness(), prior = cold(false), before = structuredClone(prior); h.physical.set(HEADER.id, prior); h.owned.add(HEADER.id)
@@ -351,7 +450,7 @@ describe('M: plugin-only recovery with explicit public writer barrier (not deplo
       if (change === 'reordered') prior.events.reverse()
     } })
     expect((await new NativeRecovery(h.parts).recover(RECORD)).reason).toBe('cold-prefix-changed-or-incomplete')
-    expect(h.readWindows).toEqual([{ offset: 0, length: 4 }]); expect(h.trace).not.toContain('append'); expect(h.owned.size).toBe(0)
+    expect(h.readWindows).toEqual([{ offset: 0, length: 3 }]); expect(h.trace).not.toContain('append'); expect(h.owned.size).toBe(0)
   })
   it('unknown trailing usage appearing before bounded read is never supplemented', async () => {
     const h = harness(), prior = cold(false); h.physical.set(HEADER.id, prior)
@@ -362,7 +461,7 @@ describe('M: plugin-only recovery with explicit public writer barrier (not deplo
     const h = harness(), prior = cold(false); h.physical.set(HEADER.id, prior)
     h.onStage(stage => { if (stage === 'append') prior.events.push(event(3, 'request/context', { provider: 'other', model: 'm' })) })
     expect((await new NativeRecovery(h.parts).recover(RECORD)).status).toBe('failed')
-    expect(prior.events).toHaveLength(4); expect(h.trace).not.toContain('flush'); expect(h.creations).toHaveLength(0); expect(h.owned.size).toBe(0)
+    expect(prior.events).toHaveLength(3); expect(h.trace).not.toContain('flush'); expect(h.creations).toHaveLength(0); expect(h.owned.size).toBe(0)
   })
   it('a live session appearing during bounded read closes cold writer without appending', async () => {
     const h = harness(); h.physical.set(HEADER.id, cold(false))
@@ -404,7 +503,7 @@ describe('M: plugin-only recovery with explicit public writer barrier (not deplo
       return value
     })
     expect((await new NativeRecovery(parts).recover(RECORD)).reason).toBe('flushed-existing-observation-query-mismatch')
-    expect((h.physical.get(HEADER.id) as Snapshot).events).toHaveLength(7); expect(h.creations).toHaveLength(0)
+    expect((h.physical.get(HEADER.id) as Snapshot).events).toHaveLength(9); expect(h.creations).toHaveLength(0)
   })
   it('rechecks live after durable write/query and refuses foreign replacement', async () => {
     const h = harness(); h.onStage(name => { if (name === 'verify') h.store.create(HEADER.id, { meta: { parentSession: SessionId('foreign'), origin: 'subagent' } }) })

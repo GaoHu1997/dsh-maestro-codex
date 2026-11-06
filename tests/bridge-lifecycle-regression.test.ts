@@ -22,7 +22,7 @@ describe('bridge authority ends before terminal publication', () => {
     cleanup.entered = false
     cleanup.release = undefined
     const config = withTestDshRoutes(effectiveOf({ claudeCliPath: process.execPath, injectGitContext: false, bridgeSkills: false, bridgeTools: 'custom', bridgeToolAllowlist: ['read'], failureRetries: 0 }))
-    config.claude.timeoutMinutes = 0.001
+    config.timeoutMinutes = 0.001
     const controller = new AbortController()
     const state = new BridgeState()
     const execute = vi.fn(async () => ({ content: [{ type: 'text', text: 'synthetic tool result' }] }))

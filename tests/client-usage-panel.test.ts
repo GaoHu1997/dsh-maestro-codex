@@ -94,6 +94,6 @@ describe('summarizeUsage', () => {
   it('ignores malformed records instead of throwing', () => {
     const broken = { recent: [undefined, { taskId: 'x' }, null], totals: undefined } as unknown as CliUsageState
     expect(summarizeUsage([broken], NOW).requests).toBe(0)
-    expect(summarizeUsage([state([record({ taskId: 'ok', durationMs: -5, inputTokens: Number.NaN })])], NOW).inputTokens).toBe(0)
+    expect(summarizeUsage([state([record({ taskId: 'ok', cli: 'claude', durationMs: -5, inputTokens: Number.NaN })])], NOW).inputTokens).toBeNull()
   })
 })

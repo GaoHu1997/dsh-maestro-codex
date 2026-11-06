@@ -5,7 +5,7 @@
  */
 import { isDeepStrictEqual } from 'node:util'
 import { SessionId, SessionLogOffset, SessionSeq, type CreateSessionOptions, type Session, type SessionEvent, type SessionHeader } from '@deepseek-ai/dsh-session'
-import { CLI_CHILD_RECORD_EVENT } from './child-session.js'
+import { CLI_CHILD_RECORD_EVENT, cliChildTurnEndReason } from './child-session.js'
 import { applyCliRecordEvent, cliRecordNativeUsageOf, cliRecordStateOf, initCliRecordState, type CliRecordAcceptedUsage, type CliRecordNativeUsage, type CliRecordState } from './cli-record-projection.js'
 import { cliUsageIdentityOf, parseCliUsageRecord, type CliUsageRecord } from './usage.js'
 
@@ -90,7 +90,8 @@ interface Eligible {
   readonly provider: string
   readonly usage: CliRecordNativeUsage
 }
-interface Seed { readonly header: SessionHeader; readonly events: readonly SessionEvent[]; readonly cut: number; readonly state: CliRecordState }
+interface Lifecycle { readonly turn: number; readonly step: number; readonly openTurn: boolean; readonly openStep: boolean }
+interface Seed { readonly header: SessionHeader; readonly events: readonly SessionEvent[]; readonly cut: number; readonly state: CliRecordState; readonly lifecycle: Lifecycle | undefined }
 interface Binding {
   readonly store: NativeRecoveryStore
   readonly query: NativeRecoveryQuery
@@ -125,6 +126,39 @@ function sameSample(sample: CliRecordAcceptedUsage, row: Eligible): boolean {
 function onlySample(state: CliRecordState, row: Eligible): boolean {
   return state.usageEventCount === 1 && state.acceptedUsages.length === 1 && state.acceptedUsages.some(sample => sameSample(sample, row))
 }
+function lifecycleOf(events: readonly SessionEvent[]): Lifecycle | undefined {
+  let turn = 0, step = 0, openTurn = false, openStep = false
+  for (const event of events) {
+    const data: unknown = event.data
+    if (event.type === 'turn/start') {
+      if (openTurn || !object(data) || !count(data.turn) || data.turn !== turn + 1) return undefined
+      turn = data.turn; step = 0; openTurn = true
+    } else if (event.type === 'step/start') {
+      if (!openTurn || openStep || !object(data) || data.turn !== turn || data.step !== step + 1) return undefined
+      step++; openStep = true
+    } else if (event.type === 'step/end') {
+      if (!openStep || !object(data) || data.turn !== turn || data.step !== step) return undefined
+      openStep = false
+    } else if (event.type === 'turn/end') {
+      if (!openTurn || openStep || !object(data) || data.turn !== turn) return undefined
+      openTurn = false
+    } else if (event.type === 'request/context' || event.type === 'request/header') {
+      if (!openTurn) return undefined
+    } else if (event.type === 'assistant/attempt' || event.type === 'assistant/message' || event.type === 'tool/call' || event.type === 'tool/result') {
+      if (!openStep || !object(data) || data.turn !== turn || data.step !== step) return undefined
+    }
+  }
+  return { turn, step, openTurn, openStep }
+}
+function storedFormatFailure(error: unknown): boolean {
+  // Public query implementations may retain the decoder error as a cause.
+  const seen = new Set<unknown>()
+  for (let value = error; object(value) && !seen.has(value); value = value.cause) {
+    seen.add(value)
+    if (value.name === 'SessionFormatError' || value.code === 'SESSION_FORMAT_ERROR') return true
+  }
+  return false
+}
 function seedOf(value: unknown, row: Eligible): Seed | undefined {
   if (!object(value) || !object(value.session) || !Array.isArray(value.events) || !count(value.inheritedEventCount)) return undefined
   const header = value.session
@@ -143,8 +177,9 @@ function seedOf(value: unknown, row: Eligible): Seed | undefined {
     if (!object(event) || event.seq !== index || !count(event.time) || !text(event.type) || !Object.prototype.hasOwnProperty.call(event, 'data')) return undefined
     state = applyCliRecordEvent(state, { seq: index, type: event.type, data: event.data })
   }
-  if (state.marker === null || state.marker.taskId !== row.record.taskId) return undefined
-  return { header: header as unknown as SessionHeader, events: value.events as readonly SessionEvent[], cut: value.inheritedEventCount, state }
+  if (state.marker === null || state.marker.taskId !== row.record.taskId || state.marker.usageId !== row.usageId || state.marker.source !== row.source) return undefined
+  return { header: header as unknown as SessionHeader, events: value.events as readonly SessionEvent[], cut: value.inheritedEventCount, state,
+    lifecycle: lifecycleOf(value.events as readonly SessionEvent[]) }
 }
 function metaOf(header: SessionHeader): NonNullable<CreateSessionOptions['meta']> {
   return { parentSession: header.parentSession, createdAt: header.createdAt, isSeeded: header.isSeeded, origin: header.origin,
@@ -152,21 +187,40 @@ function metaOf(header: SessionHeader): NonNullable<CreateSessionOptions['meta']
     ...(header.delegationDepth === undefined ? {} : { delegationDepth: header.delegationDepth }),
     ...(header.agentPreset === undefined ? {} : { agentPreset: header.agentPreset }) } as NonNullable<CreateSessionOptions['meta']>
 }
-function observationOf(row: Eligible, startSeq = 0): { header: SessionHeader; events: readonly SessionEvent[] } {
+function observationOf(row: Eligible, startSeq = 0, turn = 1): { header: SessionHeader; events: readonly SessionEvent[] } {
   const header: SessionHeader = { version: 4, id: SessionId(row.child), parentSession: SessionId(row.parent),
-    origin: 'subagent', isSeeded: false, createdAt: row.record.startedAt }
+    origin: 'subagent', isSeeded: false, createdAt: row.record.startedAt, delegationDepth: 0 }
   const time = row.record.endedAt
   const marker = { version: 1, kind: 'cli-record', executor: 'external-cli', taskId: row.record.taskId,
     parentSessionId: row.parent, childSessionId: row.child, source: row.source, usageId: row.usageId,
     accounting: 'native-mirror-of-parent-cli-ledger', inputSemantics: 'uncached', nativeInputSemantics: 'uncached',
     recoveredFrom: 'canonical', transcriptRecovered: false, parentAndNativeSameSpend: true } satisfies CliChildRecordEventData
   const events: readonly SessionEvent[] = [
-    { seq: SessionSeq(startSeq + 0), time, type: 'request/context', data: { provider: row.provider, model: row.record.model } },
-    { seq: SessionSeq(startSeq + 1), time, type: CLI_CHILD_RECORD_EVENT, data: marker, ignorable: true },
-    { seq: SessionSeq(startSeq + 2), time, type: 'step/start', data: { turn: 1, step: 1 } },
-    { seq: SessionSeq(startSeq + 3), time, type: 'assistant/attempt', data: { turn: 1, step: 1, stream: [{ type: 'chunk', time, chunk: { type: 'usage', usage: row.usage } }] } },
+    { seq: SessionSeq(startSeq + 0), time, type: 'turn/start', data: { turn } },
+    { seq: SessionSeq(startSeq + 1), time, type: 'request/context', data: { provider: row.provider, model: row.record.model } },
+    { seq: SessionSeq(startSeq + 2), time, type: CLI_CHILD_RECORD_EVENT, data: marker, ignorable: true },
+    { seq: SessionSeq(startSeq + 3), time, type: 'step/start', data: { turn, step: 1 } },
+    { seq: SessionSeq(startSeq + 4), time, type: 'assistant/attempt', data: { turn, step: 1, stream: [{ type: 'chunk', time, chunk: { type: 'usage', usage: row.usage } }] } },
+    { seq: SessionSeq(startSeq + 5), time, type: 'step/end', data: { turn, step: 1 } },
+    { seq: SessionSeq(startSeq + 6), time, type: 'turn/end', data: { turn, reason: cliChildTurnEndReason(row.record.phase === 'done', row.record.phase) } },
   ]
   return { header, events }
+}
+function supplementOf(row: Eligible, prior: Seed): readonly SessionEvent[] {
+  const lifecycle = prior.lifecycle
+  if (lifecycle === undefined) throw new RecoveryFailure('stored-session-lifecycle-invalid-migration-required')
+  const events: SessionEvent[] = []
+  const time = row.record.endedAt
+  const push = (type: 'step/end' | 'turn/end', data: unknown): void => {
+    events.push({ seq: SessionSeq(prior.events.length + events.length), time, type, data } as SessionEvent)
+  }
+  // A flushed but interrupted suffix can already contain the one native charge.
+  // Close it in place; never publish that cumulative sample a second time.
+  if (lifecycle.openStep) push('step/end', { turn: lifecycle.turn, step: lifecycle.step })
+  if (lifecycle.openTurn) push('turn/end', { turn: lifecycle.turn,
+    reason: onlySample(prior.state, row) ? cliChildTurnEndReason(row.record.phase === 'done', row.record.phase) : { kind: 'interrupted' } })
+  if (!onlySample(prior.state, row)) events.push(...observationOf(row, prior.events.length + events.length, lifecycle.turn + 1).events)
+  return events
 }
 function persistenceOf(value: unknown): NativeRecoveryPersistence | undefined {
   if (!object(value) || typeof value.identity !== 'symbol' || typeof value.create !== 'function' || typeof value.open !== 'function') return undefined
@@ -234,7 +288,7 @@ export class NativeRecovery {
     }
   }
   private async appendExistingObservation(binding: Binding, row: Eligible, prior: Seed): Promise<Seed> {
-    const suffix = observationOf(row, prior.events.length).events
+    const suffix = supplementOf(row, prior)
     const expectedEvents = [...prior.events, ...suffix]
     let handle: NativeRecoveryHandle | undefined
     try {
@@ -299,6 +353,7 @@ export class NativeRecovery {
       try { value = await query.readSession(SessionId(row.child)) }
       catch (error) {
         this.checkBinding(binding)
+        if (storedFormatFailure(error)) return { ...identity, status: 'failed', reason: 'stored-session-format-invalid-migration-required' }
         if (this.parts.isNotFound?.(error) !== true) return { ...identity, status: 'failed', reason: 'public-query-read-failed' }
         candidate = true
       }
@@ -308,8 +363,9 @@ export class NativeRecovery {
       if (!candidate) {
         const seed = seedOf(value, row)
         if (seed === undefined) return { ...identity, status: 'skipped', reason: 'cold-identity-or-seed-invalid' }
-        if (onlySample(seed.state, row)) return this.makeLive(binding, row, seed, false)
-        if (seed.state.usageObserved !== false || seed.state.usageEventCount !== 0 || seed.state.acceptedUsages.length !== 0)
+        if (seed.lifecycle === undefined) return { ...identity, status: 'failed', reason: 'stored-session-lifecycle-invalid-migration-required' }
+        if (onlySample(seed.state, row) && !seed.lifecycle.openTurn) return this.makeLive(binding, row, seed, false)
+        if (!onlySample(seed.state, row) && (seed.state.usageObserved !== false || seed.state.usageEventCount !== 0 || seed.state.acceptedUsages.length !== 0))
           return { ...identity, status: 'skipped', reason: 'cold-native-usage-unknown-or-conflicting' }
         const supplemented = await this.appendExistingObservation(binding, row, seed)
         this.checkBinding(binding)

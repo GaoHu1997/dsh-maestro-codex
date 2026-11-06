@@ -147,6 +147,7 @@ export class EffectQueue {
 
   /** 入队（同 kind+key 覆盖旧行并递增 generation）。 */
   async enqueue(kind: EffectKind, key: string, value: Record<string, unknown>): Promise<EffectRow> {
+    if (this.closed) throw new Error('副作用队列已关闭，拒绝入队')
     const id = cacheKey(kind, key)
     const previous = this.rows.get(id)
     const at = this.now()
@@ -238,9 +239,6 @@ export class EffectQueue {
   private async flush(): Promise<void> {
     const file = this.options.file
     if (file === undefined) return
-    if (this.closed && this.writing === undefined) {
-      // closed 只挡新入队；drain 自己的 flush 仍要写。
-    }
     const payload: EffectsFile = { version: EFFECTS_VERSION, rows: [...this.entries()] }
     const text = `${JSON.stringify(payload, undefined, 2)}\n`
     // 串行化写入：临时文件 + rename，避免崩溃留下半截 JSON。

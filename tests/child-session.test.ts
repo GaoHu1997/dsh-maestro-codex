@@ -4,7 +4,7 @@ import { CLI_CHILD_RECORD_EVENT, createChildSessionRecorder, type ChildSessionAp
 
 interface RecordedEvent { readonly type: string; readonly data: Record<string, unknown>; readonly opts: { surfaceOp?: 'append' } | undefined; readonly ignorable?: true }
 interface FakeSession { readonly id: string; readonly meta: { cwd?: string; parentSession?: string; origin?: string } | undefined; readonly events: RecordedEvent[] }
-function fakeStore(): { store: ChildSessionStoreFace; sessions: Map<string, FakeSession>; parent: ChildSessionAppend & { events: RecordedEvent[] }; setParentOnline(value: boolean): void } {
+function fakeStore(beforeAppend: (type: string, data: unknown) => void = () => {}): { store: ChildSessionStoreFace; sessions: Map<string, FakeSession>; parent: ChildSessionAppend & { events: RecordedEvent[] }; setParentOnline(value: boolean): void } {
   const sessions = new Map<string, FakeSession>()
   const parentEvents: RecordedEvent[] = []
   const parent = { events: parentEvents, append(type: string, data: unknown, opts?: { surfaceOp?: 'append' }) { parentEvents.push({ type, data: data as Record<string, unknown>, opts }) } }
@@ -19,7 +19,7 @@ function fakeStore(): { store: ChildSessionStoreFace; sessions: Map<string, Fake
         ...(event.ignorable === true ? { ignorable: true as const } : {}),
       })) as RecordedEvent[] }
       sessions.set(id, record)
-      return { header: { createdAt: 1234 }, append(type, data, opts) { record.events.push({ type, data: data as Record<string, unknown>, opts }) } }
+      return { header: { createdAt: 1234 }, append(type, data, opts) { beforeAppend(type, data); record.events.push({ type, data: data as Record<string, unknown>, opts }) } }
     },
   }
   return { store, sessions, parent, setParentOnline(value) { parentOnline = value } }
@@ -30,7 +30,7 @@ function recorder(store: ChildSessionStoreFace | undefined, recordChildSessions 
 const START = { taskId: 'task-1', cli: 'claude', startedAt: 1000, label: 'cli · 数据任务', taskText: '整理数据并输出报表', cwd: 'D:/work', parentSessionId: 'session-parent' } as const
 const USAGE = { inputTokens: 1200, outputTokens: 340, cachedInputTokens: 56, cacheWriteTokens: 7, usageInputSemantics: 'uncached' } as const
 const ROUTE = { provider: 'ofox', model: 'gpt-6.1-sol' }
-const nativeEvents = (events: RecordedEvent[]) => events.filter(e => e.type !== CLI_CHILD_RECORD_EVENT && e.type !== 'request/context')
+const nativeEvents = (events: RecordedEvent[]) => events.filter(e => e.type !== CLI_CHILD_RECORD_EVENT && e.type !== 'request/context' && e.type !== 'session/title')
 
 describe('CLI record session start', () => {
   it('creates native parent lineage and a one-shot catalog without pretending DSH continuation', () => {
@@ -49,6 +49,15 @@ describe('CLI record session start', () => {
     expect(row?.data).toEqual({ version: 0, childId: 'cli-task-1', childCreatedAt: 1234, mode: 'one-shot', label: 'cli · 数据任务' })
     expect(session?.events[1]?.data).toMatchObject({ kind: 'cli-record', executor: 'external-cli', parentSessionId: 'session-parent',
       childSessionId: 'cli-task-1', usageId: '["cli:claude","task-1",1000]', source: 'cli:claude', accounting: 'native-mirror-of-parent-cli-ledger' })
+    expect(session?.events[2]).toEqual({ type: 'session/title',
+      data: { title: START.label, messageSeqs: [], source: { kind: 'user' } }, opts: undefined })
+  })
+  it.each([['  真实任务名  ', '真实任务名'], [' \n\t ', 'cli-task-1']])('publishes a standalone title for label=%j', (label, title) => {
+    const fake = fakeStore()
+    recorder(fake.store).start({ ...START, label })
+    expect(fake.sessions.get('cli-task-1')?.events.filter(e => e.type === 'session/title').map(e => e.data)).toEqual([
+      { title, messageSeqs: [], source: { kind: 'user' } },
+    ])
   })
   it('does nothing without a parent identity, a store, or when switched off', () => {
     const fake = fakeStore()
@@ -95,11 +104,14 @@ describe('CLI native settlement', () => {
     child.settle({ taskId: 'task-1', ok: true, stats: USAGE, route: ROUTE, finalText: '重复' })
     const all = fake.sessions.get('cli-task-1')?.events ?? []
     const events = nativeEvents(all)
-    expect(events.map(e => e.type)).toEqual(['user/message', 'step/start', 'assistant/message'])
-    expect(events[1]?.data).toEqual({ turn: 1, step: 1 })
-    expect(events[2]?.opts).toEqual({ surfaceOp: 'append' })
-    expect(events[2]?.data).toMatchObject({ turn: 1, step: 1, stream: [], message: { role: 'assistant', source: { kind: 'model', ...ROUTE } },
+    expect(events.map(e => e.type)).toEqual(['user/message', 'turn/start', 'step/start', 'assistant/message', 'step/end', 'turn/end'])
+    expect(events[1]?.data).toEqual({ turn: 1 })
+    expect(events[2]?.data).toEqual({ turn: 1, step: 1 })
+    expect(events[3]?.opts).toEqual({ surfaceOp: 'append' })
+    expect(events[3]?.data).toMatchObject({ turn: 1, step: 1, stream: [], message: { role: 'assistant', source: { kind: 'model', ...ROUTE } },
       usage: { inputTokens: 1200, outputTokens: 340, cacheReadTokens: 56, cacheWriteTokens: 7 } })
+    expect(events[4]?.data).toEqual({ turn: 1, step: 1 })
+    expect(events[5]?.data).toEqual({ turn: 1, reason: { kind: 'completed' } })
     expect(all.find(e => e.type === 'request/context')?.data).toEqual(ROUTE)
     expect(fake.parent.events.map(e => e.type)).toEqual(['subagent/catalog'])
   })
@@ -153,7 +165,58 @@ describe('CLI native settlement', () => {
     child.settle({ taskId: 'missing', ok: true, stats: USAGE })
     child.start(START)
     child.settle({ taskId: 'task-1', ok: true, stats: USAGE, route: { provider: 'claude', model: '' }, finalText: 'ok' })
-    expect(fake.sessions.get('cli-task-1')?.events.some(e => e.type === 'assistant/attempt')).toBe(true)
+    const events = fake.sessions.get('cli-task-1')?.events ?? []
+    expect(events.find(e => e.type === 'assistant/attempt')?.data).toMatchObject({ stream: [] })
+    expect(events.map(e => e.type).slice(-2)).toEqual(['step/end', 'turn/end'])
+  })
+})
+
+describe('CLI terminal lifecycle retries', () => {
+  it.each([
+    ['done', true, { kind: 'completed' }],
+    ['failed', false, { kind: 'error', error: { code: 'CLI_FAILED', message: 'CLI task did not complete' } }],
+    ['timeout', false, { kind: 'error', error: { code: 'CLI_TIMEOUT', message: 'CLI task timed out' } }],
+    ['cancelled', false, { kind: 'aborted', reason: { kind: 'legacy' } }],
+    ['interrupted', false, { kind: 'interrupted' }],
+  ] as const)('closes phase=%s with its actual terminal reason', (phase, ok, reason) => {
+    const fake = fakeStore(), child = recorder(fake.store)
+    child.start(START)
+    child.settle({ taskId: START.taskId, ok, phase, stats: USAGE, route: ROUTE, finalText: 'result' })
+    expect(fake.sessions.get('cli-task-1')?.events.at(-1)).toMatchObject({ type: 'turn/end', data: { turn: 1, reason } })
+  })
+  it.each(['turn/start', 'request/context', 'step/start', 'assistant/message', 'step/end', 'turn/end'])('retries only the unaccepted suffix after a failure at %s', refusedType => {
+    let refuse = true
+    const fake = fakeStore(type => { if (type === refusedType && refuse) { refuse = false; throw new Error(`refused ${type}`) } })
+    const child = recorder(fake.store)
+    child.start(START)
+    child.settle({ taskId: START.taskId, ok: true, stats: USAGE, route: ROUTE, finalText: 'original result' })
+    // A later cumulative snapshot may differ. It must not create a second spend
+    // or replace the frozen settlement after any event has been accepted.
+    child.settle({ taskId: START.taskId, ok: false, phase: 'cancelled', stats: { inputTokens: 9999, outputTokens: 999 }, route: ROUTE, finalText: 'changed result' })
+    expect(child.flushPending?.()).toBe(0)
+    const events = fake.sessions.get('cli-task-1')?.events ?? []
+    expect(events.map(e => e.type)).toEqual(['user/message', CLI_CHILD_RECORD_EVENT, 'session/title', 'turn/start', 'request/context', 'step/start', 'assistant/message', 'step/end', 'turn/end'])
+    expect(events.find(e => e.type === 'assistant/message')?.data).toMatchObject({ usage: { inputTokens: 1200, outputTokens: 340 }, message: { content: [{ type: 'text', text: 'original result' }] } })
+    expect(events.at(-1)?.data).toEqual({ turn: 1, reason: { kind: 'completed' } })
+  })
+  it('flushes a failed terminal closer without recharging its accepted usage', () => {
+    let refuse = true
+    const fake = fakeStore(type => { if (type === 'turn/end' && refuse) throw new Error('temporary closer refusal') })
+    const child = recorder(fake.store)
+    child.start(START)
+    child.settle({ taskId: START.taskId, ok: false, stats: USAGE, route: ROUTE })
+    expect(child.flushPending?.()).toBe(0)
+    refuse = false
+    expect(child.flushPending?.()).toBe(1)
+    expect(child.flushPending?.()).toBe(0)
+    expect(fake.sessions.get('cli-task-1')?.events.filter(e => e.type === 'assistant/attempt')).toHaveLength(1)
+    expect(fake.sessions.get('cli-task-1')?.events.at(-1)?.type).toBe('turn/end')
+  })
+  it('does not publish native counters if the immutable usage identity changes', () => {
+    const fake = fakeStore(), child = recorder(fake.store)
+    child.start(START)
+    child.settle({ taskId: START.taskId, ok: false, stats: { ...USAGE, usageAttemptId: 'other-spend' }, route: ROUTE })
+    expect(fake.sessions.get('cli-task-1')?.events.find(e => e.type === 'assistant/attempt')?.data).toMatchObject({ stream: [] })
   })
 })
 
@@ -184,7 +247,10 @@ describe('real installed Session append contract (not cross-plugin R acceptance)
     child.start({ ...START, parentSessionId: 'real-parent', parentSession: wrap(parent) })
     child.settle({ taskId: 'task-1', ok, stats: USAGE, route: ROUTE, finalText: 'ok' })
     expect(warn).not.toHaveBeenCalled()
-    expect(sessions.get('cli-task-1')?.seq).toBe(6)
+    expect(sessions.get('cli-task-1')?.seq).toBe(10)
+    expect(sessions.get('cli-task-1')?.snapshotEvents().filter(event => event.type === 'session/title')).toMatchObject([
+      { data: { title: START.label, messageSeqs: [], source: { kind: 'user' } } },
+    ])
     const markers = (committed as Array<{ type: string; ignorable?: true }>).filter(event => event.type === CLI_CHILD_RECORD_EVENT)
     expect(markers).toHaveLength(1)
     expect(markers[0]?.ignorable).toBe(true)

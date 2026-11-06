@@ -15,6 +15,7 @@ describe('validateConfig', () => {
     expect(() => validateConfig({ defaultCli: 'gemini' })).toThrow(/defaultCli/)
     expect(() => validateConfig({ claudePermissionMode: 'yolo' })).toThrow(/claudePermissionMode/)
     expect(() => validateConfig({ codexSandbox: 'off' })).toThrow(/codexSandbox/)
+    expect(() => validateConfig({ timeoutMinutes: 0 })).toThrow(/timeoutMinutes/)
     expect(() => validateConfig({ claudeTimeoutMinutes: 0 })).toThrow(/claudeTimeoutMinutes/)
     expect(() => validateConfig({ maxConcurrentTasks: 9 })).toThrow(/maxConcurrentTasks/)
     expect(() => validateConfig({ npmRegistry: 'ftp://x' })).toThrow(/npmRegistry/)
@@ -65,6 +66,15 @@ describe('effectiveOf', () => {
   it('falls back to the default on an out-of-enum value', () => {
     const effective = effectiveOf({ defaultCli: 'yolo' })
     expect(effective.defaultCli).toBe(CONFIG_DEFAULTS.defaultCli)
+  })
+
+  it('shares one no-output timeout across CLIs and migrates the per-CLI keys', () => {
+    expect(effectiveOf({}).timeoutMinutes).toBe(20)
+    expect(effectiveOf({ timeoutMinutes: 35 }).timeoutMinutes).toBe(35)
+    // 旧版两个键只在没有统一键时作迁移来源；两者不同取较大值，免得缩短原本更宽松的窗口。
+    expect(effectiveOf({ claudeTimeoutMinutes: 10 }).timeoutMinutes).toBe(10)
+    expect(effectiveOf({ claudeTimeoutMinutes: 10, codexTimeoutMinutes: 45 }).timeoutMinutes).toBe(45)
+    expect(effectiveOf({ timeoutMinutes: 30, codexTimeoutMinutes: 45 }).timeoutMinutes).toBe(30)
   })
 })
 

@@ -177,7 +177,8 @@ export class StatusStore {
 /** GET overview — statuses, safe config view, recent tasks. */
 export function handleOverview(deps: RouteDeps): RouteOutcome {
   const config = deps.readConfig()
-  const tasks = deps.registry.list().filter(task => task.sessionId === undefined && task.kind === 'npm').slice(0, 20)
+  const publicTasks = deps.registry.list().filter(task => task.sessionId === undefined && task.kind === 'npm')
+  const tasks = [...publicTasks.filter(task => !isTerminalPhase(task.phase)), ...publicTasks.filter(task => isTerminalPhase(task.phase)).slice(0, 20)]
   const overview: MaestroOverview = {
     clis: deps.statusStore.get(),
     enabled: config.enabled,

@@ -23,14 +23,12 @@ export interface SectionValue {
   claudeBaseUrl?: string
   claudeAuthToken?: string
   claudeCliPath?: string
-  claudeTimeoutMinutes?: number
   codexEnabled?: boolean
   codexTaskTypes?: string[]
   codexSandbox?: string
   codexBaseUrl?: string
   codexApiKey?: string
   codexCliPath?: string
-  codexTimeoutMinutes?: number
   codexConfigOverrides?: string[]
   codexDshModel?: string
   claudeDshModel?: string
@@ -58,6 +56,8 @@ export interface SectionValue {
   /** Automatic re-runs after a plain failure (0–2). */
   failureRetries?: number
   npmRegistry?: string
+  /** 连续无输出超时（分钟），所有 CLI 共用。 */
+  timeoutMinutes?: number
   maxConcurrentTasks?: number
 }
 
@@ -141,9 +141,9 @@ export interface MaestroFormNotice {
 /** Fields staged as text and committed on save. */
 export type StagedField =
   | 'codexConfigOverrides'
-  | 'claudeBaseUrl' | 'claudeAuthToken' | 'claudeCliPath' | 'claudeTimeoutMinutes'
-  | 'codexBaseUrl' | 'codexApiKey' | 'codexCliPath' | 'codexTimeoutMinutes'
-  | 'npmRegistry' | 'maxConcurrentTasks' | 'failureRetries'
+  | 'claudeBaseUrl' | 'claudeAuthToken' | 'claudeCliPath'
+  | 'codexBaseUrl' | 'codexApiKey' | 'codexCliPath'
+  | 'npmRegistry' | 'timeoutMinutes' | 'maxConcurrentTasks' | 'failureRetries'
   | 'bridgeToolAllowlist'
 
 /** The multi-line list fields (one entry per line). */
@@ -151,8 +151,7 @@ const LIST_FIELDS: readonly StagedField[] = ['codexConfigOverrides', 'bridgeTool
 
 /** Numeric fields: the staged text must parse into range before a save runs. */
 const NUMBER_FIELDS: Readonly<Record<string, { min: number; max: number }>> = {
-  claudeTimeoutMinutes: { min: 1, max: 240 },
-  codexTimeoutMinutes: { min: 1, max: 240 },
+  timeoutMinutes: { min: 1, max: 240 },
   maxConcurrentTasks: { min: 1, max: 8 },
   failureRetries: { min: 0, max: 2 },
 }
