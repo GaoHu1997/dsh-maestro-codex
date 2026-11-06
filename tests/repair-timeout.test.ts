@@ -48,7 +48,7 @@ describe('DSH-NEW-P2-TIMEOUT-001：公共配置schema保留缺失身份', () => 
 })
 
 it('单任务timeoutMinutes覆盖公共迁移值，不回退legacy或默认', async () => {
-  const parsed = Config({ claudeTimeoutMinutes: 10, codexTimeoutMinutes: 45, injectGitContext: false, bridgeSkills: false }) as Config
+  const parsed = Config({ claudeTimeoutMinutes: 10, codexTimeoutMinutes: 45, claudeCliPath: process.execPath, codexCliPath: process.execPath, injectGitContext: false, bridgeSkills: false }) as Config
   const config = withTestDshRoutes(effectiveOf(parsed))
   expect(config.timeoutMinutes).toBe(45)
   const spawn = scriptedSpawn(child => {
