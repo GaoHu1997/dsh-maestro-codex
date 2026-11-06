@@ -20,12 +20,11 @@ import {
   installCli, refreshCli, uninstallCli, type Call,
 } from './api.js'
 import { cliMinTaskDifficulty, fieldText, type MaestroFormActions, type MaestroFormState, type MaestroStore, type SectionValue, type StagedField } from './form.js'
-import { formatDuration, formatTokens } from './board/model.js'
 import type { BoardHost } from './board/data.js'
 import { EXECUTOR_BRANDS } from './board/accent.js'
 import { needsPerson } from '../stage.js'
 import { useActiveCliAccess } from './access.js'
-import { usageTokenLabel, useUsageSummary } from './usage-panel.js'
+import { useUsageSummary } from './usage-panel.js'
 import {
   cleanLogText, CLI_LABELS, CLI_PACKAGES, MAESTRO_CLI_IDS, MAESTRO_STAGE_LABELS, summarizeError, TASK_TYPE_CATALOG, TASK_TYPE_DESCRIPTIONS, TERMINAL_PHASES,
   type DshProviderModels, type MaestroCliId, type MaestroCliStatus, type MaestroCliVersions, type MaestroOverview, type MaestroPhase,
@@ -268,8 +267,6 @@ const CARD_CSS = `
  * The accordion shell reuses .dmc-row / .dmc-rowbtn from the CLI tab; only
  * the expanded body and the header's status marks are SDK-specific.) --- */
 .dmc-sdkbody { padding: 14px 16px; display: flex; flex-direction: column; gap: 11px; }
-.dmc-sdkcheck { width: 18px; height: 18px; border-radius: 999px; display: inline-flex; align-items: center; justify-content: center; font-size: 11px; font-weight: 700; color: var(--dmc-ok); background: color-mix(in srgb, var(--dmc-ok) 15%, transparent); flex: none; }
-.dmc-sdkcheck-off { color: var(--dmc-fg3); background: color-mix(in srgb, var(--dmc-fg3) 15%, transparent); }
 /* A read-only row (dsh ships with the host): same geometry, no click
  * affordance and no hover tint, so it does not look installable. */
 .dmc-rowhead-static:hover { background: none; }
@@ -284,14 +281,24 @@ const CARD_CSS = `
 .dmc-sdkpath span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-family: ui-monospace, SFMono-Regular, Consolas, 'Courier New', monospace; }
 .dmc-sdkloading { font-size: 11.5px; color: var(--dmc-fg3); }
 
+/* --- 用量统计（任务监视页顶部）：一行一个 CLI，列宽固定，新增 CLI 只加一行 --- */
+.dmc-usage { display: flex; flex-direction: column; margin-top: 10px; }
+.dmc-usagehead, .dmc-usagerow { display: grid; grid-template-columns: minmax(120px, 1fr) 64px 64px 64px 176px; align-items: center; column-gap: 10px; }
+.dmc-usagehead { padding: 4px 2px 8px; font-size: 11.5px; color: var(--dmc-fg3); letter-spacing: .4px; }
+.dmc-usagehead > span:not(:first-child) { text-align: right; }
+.dmc-usagerow { padding: 10px 2px; border-top: 1px solid var(--dmc-border); }
+.dmc-usagecli { display: flex; align-items: center; gap: 10px; min-width: 0; }
+.dmc-usagename { font-size: 13.5px; font-weight: 600; color: var(--dmc-fg); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.dmc-usagenum { font-size: 14px; font-weight: 650; color: var(--dmc-fg); text-align: right; font-variant-numeric: tabular-nums; }
+.dmc-usagenum-ok { color: var(--dmc-ok); }
+.dmc-usagenum-bad { color: var(--dmc-danger); }
+.dmc-usagerate { display: flex; align-items: center; justify-content: flex-end; gap: 10px; }
+.dmc-usagebar { width: 100px; height: 7px; border-radius: 999px; overflow: hidden; display: flex; flex: none; background: color-mix(in srgb, var(--dmc-fg3) 22%, transparent); }
+.dmc-usagebar > i { display: block; height: 100%; }
+.dmc-usagepct { min-width: 42px; text-align: right; font-size: 12.5px; font-weight: 650; font-variant-numeric: tabular-nums; }
+
 /* --- log, code, banners --- */
 .dmc-code { font-family: ui-monospace, SFMono-Regular, Consolas, 'Courier New', monospace; font-size: 11.5px; }
-.dmc-chart { display: flex; align-items: flex-end; gap: 8px; height: 120px; padding: 8px 4px 0; border-bottom: 1px solid var(--dmc-border); }
-.dmc-chart-col { flex: 1; display: flex; flex-direction: column; align-items: center; justify-content: flex-end; gap: 4px; height: 100%; min-width: 0; }
-.dmc-chart-stack { width: 70%; max-width: 32px; display: flex; flex-direction: column-reverse; border-radius: 3px 3px 0 0; overflow: hidden; background: var(--dmc-track, rgba(127,127,127,.12)); }
-.dmc-chart-ok { background: var(--dmc-ok); min-height: 2px; }
-.dmc-chart-fail { background: var(--dmc-danger); min-height: 2px; }
-.dmc-chart-day { font-size: 10px; color: var(--dmc-fg3); white-space: nowrap; }
 .dmc-log { max-height: 240px; overflow: auto; background: var(--dmc-input); border: 1px solid var(--dmc-border); border-radius: 8px; padding: 8px 10px; font-family: ui-monospace, SFMono-Regular, Consolas, 'Courier New', monospace; font-size: 11.5px; line-height: 1.65; white-space: pre-wrap; word-break: break-word; color: var(--dmc-fg2); }
 .dmc-log-final { margin-top: 8px; padding-top: 8px; border-top: 1px dashed var(--dmc-border); color: var(--dmc-fg); }
 .dmc-banner { padding: 8px 12px; border-radius: 8px; font-size: 12px; line-height: 1.5; }
@@ -532,66 +539,49 @@ const NO_HOST: BoardHost = { get: () => undefined }
 
 /**
  * 任务监视页顶部的「用量统计」：把各会话的 `maestroCliUsage` 投影折成近 7 天
- * 的汇总。会话 feed 缺席时显示空态，绝不挡住任务记录。
+ * 每个 CLI 的调用 / 成功 / 失败统计。会话 feed 缺席时显示空态，绝不挡住任务记录。
  */
 export function UsageGroup(props: { ctx: BoardHost | undefined }): ReactNode {
   const usage = useUsageSummary(props.ctx ?? NO_HOST)
   return (
     <div className="dmc-group">
-      <p className="dmc-grouptitle">用量统计（最近 7 个自然日）</p>
-      <span className="dmc-hint">有限可见样本：每会话仅最近 20 次结算；调用和用量为可见样本下限，不代表完整周总量。各 token 桶独立统计，不重复相加。</span>
+      <p className="dmc-grouptitle">用量统计（最近 7 天）</p>
       {usage.requests === 0 ? (
-        <span className="dmc-hint">近 7 天还没有 CLI 调用。每次派发结算后计入所属会话的 maestroCliUsage 投影（每会话保留最近 20 次明细）。</span>
+        <span className="dmc-hint">近 7 天还没有 CLI 调用。</span>
       ) : (
-        <>
-          <div className="dmc-chips">
-            <StateChip tone="accent">{`调用 ${String(usage.requests)}`}</StateChip>
-            <StateChip tone="ok">{`成功 ${String(usage.ok)}`}</StateChip>
-            {usage.failed > 0 && <StateChip tone="err">{`失败 ${String(usage.failed)}`}</StateChip>}
-            {usage.cancelled > 0 && <StateChip tone="idle">{`取消 ${String(usage.cancelled)}`}</StateChip>}
-            <StateChip tone="idle">{`入 ${usageTokenLabel(usage.inputTokens, usage.knownTokens.inputTokens)} · 出 ${usageTokenLabel(usage.outputTokens, usage.knownTokens.outputTokens)} · 缓存读 ${usageTokenLabel(usage.cachedInputTokens, usage.knownTokens.cachedInputTokens)} · 缓存写 ${usageTokenLabel(usage.cacheWriteTokens, usage.knownTokens.cacheWriteTokens)}`}</StateChip>
-            <StateChip tone="idle">{`总耗时 ${formatDuration(usage.durationMs)}`}</StateChip>
+        <div className="dmc-usage">
+          <div className="dmc-usagehead" aria-hidden>
+            <span>CLI</span>
+            <span>调用</span>
+            <span>成功</span>
+            <span>失败</span>
+            <span>成功率</span>
           </div>
           {MAESTRO_CLI_IDS.map(cli => {
             const bucket = usage.perCli[cli]
             if (bucket === undefined || bucket.requests === 0) return undefined
+            const pct = Math.round((bucket.ok / bucket.requests) * 100)
             return (
-              <div key={cli} className="dmc-sdkmeta">
-                <span style={{ color: CLI_BRAND[cli], fontWeight: 600 }}>{CLI_LABELS[cli]}</span>
-                <span>{`调用 ${String(bucket.requests)}`}</span>
-                <span>{`成功 ${String(bucket.ok)}`}</span>
-                {bucket.failed > 0 && <span style={{ color: 'var(--dmc-danger)' }}>{`失败 ${String(bucket.failed)}`}</span>}
-                <span>{`入 ${usageTokenLabel(bucket.inputTokens, bucket.knownTokens.inputTokens)} · 出 ${usageTokenLabel(bucket.outputTokens, bucket.knownTokens.outputTokens)} · 缓存读 ${usageTokenLabel(bucket.cachedInputTokens, bucket.knownTokens.cachedInputTokens)} · 缓存写 ${usageTokenLabel(bucket.cacheWriteTokens, bucket.knownTokens.cacheWriteTokens)}`}</span>
-                <span>{`累计 ${formatDuration(bucket.durationMs)}`}</span>
+              <div key={cli} className="dmc-usagerow">
+                <span className="dmc-usagecli">
+                  <ExecutorMark executor={cli} />
+                  <span className="dmc-usagename">{CLI_LABELS[cli]}</span>
+                </span>
+                <span className="dmc-usagenum">{String(bucket.requests)}</span>
+                <span className="dmc-usagenum dmc-usagenum-ok">{String(bucket.ok)}</span>
+                <span className="dmc-usagenum dmc-usagenum-bad">{String(bucket.failed)}</span>
+                <span className="dmc-usagerate">
+                  <span className="dmc-usagebar">
+                    <i style={{ width: `${String(pct)}%`, background: 'var(--dmc-ok)' }} />
+                    <i style={{ width: `${String(100 - pct)}%`, background: 'var(--dmc-danger)' }} />
+                  </span>
+                  <span className="dmc-usagepct" style={{ color: pct >= 50 ? 'var(--dmc-ok)' : 'var(--dmc-danger)' }}>{`${String(pct)}%`}</span>
+                </span>
               </div>
             )
           })}
-          {(() => {
-            const max = Math.max(1, ...usage.daily.map(entry => entry.requests))
-            return (
-              <div className="dmc-chart">
-                {usage.daily.map(entry => {
-                  const label = new Date(entry.day).toLocaleDateString(undefined, { month: 'numeric', day: 'numeric' })
-                  return (
-                    <div
-                      key={entry.day}
-                      className="dmc-chart-col"
-                      title={`${label}：调用 ${String(entry.requests)}（成功 ${String(entry.ok)} / 失败 ${String(entry.failed)}）`}
-                    >
-                      <div className="dmc-chart-stack" style={{ height: `${String(Math.max(4, (entry.requests / max) * 100))}%` }}>
-                        {entry.ok > 0 && <div className="dmc-chart-ok" style={{ flexGrow: entry.ok }} />}
-                        {entry.failed > 0 && <div className="dmc-chart-fail" style={{ flexGrow: entry.failed }} />}
-                      </div>
-                      <span className="dmc-chart-day">{label}</span>
-                    </div>
-                  )
-                })}
-              </div>
-            )
-          })()}
-        </>
+        </div>
       )}
-      <span className="dmc-hint">重启后仍可翻看的结果保存在 $DSH_HOME/maestro/tasks（可在「调度设置」关闭）。</span>
     </div>
   )
 }
@@ -1133,7 +1123,7 @@ function MaestroCardContent(props: MaestroCardProps): ReactNode {
   }
 
   /**
-   * The built-in dsh fallback (tab 1, after the two CLIs). It never spawns a
+   * The built-in dsh fallback (tab 1, first, ahead of the two CLIs). It never spawns a
    * process of its own, so it has no model, permission, connection or enable
    * switch: only the task types it owns and the difficulty floor at which it
    * is preferred over doing the work in the main agent.
@@ -1222,7 +1212,7 @@ function MaestroCardContent(props: MaestroCardProps): ReactNode {
   }
 
   /**
-   * Read-only SDK row for dsh (tab 2): it ships inside the host, so there is
+   * Read-only SDK row for dsh (tab 2, first, ahead of the two CLIs): it ships inside the host, so there is
    * nothing to install, upgrade or probe. It keeps the same collapsed-row
    * geometry as an installable SDK (check dot, name + version, description)
    * but is not expandable and has no hover/press affordance.
@@ -1234,7 +1224,7 @@ function MaestroCardContent(props: MaestroCardProps): ReactNode {
       <div key="dsh-sdk" className="dmc-row">
         <div className="dmc-rowhead dmc-rowhead-static">
           <div className="dmc-rowbtn dmc-rowbtn-static">
-            <span className="dmc-sdkcheck" aria-hidden>✓</span>
+            <ExecutorMark executor="DSH" />
             <span className="dmc-rowmain">
               <span className="dmc-rowname">
                 <span className="dmc-sdkname">dsh 子代理</span>
@@ -1278,7 +1268,7 @@ function MaestroCardContent(props: MaestroCardProps): ReactNode {
       <div key={cli} className="dmc-row">
         <div className="dmc-rowhead">
           <button type="button" className="dmc-rowbtn" aria-expanded={open} onClick={() => { setOpenSdk(open ? undefined : cli) }}>
-            <span className={installed ? 'dmc-sdkcheck' : 'dmc-sdkcheck dmc-sdkcheck-off'} aria-hidden>{installed ? '✓' : '·'}</span>
+            <ExecutorMark executor={cli} />
             <span className="dmc-rowmain">
               <span className="dmc-rowname">
                 <span className="dmc-sdkname">{SDK_TITLES[cli]}</span>
@@ -1391,7 +1381,7 @@ function MaestroCardContent(props: MaestroCardProps): ReactNode {
 
       {notice !== '' && <div className="dmc-banner dmc-banner-err">{notice}</div>}
 
-      {tab === 'cli' && <div className="dmc-stack">{MAESTRO_CLI_IDS.map(cliRow)}{dshRow()}</div>}
+      {tab === 'cli' && <div className="dmc-stack">{dshRow()}{MAESTRO_CLI_IDS.map(cliRow)}</div>}
 
       {tab === 'sdk' && (
         <div className="dmc-stack">
@@ -1408,8 +1398,8 @@ function MaestroCardContent(props: MaestroCardProps): ReactNode {
             <span style={{ flex: 1 }} />
             <button type="button" className="dmc-btn" disabled={busy !== ''} onClick={refreshAll}>全部重新检测</button>
           </div>
-          {MAESTRO_CLI_IDS.map(sdkRow)}
           {dshSdkRow()}
+          {MAESTRO_CLI_IDS.map(sdkRow)}
           <div className="dmc-hint">「目标版本」来自 npm registry，可安装任意已发布版本；安装 / 卸载通过 npm -g 执行，过程与结果在「任务监视」标签页实时可见。registry 改动需保存。</div>
         </div>
       )}

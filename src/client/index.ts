@@ -10,6 +10,7 @@
 
 import type { ClientContext } from './types.js'
 import { MaestroCard } from './MaestroCard.js'
+import { SettingsSectionIcon } from './SettingsSectionIcon.js'
 import { MaestroForm, type SectionValue } from './form.js'
 import { registerBoardTab } from './board/register.js'
 import type { BoardHost } from './board/data.js'
@@ -71,6 +72,7 @@ export function apply(ctx: ClientContext): void {
   const describeFace = ctx.configForms.describe()
   let configDisposer: (() => void) | undefined
   let sectionDisposer: (() => void) | undefined
+  let iconDisposer: (() => void) | undefined
   const syncCardSeat = (): void => {
     const snapshot = describeFace.getSnapshot()
     const served = snapshot.status === 'ready'
@@ -104,12 +106,25 @@ export function apply(ctx: ClientContext): void {
       } catch {
         sectionDisposer = undefined
       }
+      // 左侧菜单行的图标：与 settings.section 同 id，替换宿主默认齿轮。
+      try {
+        iconDisposer = ctx.slots.inject('settings.section.icon', () => ctx.slots.register({
+          name: 'settings.section.icon',
+          id: 'maestro-codex',
+        }, SettingsSectionIcon))
+      } catch {
+        iconDisposer = undefined
+      }
     } else if (!served && configDisposer !== undefined) {
       configDisposer()
       configDisposer = undefined
       if (sectionDisposer !== undefined) {
         sectionDisposer()
         sectionDisposer = undefined
+      }
+      if (iconDisposer !== undefined) {
+        iconDisposer()
+        iconDisposer = undefined
       }
     }
   }
@@ -120,5 +135,6 @@ export function apply(ctx: ClientContext): void {
     unsubscribeDescribe()
     if (configDisposer !== undefined) configDisposer()
     if (sectionDisposer !== undefined) sectionDisposer()
+    if (iconDisposer !== undefined) iconDisposer()
   }, 'maestro-codex: plugin config card lifecycle')
 }

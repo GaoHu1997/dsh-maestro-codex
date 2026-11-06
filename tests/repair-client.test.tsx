@@ -95,16 +95,21 @@ describe('修复：取消请求single-flight与错误恢复', () => {
     expect(container.textContent).not.toContain('old-owner-error')
   })
 })
-it('真实UsageGroup持续标样本下限，整体及perCLI显示四桶与未知', async () => {
+it('真实UsageGroup只保留每个CLI的调用/成功/失败统计，不渲染图表与用量明细', async () => {
   const now = Date.now()
   const usage: CliUsageState = { recent: [{ taskId: 't', cli: 'codex', model: '', phase: 'done', startedAt: now - 100, endedAt: now, durationMs: 100, inputTokens: null, knownTokens: { inputTokens: 123 }, outputTokens: 11, cachedInputTokens: 13, cacheWriteTokens: 17 }], totals: { requests: 21, inputTokens: null, outputTokens: 999, cachedInputTokens: 999, cacheWriteTokens: 999, durationMs: 999 } }
   const snapshot: BoardSessionList = { byId: {}, projectionsBySession: { owner: { values: { maestroCliUsage: usage } } } }
   const sessions = { list: { getSnapshot: () => snapshot, subscribe: () => () => {} } }
   const host: BoardHost = { get: () => sessions }
   await act(async () => { root.render(<UsageGroup ctx={host} />) })
-  expect(container.textContent).toContain('有限可见样本'); expect(container.textContent).toContain('下限')
-  expect(container.textContent?.match(/至少 123/g)).toHaveLength(2)
-  expect(container.textContent?.match(/缓存写 17/g)).toHaveLength(2)
-  expect(container.textContent?.match(/缓存读 13/g)).toHaveLength(2)
+  expect([...container.querySelectorAll('.dmc-usagehead span')].map(span => span.textContent)).toEqual(['CLI', '调用', '成功', '失败', '成功率'])
+  const row = container.querySelector('.dmc-usagerow')
+  expect(row).not.toBeNull()
+  expect(row!.textContent).toContain('codex cli')
+  expect([...row!.querySelectorAll('.dmc-usagenum')].map(cell => cell.textContent)).toEqual(['1', '1', '0'])
+  expect(row!.querySelector('.dmc-usagebar')).not.toBeNull()
+  expect(container.textContent).not.toContain('至少 123')
+  expect(container.textContent).not.toContain('缓存写')
   expect(container.textContent).not.toContain('999')
+  expect(container.querySelector('.dmc-chart')).toBeNull()
 })
