@@ -76,6 +76,11 @@ dsh 的 CLI 子代理编排插件：把会话中的任务按类型派发给 **co
 
 ## 版本日志
 
+### 0.1.11
+
+- **Windows Codex 启动修复**：npm 安装的 codex.cmd shim 经 cmd.exe 转发 `%*` 会二次解析参数，破坏含 JSON 的 TOML override 引号（MCP 服务器配置、`-c` 覆盖项含空格/引号时启动失败）。现在识别 npm 生成的 shim 后改为直接用 node + codex.js 启动——优先 shim 同级的 node.exe，否则回退 PATH 上的 node，绝不使用桌面宿主的 Electron 可执行文件；自定义批处理 launcher 保持原 cmd 路径语义不变。
+- **引号保真回归测试**：新增 Windows 启动计划测试，覆盖 npm shim 识别、兄弟 node 回退、自定义 launcher 直通，以及真实子进程下 MCP TOML/JSON 与 shell 元字符的逐字节保真。
+
 ### 0.1.10
 
 - **统一超时配置**：连续无输出超时改为 claude / codex 共用一项 `timeoutMinutes` 配置；旧配置里的按 CLI 超时仍会被读取，两者不同时取较大值迁移，配置页不再各设一份。

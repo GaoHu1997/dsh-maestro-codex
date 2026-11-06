@@ -7,7 +7,7 @@
 
 import { spawn, type ChildProcess } from 'node:child_process'
 import { execFile } from 'node:child_process'
-import { constants, existsSync } from 'node:fs'
+import { constants, existsSync, readFileSync } from 'node:fs'
 import { access, stat } from 'node:fs/promises'
 import path from 'node:path'
 import { StringDecoder } from 'node:string_decoder'
@@ -153,8 +153,33 @@ export interface LaunchPlan {
   windowsVerbatimArguments?: boolean
 }
 
+/**
+ * npm's Codex shim forwards `%*` through cmd.exe. That extra parse corrupts
+ * quotes in TOML overrides containing JSON. Recognize the npm launcher and use
+ * its JS entry + Node directly; custom batch launchers retain their semantics.
+ */
+function codexNodeLaunchPlan(file: string, args: readonly string[]): LaunchPlan | undefined {
+  if (path.basename(file).toLowerCase() !== 'codex.cmd') return undefined
+  try {
+    const shim = readFileSync(file, 'utf8')
+    if (!/"%_prog%"\s+"%dp0%[\\/]node_modules[\\/]@openai[\\/]codex[\\/]bin[\\/]codex\.js"\s+%\*\s*$/im.test(shim)
+      || !/SET\s+"_prog=node"/i.test(shim)) return undefined
+    const dir = path.dirname(path.resolve(file))
+    const entry = path.join(dir, 'node_modules', '@openai', 'codex', 'bin', 'codex.js')
+    if (!existsSync(entry)) return undefined
+    const node = path.join(dir, 'node.exe')
+    // Match npm's sibling-Node preference and PATH fallback. Do not use
+    // process.execPath: in the desktop host that is the Electron application.
+    return { file: existsSync(node) ? node : 'node.exe', args: [entry, ...args] }
+  } catch {
+    return undefined
+  }
+}
+
 export function launchPlan(file: string, args: readonly string[]): LaunchPlan {
   if (process.platform === 'win32' && /\.(cmd|bat)$/i.test(file)) {
+    const nodePlan = codexNodeLaunchPlan(file, args)
+    if (nodePlan !== undefined) return nodePlan
     const line = `""${file}" ${args.map(windowsQuote).join(' ')}"`
     return {
       file: `${process.env.SystemRoot ?? 'C:\\Windows'}\\System32\\cmd.exe`,

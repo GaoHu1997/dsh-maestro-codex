@@ -312,11 +312,8 @@ export function CliCatalogChip(props: { readonly sessionId?: string; readonly ho
   }, [sessionId, list, tasks.tasks, now])
 
   const runningCount = rows.filter(row => row.running).length
-  /* 只有存在 CLI 子代理时才接管：纯本地子代理的会话保留内核那颗（它的菜单
-   * 更完整，有会话预览和更细的 metrics）。这样覆盖范围最小，也避免两颗
-   * 计数不同的 chip 同时出现。 */
-  const hasCli = rows.some(row => row.cli === true)
-  const visible = rows.length > 0 && hasCli && sessionId !== undefined && !isChild
+  /* 只在存在子智能体时接管：纯本地子代理也使用插件统一样式，避免原生菜单与 CLI/DSH 混合菜单外观不一致。 */
+  const visible = rows.length > 0 && sessionId !== undefined && !isChild
   useBodyFlag(visible)
 
   /* 把内核那颗 chip 藏起来：slot 条目按 id 去重且先注册者胜，插件无法注销它，

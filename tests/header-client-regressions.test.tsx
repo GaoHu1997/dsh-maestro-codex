@@ -3,23 +3,25 @@ import { act } from 'react'
 import { createRoot, type Root } from 'react-dom/client'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import type { MaestroTaskSummary } from '../src/wire.js'
-const spies = vi.hoisted(() => ({ native: vi.fn(), resource: vi.fn(), mode: 'continuable' }))
+const spies = vi.hoisted(() => ({ native: vi.fn(), resource: vi.fn(), mode: 'continuable', cli: true }))
 vi.mock('../src/client/board/data.js', async importOriginal => {
   const actual = await importOriginal<typeof import('../src/client/board/data.js')>()
   const task: MaestroTaskSummary = { id: 'task-1', sessionId: 's1', cli: 'codex', phase: 'done', model: 'm', title: 'CLI original', startedAt: 1, sessionRef: 'ref' }
+  const catalogRows = [
+    { id: 'local', mode: 'continuable', createdAt: 1 },
+    { id: 'cli-task-1', mode: 'continuable', label: 'Native mirror', createdAt: 2 },
+    { id: 'task-1', mode: 'external', label: 'Old mirror', createdAt: 3 },
+  ]
   const list = { byId: { s1: { id: 's1', displayTitle: 'Parent' }, local: { id: 'local', displayTitle: 'Local agent' } }, projectionsBySession: { s1: { values: {
     maestroCliAccess: { sessionId: 's1', token: 'a'.repeat(64) },
-    subagentCatalog: [
-      { id: 'local', mode: 'continuable', createdAt: 1 },
-      { id: 'cli-task-1', mode: 'continuable', label: 'Native mirror', createdAt: 2 },
-      { id: 'task-1', mode: 'external', label: 'Old mirror', createdAt: 3 },
-    ],
+    subagentCatalog: catalogRows,
   } } } }
   return { ...actual, useSessionList: () => {
-    const native = list.projectionsBySession.s1.values.subagentCatalog[0]
+    const native = catalogRows[0]
     if (native !== undefined) native.mode = spies.mode
+    list.projectionsBySession.s1.values.subagentCatalog = spies.cli ? catalogRows : catalogRows.slice(0, 1)
     return list
-  }, useCliTasks: () => ({ tasks: [task], loading: false, error: undefined, refresh: () => {}, cancel: async () => undefined }), useNow: () => 100 }
+  }, useCliTasks: () => ({ tasks: spies.cli ? [task] : [], loading: false, error: undefined, refresh: () => {}, cancel: async () => undefined }), useNow: () => 100 }
 })
 const { CliCatalogChip, headerTokenText } = await import('../src/client/header/CliCatalogChip.js')
 ;(globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true
@@ -37,7 +39,7 @@ async function mount(hasRight: boolean, nativeTab = true): Promise<void> {
   await act(async () => root?.render(<CliCatalogChip sessionId="s1" host={host} />))
   await act(async () => container?.querySelector<HTMLButtonElement>('[data-dmc-trigger]')?.click())
 }
-afterEach(() => { act(() => root?.unmount()); container?.remove(); root = undefined; container = undefined; spies.mode = 'continuable'; spies.resource.mockReset(); vi.clearAllMocks(); vi.unstubAllGlobals() })
+afterEach(() => { act(() => root?.unmount()); container?.remove(); root = undefined; container = undefined; spies.mode = 'continuable'; spies.cli = true; spies.resource.mockReset(); vi.clearAllMocks(); vi.unstubAllGlobals() })
 const nativeButton = () => [...document.querySelectorAll<HTMLButtonElement>('[role="treeitem"]')].find(button => button.querySelector('[data-cli-executor="DSH"]') !== null)
 const cliButton = () => [...document.querySelectorAll<HTMLButtonElement>('[role="treeitem"]')].find(button => button.textContent?.includes('CLI original'))
 
@@ -50,6 +52,15 @@ describe('header client regressions MA-08', () => {
     expect(document.querySelectorAll('[data-cli-executor="codex"]')).toHaveLength(1)
     expect(document.querySelectorAll('[data-cli-executor="DSH"]')).toHaveLength(1)
     expect(cliButton()?.disabled).toBe(false)
+  })
+  it('uses the plugin chip and menu for DSH-only child sessions', async () => {
+    spies.cli = false
+    await mount(true)
+    expect(container?.querySelector('[data-dmc-trigger]')?.textContent).toContain('1 个子智能体')
+    expect(document.querySelector('.dmch-menu')).not.toBeNull()
+    expect(document.querySelectorAll('[role="treeitem"]')).toHaveLength(1)
+    expect(document.querySelector('.dmch-menu')?.textContent).toContain('Local agent')
+    expect(document.querySelector('.dmch-menu')?.textContent).not.toContain('CLI original')
   })
   it.each(['continuable', 'one-shot', 'unknown'])('opens a DSH child in the native right tab with its %s address', async mode => {
     spies.mode = mode
