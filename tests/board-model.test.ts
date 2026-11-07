@@ -507,6 +507,47 @@ describe('foldFinished / expandFolds', () => {
     expect(expandFolds(folded, new Set(['other'])).children[1]?.children).toEqual([])
   })
 
+  it('resolves nested folds in the same pass they are expanded', () => {
+    // 回归：外层折叠组摊开时，成员里如果还有折叠组（review 下的已完成 N），
+    // 必须同一渲染就解析——否则内层点了没反应（外层每次都把未处理的成员
+    // 原样塞回 children，内层的 expanded 命中永远轮不到）。
+    const innerMembers: readonly BoardNode[] = [
+      { kind: 'agent', id: 'a1', title: '甲一', depth: 2, running: false, hasSession: true, status: 'done', children: [] },
+      { kind: 'agent', id: 'a2', title: '甲二', depth: 2, running: false, hasSession: true, status: 'done', children: [] },
+    ]
+    const nested = foldFinished({
+      ...settledSiblings(),
+      children: settledSiblings().children.map((child) => {
+        if (child.id !== 'a') return child
+        // 给甲塞一层自己的折叠组（手工构造：一个 fold 节点挂在甲下面）。
+        return {
+          ...child,
+          children: [{
+            kind: 'fold', id: `${FOLD_NODE_PREFIX}a`, title: '已完成 2', depth: 2, running: false,
+            hasSession: false, status: 'done', foldParent: 'a', children: [],
+            members: innerMembers,
+          }],
+        }
+      }),
+    })
+    const outer = `${FOLD_NODE_PREFIX}root`
+    const inner = `${FOLD_NODE_PREFIX}a`
+    const opened = expandFolds(nested, new Set([outer, inner]))
+    // 甲本身在外层折叠组里；外层摊开后，甲的内层折叠组也已在同一遍里摊开
+    // （折叠节点保留、成员填进 children——UI 靠 children.length 判定展开）。
+    const outerGroup = opened.children.find(child => child.id === outer)
+    const jia = outerGroup?.children.find(child => child.id === 'a')
+    const innerFold = jia?.children[0]
+    expect(innerFold?.id).toBe(inner)
+    expect(innerFold?.children.map(child => child.title)).toEqual(['甲一', '甲二'])
+    // 只开外层：内层保持收起（children 仍是空、members 保留）。
+    const outerOnly = expandFolds(nested, new Set([outer]))
+    const jiaFolded = outerOnly.children.find(child => child.id === outer)?.children.find(child => child.id === 'a')
+    expect(jiaFolded?.children[0]?.id).toBe(inner)
+    expect(jiaFolded?.children[0]?.children).toEqual([])
+    expect(jiaFolded?.children[0]?.members?.map(child => child.title)).toEqual(['甲一', '甲二'])
+  })
+
   it('keeps a settled node with running descendants out of the group', () => {
     // review 自身已结束，但它底下还有在跑的 deep —— 收起来会把活的东西藏掉。
     const root = buildSessionTree({

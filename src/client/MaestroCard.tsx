@@ -40,7 +40,7 @@ export interface MaestroCardProps {
 }
 
 /** Per-CLI identity colors, reused by the task list and inline labels. */
-const CLI_BRAND: Record<MaestroCliId, string> = { claude: '#d97757', codex: '#10a37f', grok: '#8b5cf6' }
+const CLI_BRAND: Record<MaestroCliId, string> = { claude: '#d97757', codex: '#10a37f', grok: '#383d44' }
 
 const CLI_OPTIONS = MAESTRO_CLI_IDS.map(cli => ({ value: cli, label: CLI_LABELS[cli] }))
 

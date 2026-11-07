@@ -77,6 +77,12 @@ dsh 的 CLI 子代理编排插件：把会话中的任务按类型派发给 **co
 
 ## 版本日志
 
+### 0.1.14
+
+- **看板嵌套折叠组展开修复**：外层折叠组摊开时，成员里若还有内层折叠组（如「已完成 N」下再套「已完成 N」），现在会在同一次渲染里递归解析，内层点击立即生效；此前外层每次展开都把未解析的成员原样塞回 children，内层的展开状态永远轮不到，点了没反应。附嵌套折叠组展开/保留回归测试。
+
+- **grok 品牌视觉更新**：执行器标识改用 xAI 官方 logo（斜杠双翼图形），配色由紫色改为中性灰（light/dark 双色），任务列表、看板徽标与用量表同步。
+
 ### 0.1.13
 
 - **新增 grok cli 执行器**：支持把任务派发给 xAI 官方 Grok Build CLI（`@xai-official/grok`，headless `grok -p - --output-format streaming-messages-json`）。该输出与 claude stream-json 同构（Anthropic Messages wire），帧解析复用 claude 通道；错误帧退出码可为 0，按帧判定成败。模型/密钥/端点经 `XAI_API_KEY` 与 `GROK_XAI_API_BASE_URL` 注入，思考等级走 `--reasoning-effort`（档位不认时跳过并提示），`resume` 用 `-r <sessionId>`。

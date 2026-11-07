@@ -398,7 +398,10 @@ export function expandFolds(node: BoardNode, expanded: ReadonlySet<string>): Boa
     if (!expanded.has(node.id)) return node
     const members = node.members ?? []
     if (members.length === 0 || node.children.length > 0) return node
-    return { ...node, children: members }
+    // 摊开的成员要再过一遍 expandFolds：嵌套折叠组（成员里还有折叠组）必须在
+    // 同一次渲染里解析，否则外层每次展开都把未处理的成员原样塞回 children，
+    // 内层的 expanded 命中永远轮不到——点了也没反应。
+    return { ...node, children: members.map(member => expandFolds(member, expanded)) }
   }
   let touched = false
   const children = node.children.map((child) => {
