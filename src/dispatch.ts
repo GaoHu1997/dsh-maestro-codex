@@ -12,6 +12,7 @@ import { isAbsolute } from 'node:path'
 import { modelTokenError, type EffectiveConfig, type TaskDifficulty } from './config.js'
 import { runClaudeTask } from './channels/claude.js'
 import { runCodexTask } from './channels/codex.js'
+import { runGrokTask } from './channels/grok.js'
 import { detectCli, type CliDetection } from './cli-manager.js'
 import { RoutingError, assertTaskDifficulty, pickCli, taskDifficultyError } from './routing.js'
 import { isTerminalPhase, Limiter, TaskRegistry, type MaestroTask as TaskRegistryTask } from './task-registry.js'
@@ -209,7 +210,7 @@ export class CliPathCache {
   /** The resolved CLI path, or a friendly not-installed error. */
   async pathOf(cli: MaestroCliId, signal?: AbortSignal): Promise<string> {
     const config = this.readConfig()
-    const override = cli === 'claude' ? config.claude.cliPath : config.codex.cliPath
+    const override = config[cli].cliPath
     const key = `${cli}:${override}`
     const cached = this.cache.get(key)
     if (cached !== undefined && Date.now() - cached.at < CliPathCache.TTL_MS) {
@@ -257,6 +258,12 @@ function protocolProblem(cli: MaestroCliId, endpoint: DshModelEndpoint): string 
   // `ofox::openai/gpt-6.1-sol` lose its model entirely.
   if (cli === 'codex' && endpoint.api !== 'openai-responses' && endpoint.api !== 'openai-completions') {
     return `dsh 供应商 "${endpoint.provider}" 使用 ${endpoint.api} 协议，codex 只认 OpenAI 兼容端点；请在配置页选择 openai-responses 或 openai-completions 协议的供应商`
+  }
+  // Grok talks OpenAI chat completions upstream (GROK_XAI_API_BASE_URL +
+  // /v1/chat/completions), so the same OpenAI-compatible gateways that drive
+  // codex drive grok; anthropic-messages endpoints cannot.
+  if (cli === 'grok' && endpoint.api !== 'openai-responses' && endpoint.api !== 'openai-completions') {
+    return `dsh 供应商 "${endpoint.provider}" 使用 ${endpoint.api} 协议，grok 只认 OpenAI 兼容端点；请在配置页选择 openai-responses 或 openai-completions 协议的供应商`
   }
   return undefined
 }
@@ -631,8 +638,8 @@ export async function runDispatch(deps: DispatchDeps, params: DispatchParams, si
               : `使用显式选择的 dsh 模型：${explicitSelection}`)
         } else {
           const cliLabel = decision.cli
-          const configuredSelection = withBareModel(cliLabel === 'claude' ? config.claude.dshModel : config.codex.dshModel)
-          const configuredKey = cliLabel === 'claude' ? 'claudeDshModel' : 'codexDshModel'
+          const configuredSelection = withBareModel(config[cliLabel].dshModel)
+          const configuredKey = `${cliLabel}DshModel`
           const attempts: Array<{ selection: string; label: string; fatal: boolean }> = []
           const primary = selectionOf(params.primaryModel)
           const primarySelection = primary === undefined ? undefined : withBareModel(primary)
@@ -696,9 +703,11 @@ export async function runDispatch(deps: DispatchDeps, params: DispatchParams, si
             const reasons = [...rejected]
             if (deps.resolveDshModel === undefined) reasons.push('读不到 dsh 模型目录（settings/credentials 服务不可用）')
             if (configuredSelection === '') reasons.push(`配置页未设置 ${configuredKey}`)
-            const hint = cliLabel === 'codex'
-              ? '请在插件设置里为 codex 选择一个 OpenAI 兼容的 dsh 模型（openai-responses 或 openai-completions 协议的供应商，形如 provider::model，例如 wb::gpt-6.1-sol），或把主代理切到这类供应商。'
-              : '请在插件设置里为 claude 选择 anthropic-messages 协议的模型（形如 provider::model），或把主代理切到 anthropic-messages 协议的供应商。'
+            const hint = cliLabel === 'claude'
+              ? '请在插件设置里为 claude 选择 anthropic-messages 协议的模型（形如 provider::model），或把主代理切到 anthropic-messages 协议的供应商。'
+              : cliLabel === 'grok'
+                ? '请在插件设置里为 grok 选择一个 OpenAI 兼容的 dsh 模型（openai-responses 或 openai-completions 协议的供应商，形如 provider::model），或把主代理切到这类供应商。'
+                : '请在插件设置里为 codex 选择一个 OpenAI 兼容的 dsh 模型（openai-responses 或 openai-completions 协议的供应商，形如 provider::model，例如 wb::gpt-6.1-sol），或把主代理切到这类供应商。'
             const message = [
               `${cliLabel} 子代理需要一个 dsh 模型端点，但当前没有可用的路由：`,
               ...reasons.map(reason => `· ${reason}`),
@@ -761,7 +770,7 @@ export async function runDispatch(deps: DispatchDeps, params: DispatchParams, si
 
         // The thinking level: an explicit override (the session page's picker)
         // wins over the configured per-CLI default.
-        const thinking = params.thinking ?? (decision.cli === 'claude' ? config.claude.thinking : config.codex.thinking)
+        const thinking = params.thinking ?? config[decision.cli].thinking
 
         const baseMcpServers = config.bridgeMcp === true ? deps.listMcpServers?.() ?? [] : []
         // 失败自动重试（默认 0 次）：只重试普通失败——超时重试会翻倍等待、取消
@@ -844,7 +853,25 @@ export async function runDispatch(deps: DispatchDeps, params: DispatchParams, si
                   onEvent,
                   onUsage,
                 })
-              : runCodexTask({
+              : decision.cli === 'grok'
+                ? runGrokTask({
+                    ...(deps.spawnFn === undefined ? {} : { spawnFn: deps.spawnFn }),
+                    grokPath: cliPath,
+                    task: attemptTaskText,
+                    cwd,
+                    model: effectiveModel,
+                    ...(params.resume === undefined ? {} : { resume: params.resume }),
+                    permissionMode: config.grok.permissionMode,
+                    thinking,
+                    baseUrl: dshEndpoint.baseURL,
+                    apiKey: dshEndpoint.apiKey,
+                    ...(mcpServers.length > 0 ? { mcpServers } : {}),
+                    timeoutMs,
+                    signal: abort.signal,
+                    onEvent,
+                    onUsage,
+                  })
+                : runCodexTask({
                   ...(deps.spawnFn === undefined ? {} : { spawnFn: deps.spawnFn }),
                   codexPath: cliPath,
                   task: attemptTaskText,

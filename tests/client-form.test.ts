@@ -87,10 +87,10 @@ describe('independent CLI difficulty configuration', () => {
   })
 
   it.each(MAESTRO_CLI_IDS)('renders the %s selector with only its own selected threshold', cli => {
-    const values: SectionValue = { claudeMinTaskDifficulty: 'low', codexMinTaskDifficulty: 'extreme' }
+    const values: SectionValue = { claudeMinTaskDifficulty: 'low', codexMinTaskDifficulty: 'extreme', grokMinTaskDifficulty: 'high' }
     const html = renderToStaticMarkup(createElement(CliDifficultySelect, { cli, values, onChange: () => {} }))
     expect(html).toContain(`${CLI_LABELS[cli]} 最低任务难度`)
-    expect(html).toContain(`value="${cli === 'claude' ? 'low' : 'extreme'}" selected=""`)
+    expect(html).toContain(`value="${cli === 'claude' ? 'low' : cli === 'grok' ? 'high' : 'extreme'}" selected=""`)
     expect(html).toContain('仅控制此 CLI')
     for (const option of TASK_DIFFICULTY_OPTIONS) expect(html).toContain(`>${option.label}</option>`)
   })

@@ -110,12 +110,12 @@ export interface MaestroMcpServerRef {
 }
 
 /** The CLIs this plugin drives. */
-export type MaestroCliId = 'claude' | 'codex'
+export type MaestroCliId = 'claude' | 'codex' | 'grok'
 
 /** 路由目标：两个外部 CLI，外加内置 dsh 子代理（不经过 CLI 进程）。 */
 export type MaestroRouteTarget = MaestroCliId | 'dsh'
 
-export const MAESTRO_CLI_IDS: readonly MaestroCliId[] = ['claude', 'codex']
+export const MAESTRO_CLI_IDS: readonly MaestroCliId[] = ['claude', 'codex', 'grok']
 
 /**
  * Lifecycle phase of one dispatched task.
@@ -207,12 +207,14 @@ export const MAESTRO_EVENT_KINDS: readonly MaestroTaskEvent['kind'][] = ['phase'
 export const CLI_PACKAGES: Record<MaestroCliId, string> = {
   claude: '@anthropic-ai/claude-code',
   codex: '@openai/codex',
+  grok: '@xai-official/grok',
 }
 
 /** Human label per CLI. */
 export const CLI_LABELS: Record<MaestroCliId, string> = {
   claude: 'claude cli',
   codex: 'codex cli',
+  grok: 'grok cli',
 }
 
 /** Four-character task names shared by the CLI picker and routing defaults. */
@@ -292,6 +294,12 @@ export const CLAUDE_THINKING_BUDGETS: Readonly<Record<string, number>> = {
 
 /** `model_reasoning_effort` values codex parses; anything else (e.g. `off`) is skipped. */
 export const CODEX_REASONING_EFFORTS: readonly string[] = ['minimal', 'low', 'medium', 'high', 'xhigh', 'none']
+
+/**
+ * Canonical `--reasoning-effort` levels grok parses (a model only accepts the
+ * levels it declares; unsupported keys are skipped at run time like codex).
+ */
+export const GROK_REASONING_EFFORTS: readonly string[] = ['none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max']
 
 /** One CLI's published versions (npm registry) for the SDK card's picker. */
 export interface MaestroCliVersions {

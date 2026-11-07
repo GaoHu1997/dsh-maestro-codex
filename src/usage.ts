@@ -199,7 +199,7 @@ export function reportCliUsage(session: unknown, task: CliUsageTask): void {
 const TOKEN_KEYS = ['inputTokens', 'outputTokens', 'cachedInputTokens', 'cacheWriteTokens'] as const
 function recordOfEvent(data: unknown): CliUsageRecord | undefined {
   if (!isRecord(data) || typeof data['taskId'] !== 'string' || data['taskId'] === ''
-    || (data['cli'] !== 'claude' && data['cli'] !== 'codex') || typeof data['model'] !== 'string'
+    || (data['cli'] !== 'claude' && data['cli'] !== 'codex' && data['cli'] !== 'grok') || typeof data['model'] !== 'string'
     || typeof data['phase'] !== 'string' || !TERMINAL_PHASES.includes(data['phase'] as MaestroPhase)
     || !finiteCount(data['startedAt']) || !finiteCount(data['endedAt']) || !finiteCount(data['durationMs'])) return undefined
   for (const key of TOKEN_KEYS) if (data[key] !== null && !finiteCount(data[key])) return undefined

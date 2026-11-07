@@ -1,7 +1,11 @@
-import { readFileSync, statSync, unlinkSync } from 'node:fs'
+import { randomUUID } from 'node:crypto'
+import { mkdirSync, readFileSync, rmSync, statSync, unlinkSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 import { describe, expect, it } from 'vitest'
 import { claudeArgs, claudeEnv, claudeFrameEvents, claudeMcpArgs, claudePermissionArgs, claudeResultOf, lastLines, mergeLiveUsage, runClaudeTask, writeClaudeSettingsFile } from '../src/channels/claude.js'
 import { codexArgs, codexDshModelArgs, codexEnv, codexFrameEvents, codexSandboxArgs, codexWindowsSandboxArgs, codexUsageStats, runCodexTask, tomlString } from '../src/channels/codex.js'
+import { grokArgs, grokEnv, grokFrameEvents, grokHomeConfig, grokHomeOf, grokMcpEnv, runGrokTask } from '../src/channels/grok.js'
 import { scriptedSpawn } from './fake-child.js'
 
 describe('channel usage normalization', () => {
@@ -725,5 +729,179 @@ describe('runCodexTask (fake spawn)', () => {
     expect(result.ok).toBe(false)
     expect(result.error).toContain('进程退出码 2')
     expect(result.error).toContain('shutdown failed')
+  })
+})
+
+describe('grok argv/env', () => {
+  it('rides the stdin prompt with streaming-messages-json and adds flags per option', () => {
+    expect(grokArgs('', 'inherit')).toEqual(['-p', '-', '--output-format', 'streaming-messages-json'])
+    expect(grokArgs('grok-4-fast', 'acceptEdits', 'high', 'sess-1', ['mcp__dsh_bridge']))
+      .toEqual(['-p', '-', '--output-format', 'streaming-messages-json', '-m', 'grok-4-fast',
+        '--permission-mode', 'acceptEdits', '--reasoning-effort', 'high', '-r', 'sess-1', '--allow', 'mcp__dsh_bridge'])
+    // `inherit`/`default` send no permission flag; an unsupported effort is skipped.
+    expect(grokArgs('m', 'default', 'off')).toEqual(['-p', '-', '--output-format', 'streaming-messages-json', '-m', 'm'])
+    const bypass = grokArgs('', 'bypassPermissions')
+    expect(bypass).toContain('--permission-mode')
+    expect(bypass).toContain('bypassPermissions')
+  })
+
+  it('points grok at the dsh provider through env and isolates the run into GROK_HOME', () => {
+    expect(grokEnv('https://gw.example.com', 'xai-key', '/maestro/grok-home')).toEqual({
+      GROK_NO_AUTO_UPDATE: '1',
+      GROK_XAI_API_BASE_URL: 'https://gw.example.com',
+      XAI_API_KEY: 'xai-key',
+      GROK_HOME: '/maestro/grok-home',
+    })
+    expect(grokEnv('', '')).toEqual({ GROK_NO_AUTO_UPDATE: '1' })
+  })
+
+  it('writes the maestro-owned config.toml with shim-wrapped servers and no secret values', () => {
+    const body = grokHomeConfig([
+      { name: 'plain.server', transport: 'stdio', command: 'node', args: ['server.js'], env: {} },
+      { name: 'bridge', transport: 'stdio', command: 'bridge-cmd', args: ['--flag'], env: { SECRET_A: 'secret-one', SECRET_B: 'secret-two' } },
+      { name: 'http-only', transport: 'http', command: '', args: [], env: {} },
+    ], '/shim/mcp-env-shim.js')
+    // Dotted names are quoted (a bare dotted key would parse as a nested table).
+    expect(body).toContain('[mcp_servers."plain.server"]')
+    expect(body).toContain('command = "node"')
+    // Secret-carrying servers go through the shim; values ride the child env only.
+    expect(body).toContain('/shim/mcp-env-shim.js')
+    expect(body).toContain('MAESTRO_MCP_SECRET_1_0')
+    expect(body).toContain('MAESTRO_MCP_SECRET_1_1')
+    expect(body).not.toContain('secret-one')
+    expect(body).not.toContain('secret-two')
+    expect(body).not.toContain('http-only')
+    expect(grokMcpEnv([{ env: { SECRET_A: 'secret-one', SECRET_B: 'secret-two' } }]))
+      .toEqual({ MAESTRO_MCP_SECRET_0_0: 'secret-one', MAESTRO_MCP_SECRET_0_1: 'secret-two' })
+    expect(grokHomeOf('C:/dsh', 'C:/home')).toBe(join('C:/dsh', 'maestro', 'grok-home'))
+    // envDshHome 传 ''（而非 undefined）模拟机器未设置 DSH_HOME，不依赖测试机环境。
+    expect(grokHomeOf(undefined, 'C:/home', '')).toBe(join('C:/home', '.dsh', 'maestro', 'grok-home'))
+    expect(grokHomeOf(undefined, 'C:/home', 'C:/explicit-dsh')).toBe(join('C:/explicit-dsh', 'maestro', 'grok-home'))
+  })
+})
+
+describe('grok frame parsing', () => {
+  it('surfaces failed MCP mounts from the init frame', () => {
+    const events = grokFrameEvents({
+      type: 'system', subtype: 'init', session_id: 's1',
+      mcp_servers: [{ name: 'dsh_bridge', status: 'connected' }, { name: 'other', status: 'failed' }],
+    })
+    expect(events.some(event => event.kind === 'error' && event.text.includes('other（failed）'))).toBe(true)
+    expect(events.every(event => !event.text.includes('dsh_bridge（connected）'))).toBe(true)
+  })
+
+  it('turns a failed result frame into error events carrying its causes', () => {
+    const events = grokFrameEvents({
+      type: 'result', subtype: 'error_during_execution', is_error: true, stop_reason: 'cancelled',
+      errors: ['model unavailable', ' '],
+    })
+    // The run-ended label comes from the shared claude result handling; only
+    // the grok-specific causes are emitted here.
+    expect(events).toEqual([{ kind: 'error', text: 'model unavailable' }])
+  })
+
+  it('keeps a successful result frame free of grok-specific error events', () => {
+    expect(grokFrameEvents({ type: 'result', subtype: 'success' })).toEqual([])
+  })
+})
+
+describe('runGrokTask (fake spawn)', () => {
+  const grokHome = (): string => {
+    const dir = join(tmpdir(), `dsh-maestro-grok-test-${randomUUID().slice(0, 8)}`)
+    mkdirSync(dir, { recursive: true })
+    return dir
+  }
+
+  it('streams events and returns the final result with usage', async () => {
+    const home = grokHome()
+    try {
+      const { spawnFn, launches } = scriptedSpawn(child => {
+        child.onStdin = input => {
+          expect(input).toContain('完整任务')
+          child.finish([
+            JSON.stringify({ type: 'system', subtype: 'init', session_id: 'g1', model: 'grok-4.6', mcp_servers: [{ name: 'dsh_bridge', status: 'connected' }] }),
+            JSON.stringify({ type: 'assistant', message: { usage: { input_tokens: 12, output_tokens: 4, cache_read_input_tokens: 3, cache_creation_input_tokens: 1 }, content: [{ type: 'text', text: '进行中' }] } }),
+            JSON.stringify({ type: 'result', subtype: 'success', session_id: 'g1', result: 'grok 完成', num_turns: 1,
+              usage: { input_tokens: 20, output_tokens: 9, cache_read_input_tokens: 5, cache_creation_input_tokens: 2 } }),
+          ].join('\n'))
+        }
+      })
+      const events: string[] = []
+      const usages: Array<Record<string, string | number | boolean>> = []
+      const result = await runGrokTask({
+        spawnFn, grokPath: 'grok', task: '一个完整任务', cwd: undefined, model: 'grok-4.6',
+        permissionMode: 'inherit', thinking: 'high', baseUrl: 'https://gw.example.com', apiKey: 'xai-key',
+        grokHome: home, timeoutMs: 10_000, signal: new AbortController().signal,
+        onEvent: (kind, text) => events.push(`${kind}:${text}`),
+        onUsage: stats => usages.push(stats),
+      })
+      expect(result.ok).toBe(true)
+      expect(result.finalText).toBe('grok 完成')
+      expect(result.sessionId).toBe('g1')
+      expect(result.stats['turns']).toBe(1)
+      expect(result.stats['inputTokens']).toBe(20)
+      expect(result.stats['usageInputSemantics']).toBe('uncached')
+      expect(events.some(event => event.startsWith('text:进行中'))).toBe(true)
+      // Live counters moved before the result frame landed.
+      expect(usages[0]).toMatchObject({ inputTokens: 12, outputTokens: 4 })
+      // The child env pins the provider and the isolated home.
+      expect(launches[0]!.env()).toMatchObject({ XAI_API_KEY: 'xai-key', GROK_XAI_API_BASE_URL: 'https://gw.example.com', GROK_NO_AUTO_UPDATE: '1', GROK_HOME: home })
+      // The home carries the config.toml; no per-run temp file was left by the channel.
+      expect(readFileSync(join(home, 'config.toml'), 'utf8')).toContain('maestro')
+    } finally {
+      rmSync(home, { recursive: true, force: true })
+    }
+  })
+
+  it('fails the run on an error frame even though grok exits 0', async () => {
+    // Measured live: `grok -p` exits 0 after `{"type":"error",…}` (not signed in).
+    const { spawnFn } = scriptedSpawn(child => {
+      child.finish(JSON.stringify({ type: 'error', message: 'Not signed in. To authenticate without a browser, run:\n  grok login --device-code' }))
+    })
+    const events: string[] = []
+    const result = await runGrokTask({
+      spawnFn, grokPath: 'grok', task: '任务', cwd: undefined, model: '', permissionMode: 'inherit',
+      baseUrl: '', apiKey: '', grokHome: grokHome(), timeoutMs: 10_000, signal: new AbortController().signal,
+      onEvent: (kind, text) => events.push(`${kind}:${text}`),
+    })
+    expect(result.ok).toBe(false)
+    expect(result.exitCode).toBe(0)
+    expect(result.error).toContain('Not signed in')
+    expect(events.some(event => event.startsWith('error:Not signed in'))).toBe(true)
+  })
+
+  it('reports error_during_execution results with their causes', async () => {
+    const { spawnFn } = scriptedSpawn(child => {
+      child.finish(JSON.stringify({
+        type: 'result', subtype: 'error_during_execution', is_error: true, stop_reason: null,
+        errors: ["Couldn't set model 'x': unknown model id"], session_id: 'g2',
+      }))
+    })
+    const result = await runGrokTask({
+      spawnFn, grokPath: 'grok', task: '任务', cwd: undefined, model: 'x', permissionMode: 'inherit',
+      baseUrl: '', apiKey: '', grokHome: grokHome(), timeoutMs: 10_000, signal: new AbortController().signal,
+      onEvent: () => {},
+    })
+    expect(result.ok).toBe(false)
+    expect(result.error).toContain('error_during_execution')
+    expect(result.error).toContain("unknown model id")
+    // The session ref survives even a failed run, so the reply chain can anchor.
+    expect(result.sessionId).toBe('g2')
+  })
+
+  it('resumes with -r and the follow-up instruction still rides stdin', async () => {
+    const { spawnFn } = scriptedSpawn(child => {
+      child.onStdin = input => {
+        expect(input).toContain('补充指令')
+        child.finish(JSON.stringify({ type: 'result', subtype: 'success', session_id: 'g3', result: '续接完成' }))
+      }
+    })
+    const result = await runGrokTask({
+      spawnFn, grokPath: 'grok', task: '补充指令', cwd: undefined, model: '', permissionMode: 'inherit',
+      resume: 'g3', baseUrl: '', apiKey: '', grokHome: grokHome(), timeoutMs: 10_000, signal: new AbortController().signal,
+      onEvent: () => {},
+    })
+    expect(result.ok).toBe(true)
+    expect(result.sessionId).toBe('g3')
   })
 })

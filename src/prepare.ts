@@ -37,10 +37,17 @@ export interface PrepareOutcome {
 /**
  * 命令如何交给系统：Windows 走 `cmd.exe /d /s /c`，其余走 `sh -c`。单独导出
  * 是为了能在测试里断言形态，而不是真的起 shell。
+ *
+ * Windows 上命令行必须整行包一对引号并以 verbatim 方式传参：Node 的默认
+ * argv 转义会把命令里的引号改写成 `\"`，cmd /s 原样转交后，被启动程序的
+ * CRT 再吃一层——`node -e "process.exit(3)"` 这类含引号命令的退出码会静默
+ * 变成 0，prepare 失败被吞掉。整行包一对引号后，/s 只剥外壳，命令里的
+ * 引号原样到达目标程序（与 `launchPlan` 对 `.cmd` 的包装同一配方，已在
+ * 真机验证退出码保真）。
  */
-export function prepareInvocation(command: string, platform: NodeJS.Platform = process.platform): { file: string; args: string[] } {
+export function prepareInvocation(command: string, platform: NodeJS.Platform = process.platform): { file: string; args: string[]; windowsVerbatimArguments?: boolean } {
   return platform === 'win32'
-    ? { file: 'cmd.exe', args: ['/d', '/s', '/c', command] }
+    ? { file: 'cmd.exe', args: ['/d', '/s', '/c', `"${command}"`], windowsVerbatimArguments: true }
     : { file: 'sh', args: ['-c', command] }
 }
 
@@ -62,7 +69,11 @@ export async function runPrepare(command: string, options: PrepareOptions): Prom
   const timeoutMs = options.timeoutMs ?? PREPARE_TIMEOUT_MS
   let child: ChildProcess
   try {
-    child = spawnFn(invocation.file, invocation.args, { cwd: options.cwd, stdio: ['ignore', 'pipe', 'pipe'] })
+    child = spawnFn(invocation.file, invocation.args, {
+      cwd: options.cwd,
+      stdio: ['ignore', 'pipe', 'pipe'],
+      ...(invocation.windowsVerbatimArguments === undefined ? {} : { windowsVerbatimArguments: invocation.windowsVerbatimArguments }),
+    })
   } catch (error) {
     return { ok: false, code: null, timedOut: false, output: error instanceof Error ? error.message : String(error) }
   }

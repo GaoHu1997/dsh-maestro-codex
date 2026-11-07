@@ -19,7 +19,7 @@ import {
   cancelTask, fetchTasks, fetchCliVersions, fetchHint, fetchModels, fetchOverview, fetchTaskDetail,
   installCli, refreshCli, uninstallCli, type Call,
 } from './api.js'
-import { cliMinTaskDifficulty, fieldText, type MaestroFormActions, type MaestroFormState, type MaestroStore, type SectionValue, type StagedField } from './form.js'
+import { cliMinTaskDifficulty, fieldText, type ImmediateField, type MaestroFormActions, type MaestroFormState, type MaestroStore, type SectionValue, type StagedField } from './form.js'
 import type { BoardHost } from './board/data.js'
 import { EXECUTOR_BRANDS } from './board/accent.js'
 import { needsPerson } from '../stage.js'
@@ -40,7 +40,7 @@ export interface MaestroCardProps {
 }
 
 /** Per-CLI identity colors, reused by the task list and inline labels. */
-const CLI_BRAND: Record<MaestroCliId, string> = { claude: '#d97757', codex: '#10a37f' }
+const CLI_BRAND: Record<MaestroCliId, string> = { claude: '#d97757', codex: '#10a37f', grok: '#8b5cf6' }
 
 const CLI_OPTIONS = MAESTRO_CLI_IDS.map(cli => ({ value: cli, label: CLI_LABELS[cli] }))
 
@@ -83,16 +83,19 @@ export function CliDifficultySelect(props: { cli: MaestroCliId; values: SectionV
 const SDK_TITLES: Record<MaestroCliId, string> = {
   claude: 'Claude Code SDK',
   codex: 'Codex SDK',
+  grok: 'Grok CLI SDK',
 }
 const SDK_DESCRIPTIONS: Record<MaestroCliId, string> = {
   claude: 'Claude AI 功能所需。包含 Claude Code SDK 及相关依赖。',
   codex: 'Codex AI 功能所需。包含 OpenAI Codex SDK。',
+  grok: 'Grok AI 功能所需。包含 xAI Grok CLI 及相关依赖。',
 }
 
 /** Task-monitor owner labels: every row there is an external CLI subagent. */
 const SUBAGENT_LABELS: Record<MaestroCliId, string> = {
   claude: 'claude 子代理',
   codex: 'codex 子代理',
+  grok: 'grok 子代理',
 }
 
 const PHASE_LABELS: Record<MaestroPhase, string> = {
@@ -451,7 +454,7 @@ function Chevron(props: { open: boolean }): ReactNode {
  * flower, codex knot, DSH whale) on the board's brand tint, so a settings row
  * and its board node read as the same actor.
  */
-function ExecutorMark(props: { executor: 'claude' | 'codex' | 'DSH'; size?: number }): ReactNode {
+function ExecutorMark(props: { executor: 'claude' | 'codex' | 'grok' | 'DSH'; size?: number }): ReactNode {
   const brand = EXECUTOR_BRANDS[props.executor] ?? { color: 'currentColor', mask: 'none' }
   const glyph: CSSProperties = {
     width: props.size ?? 16,
@@ -811,7 +814,7 @@ function MaestroCardContent(props: MaestroCardProps): ReactNode {
       setHint(result.ok ? { text: result.hint, error: '' } : { text: '', error: result.error })
     })
     return () => { disposed = true }
-  }, [tab, values.minTaskDifficulty, values.claudeMinTaskDifficulty, values.codexMinTaskDifficulty, values.dshMinTaskDifficulty, values.defaultCli, values.claudeTaskTypes, values.codexTaskTypes, values.dshTaskTypes, values.claudeEnabled, values.codexEnabled])
+  }, [tab, values.minTaskDifficulty, values.claudeMinTaskDifficulty, values.codexMinTaskDifficulty, values.grokMinTaskDifficulty, values.dshMinTaskDifficulty, values.defaultCli, values.claudeTaskTypes, values.codexTaskTypes, values.grokTaskTypes, values.dshTaskTypes, values.claudeEnabled, values.codexEnabled, values.grokEnabled])
 
   // Poll the selected task's detail until it settles: a terminal phase stops
   // the timer instead of polling a finished task forever.
@@ -924,9 +927,19 @@ function MaestroCardContent(props: MaestroCardProps): ReactNode {
     return click
   }
 
+  /** Per-CLI immediate-field names, so the row renderer never branches per CLI. */
+  const cliFieldOf: Readonly<Record<MaestroCliId, {
+    enabled: ImmediateField; taskTypes: ImmediateField; dshModel: ImmediateField
+    thinking: ImmediateField; minDifficulty: ImmediateField
+  }>> = {
+    claude: { enabled: 'claudeEnabled', taskTypes: 'claudeTaskTypes', dshModel: 'claudeDshModel', thinking: 'claudeThinking', minDifficulty: 'claudeMinTaskDifficulty' },
+    codex: { enabled: 'codexEnabled', taskTypes: 'codexTaskTypes', dshModel: 'codexDshModel', thinking: 'codexThinking', minDifficulty: 'codexMinTaskDifficulty' },
+    grok: { enabled: 'grokEnabled', taskTypes: 'grokTaskTypes', dshModel: 'grokDshModel', thinking: 'grokThinking', minDifficulty: 'grokMinTaskDifficulty' },
+  }
+
   /** The dsh model selection of one CLI (`provider::model`, '' = follow the main agent). */
   const dshSelectionOf = (cli: MaestroCliId): string =>
-    String(cli === 'claude' ? values.claudeDshModel ?? '' : values.codexDshModel ?? '')
+    String(values[cliFieldOf[cli].dshModel] ?? '')
 
   /**
    * The reasoning efforts the selected dsh model declares (the thinking-level
@@ -943,7 +956,7 @@ function MaestroCardContent(props: MaestroCardProps): ReactNode {
   /** The model summary shown on a collapsed CLI row. */
   const modelSummary = (cli: MaestroCliId): string => {
     const dsh = dshSelectionOf(cli)
-    const thinking = String(cli === 'claude' ? values.claudeThinking ?? '' : values.codexThinking ?? '')
+    const thinking = String(values[cliFieldOf[cli].thinking] ?? '')
     const thinkingLabel = thinking === '' ? '' : ` · 思考 ${thinking}`
     return `${dsh === '' ? '沿用主代理模型' : `dsh 模型 ${dsh}`}${thinkingLabel}`
   }
@@ -952,25 +965,21 @@ function MaestroCardContent(props: MaestroCardProps): ReactNode {
 
   /** One expandable CLI row (tab 1): identity, status, and the config panel. */
   const cliRow = (cli: MaestroCliId): ReactNode => {
+    const fields = cliFieldOf[cli]
     const open = openCli === cli
     const status = statusOf(cli)
-    const enabled = cli === 'claude' ? values.claudeEnabled === true : values.codexEnabled === true
-    const taskTypes: readonly string[] = (cli === 'claude' ? values.claudeTaskTypes : values.codexTaskTypes) ?? []
-    // Task types name exactly one executor: the two CLIs and the built-in dsh
+    const enabled = values[fields.enabled] === true
+    const taskTypes: readonly string[] = (values[fields.taskTypes] as readonly string[] | undefined) ?? []
+    // Task types name exactly one executor: the CLIs and the built-in dsh
     // fallback all draw from the same catalogue, so adding here removes there.
-    const otherOwners: ReadonlyArray<{ label: string; types: readonly string[] }> = cli === 'claude'
-      ? [
-          { label: CLI_LABELS.codex, types: values.codexTaskTypes ?? [] },
-          { label: DSH_LABEL, types: values.dshTaskTypes ?? [] },
-        ]
-      : [
-          { label: CLI_LABELS.claude, types: values.claudeTaskTypes ?? [] },
-          { label: DSH_LABEL, types: values.dshTaskTypes ?? [] },
-        ]
+    const otherOwners: ReadonlyArray<{ label: string; types: readonly string[] }> = [
+      ...MAESTRO_CLI_IDS.filter(other => other !== cli).map(other => ({ label: CLI_LABELS[other], types: (values[cliFieldOf[other].taskTypes] as readonly string[] | undefined) ?? [] })),
+      { label: DSH_LABEL, types: values.dshTaskTypes ?? [] },
+    ]
     const otherTaskTypes: readonly string[] = otherOwners.flatMap(entry => entry.types)
     const toggleTaskType = (type: string): void => { actions.toggleTaskType(cli, type) }
     const selection = dshSelectionOf(cli)
-    const thinkingValue = String(cli === 'claude' ? values.claudeThinking ?? '' : values.codexThinking ?? '')
+    const thinkingValue = String(values[fields.thinking] ?? '')
     // The thinking options ARE the selected model's configured reasoningEfforts.
     const levels = reasoningLevelsOf(selection)
     const thinkingOptions: Array<{ value: string; label: string }> = [
@@ -982,10 +991,10 @@ function MaestroCardContent(props: MaestroCardProps): ReactNode {
       thinkingOptions.push({ value: thinkingValue, label: `${thinkingValue}（当前模型未列出）` })
     }
     const changeModel = (value: string): void => {
-      actions.setImmediate(cli === 'claude' ? 'claudeDshModel' : 'codexDshModel', value)
+      actions.setImmediate(fields.dshModel, value)
       // A level the new model doesn't declare would ride every later dispatch — reset it.
       if (thinkingValue !== '' && !reasoningLevelsOf(value).includes(thinkingValue)) {
-        actions.setImmediate(cli === 'claude' ? 'claudeThinking' : 'codexThinking', '')
+        actions.setImmediate(fields.thinking, '')
       }
     }
     return (
@@ -1016,7 +1025,7 @@ function MaestroCardContent(props: MaestroCardProps): ReactNode {
             <Toggle
               checked={enabled}
               ariaLabel={`启用 ${CLI_LABELS[cli]}`}
-              onChange={value => { actions.setImmediate(cli === 'claude' ? 'claudeEnabled' : 'codexEnabled', value) }}
+              onChange={value => { actions.setImmediate(fields.enabled, value) }}
             />
           </span>
         </div>
@@ -1036,7 +1045,7 @@ function MaestroCardContent(props: MaestroCardProps): ReactNode {
                   value={thinkingValue}
                   options={thinkingOptions}
                   disabled={levels.length === 0 && thinkingValue === ''}
-                  onChange={value => { actions.setImmediate(cli === 'claude' ? 'claudeThinking' : 'codexThinking', value) }}
+                  onChange={value => { actions.setImmediate(fields.thinking, value) }}
                 />
               </div>
             </div>
@@ -1044,7 +1053,7 @@ function MaestroCardContent(props: MaestroCardProps): ReactNode {
             <CliDifficultySelect
               cli={cli}
               values={values}
-              onChange={value => { actions.setImmediate(cli === 'claude' ? 'claudeMinTaskDifficulty' : 'codexMinTaskDifficulty', value) }}
+              onChange={value => { actions.setImmediate(fields.minDifficulty, value) }}
             />
 
             <Field
@@ -1101,6 +1110,22 @@ function MaestroCardContent(props: MaestroCardProps): ReactNode {
                     onChange={value => { actions.setImmediate('claudePermissionMode', value) }}
                     hint="headless 无法交互确认，写入类任务建议 acceptEdits 及以上"
                   />
+                ) : cli === 'grok' ? (
+                  <SelectField
+                    label="权限模式"
+                    value={String(values.grokPermissionMode ?? 'inherit')}
+                    options={[
+                      { value: 'inherit', label: '继承（CLI 非交互默认策略）' },
+                      { value: 'default', label: 'default（保守）' },
+                      { value: 'acceptEdits', label: 'acceptEdits（自动接受文件编辑）' },
+                      { value: 'auto', label: 'auto（自动批准常规操作）' },
+                      { value: 'dontAsk', label: 'dontAsk（不询问，未批准即拒绝）' },
+                      { value: 'plan', label: 'plan（只读规划）' },
+                      { value: 'bypassPermissions', label: 'bypassPermissions（跳过所有确认）' },
+                    ]}
+                    onChange={value => { actions.setImmediate('grokPermissionMode', value) }}
+                    hint="headless 无法交互确认，写入类任务建议 acceptEdits 及以上"
+                  />
                 ) : (
                   <SelectField
                     label="沙箱级别"
@@ -1131,10 +1156,7 @@ function MaestroCardContent(props: MaestroCardProps): ReactNode {
   const dshRow = (): ReactNode => {
     const taskTypes: readonly string[] = values.dshTaskTypes ?? []
     const minimum = String(values.dshMinTaskDifficulty ?? 'low')
-    const otherOwners: ReadonlyArray<{ label: string; types: readonly string[] }> = [
-      { label: CLI_LABELS.claude, types: values.claudeTaskTypes ?? [] },
-      { label: CLI_LABELS.codex, types: values.codexTaskTypes ?? [] },
-    ]
+    const otherOwners: ReadonlyArray<{ label: string; types: readonly string[] }> = MAESTRO_CLI_IDS.map(cli => ({ label: CLI_LABELS[cli], types: (values[cliFieldOf[cli].taskTypes] as readonly string[] | undefined) ?? [] }))
     const otherTaskTypes: readonly string[] = otherOwners.flatMap(entry => entry.types)
     return (
       <div key="dsh" className="dmc-row">
@@ -1356,7 +1378,7 @@ function MaestroCardContent(props: MaestroCardProps): ReactNode {
       <header className="dmc-head">
         <div>
           <h3 className="dmc-title">子智能体</h3>
-          <p className="dmc-subtitle">按类型把任务派发给 claude / codex 子代理（headless），未达门槛时回退内置 dsh 子代理，结果回填主会话</p>
+          <p className="dmc-subtitle">按类型把任务派发给 claude / codex / grok 子代理（headless），未达门槛时回退内置 dsh 子代理，结果回填主会话</p>
         </div>
         <div className="dmc-headside">
           {activeCount > 0 && <StateChip tone="accent">{`子代理运行中 ${String(activeCount)}`}</StateChip>}

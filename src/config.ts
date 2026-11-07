@@ -36,7 +36,14 @@ export type ClaudeSkillsMode = (typeof CLAUDE_SKILLS_MODES)[number]
 export const CODEX_SANDBOX_MODES = ['read-only', 'workspace-write', 'danger-full-access'] as const
 export type CodexSandboxMode = (typeof CODEX_SANDBOX_MODES)[number]
 
-export const CLI_CHOICES = ['claude', 'codex'] as const
+/**
+ * Grok permission modes accepted by `grok -p --permission-mode` (`inherit`
+ * sends none and keeps the CLI's own headless default).
+ */
+export const GROK_PERMISSION_MODES = ['inherit', 'default', 'acceptEdits', 'auto', 'dontAsk', 'bypassPermissions', 'plan'] as const
+export type GrokPermissionMode = (typeof GROK_PERMISSION_MODES)[number]
+
+export const CLI_CHOICES = ['claude', 'codex', 'grok'] as const
 
 /** Ordered from least to most difficult; keywords never determine this rank. */
 export const TASK_DIFFICULTIES = ['low', 'medium', 'high', 'extreme'] as const
@@ -74,6 +81,15 @@ export const CONFIG_DEFAULTS = {
   codexConfigOverrides: [],
   codexDshModel: '',
   claudeDshModel: '',
+  grokMinTaskDifficulty: 'medium',
+  grokEnabled: false,
+  grokTaskTypes: [],
+  grokPermissionMode: 'inherit',
+  grokBaseUrl: '',
+  grokApiKey: '',
+  grokCliPath: '',
+  grokDshModel: '',
+  grokThinking: '',
   /** dsh 子代理是内置回退：类型与门槛都可配，其余选项不暴露（没有 CLI 进程）。 */
   dshMinTaskDifficulty: 'low',
   dshTaskTypes: ['代码定位', '资料检索', '方案核验'],
@@ -119,6 +135,16 @@ export interface Config {
   codexConfigOverrides?: Volatile<string[]> | string[]
   codexDshModel?: Volatile<string> | string
   claudeDshModel?: Volatile<string> | string
+  /** Grok (xAI Grok Build CLI) axes; off by default so routing never hits an uninstalled CLI. */
+  grokEnabled?: Volatile<boolean> | boolean
+  grokTaskTypes?: Volatile<string[]> | string[]
+  grokMinTaskDifficulty?: Volatile<TaskDifficulty> | TaskDifficulty
+  grokPermissionMode?: Volatile<string> | string
+  grokBaseUrl?: Volatile<string> | string
+  grokApiKey?: Volatile<string> | string
+  grokCliPath?: Volatile<string> | string
+  grokDshModel?: Volatile<string> | string
+  grokThinking?: Volatile<string> | string
   /** dsh 子代理（内置回退）的最低任务难度；固定独立于 legacy 共享项。 */
   dshMinTaskDifficulty?: Volatile<TaskDifficulty> | TaskDifficulty
   /** dsh 子代理擅长的任务类型：命中即建议改用 subagent，不派发 CLI。 */
@@ -190,6 +216,16 @@ export const Config: z = z.object({
   codexConfigOverrides: z.array(z.string()).default([]).volatile(),
   codexDshModel: z.string().default(CONFIG_DEFAULTS.codexDshModel).volatile(),
   claudeDshModel: z.string().default(CONFIG_DEFAULTS.claudeDshModel).volatile(),
+  grokEnabled: z.boolean().default(CONFIG_DEFAULTS.grokEnabled).volatile(),
+  grokTaskTypes: z.array(z.string()).default([...CONFIG_DEFAULTS.grokTaskTypes]).volatile(),
+  // Same inheritance rule as claude/codex: a projected medium must not hide a legacy high/extreme.
+  grokMinTaskDifficulty: z.union(TASK_DIFFICULTIES.map(value => z.const(value))).volatile(),
+  grokPermissionMode: z.string().default(CONFIG_DEFAULTS.grokPermissionMode).volatile(),
+  grokBaseUrl: z.string().default(CONFIG_DEFAULTS.grokBaseUrl).volatile(),
+  grokApiKey: z.string().default(CONFIG_DEFAULTS.grokApiKey).volatile(),
+  grokCliPath: z.string().default(CONFIG_DEFAULTS.grokCliPath).volatile(),
+  grokDshModel: z.string().default(CONFIG_DEFAULTS.grokDshModel).volatile(),
+  grokThinking: z.string().default(CONFIG_DEFAULTS.grokThinking).volatile(),
   // dsh 是内置回退，门槛不继承 legacy：旧配置只描述外部 CLI。
   dshMinTaskDifficulty: z.union(TASK_DIFFICULTIES.map(value => z.const(value))).default(CONFIG_DEFAULTS.dshMinTaskDifficulty).volatile(),
   dshTaskTypes: z.array(z.string()).default([...CONFIG_DEFAULTS.dshTaskTypes]).volatile(),
@@ -229,7 +265,7 @@ export function validateConfig(config: Config): void {
   if (defaultCli !== undefined && !(CLI_CHOICES as readonly string[]).includes(defaultCli)) {
     throw new Error(`MaestroConfig: "defaultCli" must be one of ${CLI_CHOICES.join(' | ')}`)
   }
-  for (const field of ['minTaskDifficulty', 'claudeMinTaskDifficulty', 'codexMinTaskDifficulty', 'dshMinTaskDifficulty'] as const) {
+  for (const field of ['minTaskDifficulty', 'claudeMinTaskDifficulty', 'codexMinTaskDifficulty', 'grokMinTaskDifficulty', 'dshMinTaskDifficulty'] as const) {
     const minimum = readVolatile(config[field])
     if (minimum !== undefined && !isTaskDifficulty(minimum)) {
       throw new Error(`MaestroConfig: "${field}" must be one of ${TASK_DIFFICULTIES.join(' | ')}`)
@@ -242,6 +278,10 @@ export function validateConfig(config: Config): void {
   const sandbox = readVolatile(config.codexSandbox)
   if (sandbox !== undefined && !(CODEX_SANDBOX_MODES as readonly string[]).includes(sandbox)) {
     throw new Error(`MaestroConfig: "codexSandbox" must be one of ${CODEX_SANDBOX_MODES.join(' | ')}`)
+  }
+  const grokPermissionMode = readVolatile(config.grokPermissionMode)
+  if (grokPermissionMode !== undefined && !(GROK_PERMISSION_MODES as readonly string[]).includes(grokPermissionMode)) {
+    throw new Error(`MaestroConfig: "grokPermissionMode" must be one of ${GROK_PERMISSION_MODES.join(' | ')}`)
   }
   const bridgeTools = readVolatile(config.bridgeTools)
   if (bridgeTools !== undefined && !(BRIDGE_TOOLS_MODES as readonly string[]).includes(bridgeTools)) {
@@ -264,6 +304,11 @@ export function validateConfig(config: Config): void {
     const error = dshModelSelectionError(codexDshModel)
     if (error !== undefined) throw new Error(`MaestroConfig: "codexDshModel" ${error}`)
   }
+  const grokDshModel = readVolatile(config.grokDshModel)
+  if (grokDshModel !== undefined) {
+    const error = dshModelSelectionError(grokDshModel)
+    if (error !== undefined) throw new Error(`MaestroConfig: "grokDshModel" ${error}`)
+  }
   const claudeThinking = readVolatile(config.claudeThinking)
   if (claudeThinking !== undefined) {
     const error = modelTokenError(claudeThinking)
@@ -273,6 +318,11 @@ export function validateConfig(config: Config): void {
   if (codexThinking !== undefined) {
     const error = modelTokenError(codexThinking)
     if (error !== undefined) throw new Error(`MaestroConfig: "codexThinking" ${error}`)
+  }
+  const grokThinking = readVolatile(config.grokThinking)
+  if (grokThinking !== undefined) {
+    const error = modelTokenError(grokThinking)
+    if (error !== undefined) throw new Error(`MaestroConfig: "grokThinking" ${error}`)
   }
   const concurrency = readVolatile(config.maxConcurrentTasks)
   if (concurrency !== undefined && (!Number.isInteger(concurrency) || concurrency < 1 || concurrency > 8)) {
@@ -286,7 +336,7 @@ export function validateConfig(config: Config): void {
   if (prepare !== undefined && prepare.length > 4000) {
     throw new Error('MaestroConfig: "prepareCommand" must be at most 4000 characters')
   }
-  for (const field of ['claudeTaskTypes', 'codexTaskTypes', 'dshTaskTypes', 'codexConfigOverrides'] as const) {
+  for (const field of ['claudeTaskTypes', 'codexTaskTypes', 'grokTaskTypes', 'dshTaskTypes', 'codexConfigOverrides'] as const) {
     const list = readVolatile(config[field])
     if (list !== undefined && (!Array.isArray(list) || !list.every(item => typeof item === 'string'))) {
       throw new Error(`MaestroConfig: "${field}" must be an array of strings`)
@@ -342,6 +392,18 @@ export interface EffectiveConfig {
     /** Raw `-c key=value` overrides passed to every codex invocation. */
     configOverrides: string[]
   }
+  grok: {
+    enabled: boolean
+    minTaskDifficulty: TaskDifficulty
+    taskTypes: string[]
+    dshModel: string
+    /** Thinking level key (`--reasoning-effort`); '' = CLI default. */
+    thinking: string
+    permissionMode: GrokPermissionMode
+    baseUrl: string
+    apiKey: string
+    cliPath: string
+  }
   /** 内置 dsh 子代理：没有 CLI 进程，只由类型与门槛决定「建议用它还是主代理直接做」。 */
   dsh: {
     minTaskDifficulty: TaskDifficulty
@@ -376,7 +438,7 @@ export interface EffectiveConfig {
 }
 
 /** The configured thinking level of one CLI ('' when absent). */
-function thinkingOf(config: Config, field: 'claudeThinking' | 'codexThinking'): string {
+function thinkingOf(config: Config, field: 'claudeThinking' | 'codexThinking' | 'grokThinking'): string {
   return readVolatile(config[field]) ?? ''
 }
 
@@ -403,8 +465,10 @@ export function effectiveOf(config: Config): EffectiveConfig {
   const inheritedMinimum = isTaskDifficulty(legacyMinimum) ? legacyMinimum : CONFIG_DEFAULTS.minTaskDifficulty
   const claudeMinimum = readVolatile(config.claudeMinTaskDifficulty) ?? inheritedMinimum
   const codexMinimum = readVolatile(config.codexMinTaskDifficulty) ?? inheritedMinimum
+  const grokMinimum = readVolatile(config.grokMinTaskDifficulty) ?? inheritedMinimum
   const permissionMode = readVolatile(config.claudePermissionMode) ?? CONFIG_DEFAULTS.claudePermissionMode
   const sandbox = readVolatile(config.codexSandbox) ?? CONFIG_DEFAULTS.codexSandbox
+  const grokPermissionMode = readVolatile(config.grokPermissionMode) ?? CONFIG_DEFAULTS.grokPermissionMode
   return {
     enabled: readVolatile(config.enabled) ?? CONFIG_DEFAULTS.enabled,
     defaultCli: (CLI_CHOICES as readonly string[]).includes(defaultCli) ? defaultCli as MaestroCliId : CONFIG_DEFAULTS.defaultCli,
@@ -434,6 +498,19 @@ export function effectiveOf(config: Config): EffectiveConfig {
       apiKey: readVolatile(config.codexApiKey) ?? '',
       cliPath: readVolatile(config.codexCliPath) ?? '',
       configOverrides: readVolatile(config.codexConfigOverrides) ?? [],
+    },
+    grok: {
+      enabled: readVolatile(config.grokEnabled) ?? CONFIG_DEFAULTS.grokEnabled,
+      minTaskDifficulty: isTaskDifficulty(grokMinimum) ? grokMinimum : CONFIG_DEFAULTS.grokMinTaskDifficulty,
+      taskTypes: normalizeTaskTypes(readVolatile(config.grokTaskTypes) ?? [...CONFIG_DEFAULTS.grokTaskTypes]),
+      dshModel: readVolatile(config.grokDshModel) ?? '',
+      thinking: thinkingOf(config, 'grokThinking'),
+      permissionMode: (GROK_PERMISSION_MODES as readonly string[]).includes(grokPermissionMode)
+        ? grokPermissionMode as GrokPermissionMode
+        : CONFIG_DEFAULTS.grokPermissionMode,
+      baseUrl: readVolatile(config.grokBaseUrl) ?? '',
+      apiKey: readVolatile(config.grokApiKey) ?? '',
+      cliPath: readVolatile(config.grokCliPath) ?? '',
     },
     dsh: {
       minTaskDifficulty: (() => {
@@ -469,5 +546,6 @@ export function redactEffective(effective: EffectiveConfig): EffectiveConfig {
     ...effective,
     claude: { ...effective.claude, authToken: effective.claude.authToken === '' ? '' : '••••' },
     codex: { ...effective.codex, apiKey: effective.codex.apiKey === '' ? '' : '••••' },
+    grok: { ...effective.grok, apiKey: effective.grok.apiKey === '' ? '' : '••••' },
   }
 }

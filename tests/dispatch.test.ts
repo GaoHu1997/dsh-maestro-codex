@@ -35,7 +35,7 @@ function fixture(overrides: Partial<EffectiveConfig> & { minTaskDifficulty?: Eff
   return { ...base, ...effectiveOverrides }
 }
 
-/** A fake spawn that answers --version and streams a claude/codex transcript. */
+/** A fake spawn that answers --version and streams a claude/codex/grok transcript. */
 function fakeCliSpawn(ok = true): ReturnType<typeof scriptedSpawn> {
   return scriptedSpawn(child => {
     if (child.spawnArgs[0] === '--version') {
@@ -48,6 +48,24 @@ function fakeCliSpawn(ok = true): ReturnType<typeof scriptedSpawn> {
         JSON.stringify({ type: 'item.completed', item: { type: 'agent_message', text: ok ? 'codex 完成' : '' } }),
         JSON.stringify({ type: ok ? 'turn.completed' : 'turn.failed', ...(ok ? { usage: { output_tokens: 7 } } : { error: { message: 'turn 出错' } }) }),
       ].join('\n'))
+      return
+    }
+    if (child.spawnArgs.includes('streaming-messages-json')) {
+      // grok: error frames keep exit code 0 (measured live); a failed result
+      // frame carries its causes in `errors[]`.
+      if (ok) {
+        child.finish([
+          JSON.stringify({ type: 'system', subtype: 'init', session_id: 'g1', model: 'grok-4.6' }),
+          JSON.stringify({ type: 'assistant', message: { content: [{ type: 'text', text: 'grok 完成' }] } }),
+          JSON.stringify({ type: 'result', subtype: 'success', session_id: 'g1', result: 'grok 完成', num_turns: 1,
+            usage: { input_tokens: 10, output_tokens: 4, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 } }),
+        ].join('\n'))
+      } else {
+        child.finish(JSON.stringify({
+          type: 'result', subtype: 'error_during_execution', is_error: true, stop_reason: null,
+          errors: ['upstream said no'], session_id: 'g1',
+        }))
+      }
       return
     }
     child.finish([
@@ -845,5 +863,60 @@ describe('persist sink', () => {
     deps.persist = () => { throw new Error('sink exploded') }
     const value = await runDispatch(deps, { ...assessment, cli: 'claude', task: 'x' }, new AbortController().signal)
     expect(value.ok).toBe(true)
+  })
+})
+
+describe('grok dispatch', () => {
+  function grokFixture(overrides: Partial<EffectiveConfig['grok']> = {}): EffectiveConfig {
+    const config = fixture()
+    return { ...config, grok: { ...config.grok, enabled: true, cliPath: process.execPath, taskTypes: ['资料检索'], ...overrides } }
+  }
+
+  it('dispatches an explicit grok task end to end over the messages-json wire', async () => {
+    const cli = fakeCliSpawn(true)
+    const { deps, registry } = makeDeps(grokFixture(), cli.spawnFn)
+    const value = await runDispatch(deps, { ...assessment, cli: 'grok', task: '检索一下这个仓库的入口' }, new AbortController().signal)
+    expect(value.ok).toBe(true)
+    expect(value.cli).toBe('grok')
+    expect(value.model).toBe('test-grok-model')
+    expect(value.sessionRef).toBe('g1')
+    expect(value.finalText).toBe('grok 完成')
+    // The grok transcript ran through the shared runner: usage and session ref land.
+    const task = registry.get(value.taskId)!
+    expect(task.stats?.['sessionRef']).toBe('g1')
+    expect(task.stats?.['inputTokens']).toBe(10)
+    expect(task.events.some(event => event.text === 'grok 完成')).toBe(true)
+  })
+
+  it('routes by grok task-type keywords and reports the keyword decision', async () => {
+    const cli = fakeCliSpawn(true)
+    const { deps } = makeDeps(grokFixture(), cli.spawnFn)
+    const value = await runDispatch(deps, { ...assessment, cli: 'auto', task: '帮我做一次资料检索' }, new AbortController().signal)
+    expect(value.cli).toBe('grok')
+    expect(value.notes.some(note => note.includes('按任务类型命中'))).toBe(true)
+  })
+
+  it('falls back to the default CLI when grok is disabled', async () => {
+    const cli = fakeCliSpawn(true)
+    const config = grokFixture({ enabled: false })
+    const { deps } = makeDeps(config, cli.spawnFn)
+    const value = await runDispatch(deps, { ...assessment, cli: 'grok', task: 'x' }, new AbortController().signal)
+    expect(value.cli).toBe('claude')
+    expect(value.notes.some(note => note.includes('grok 已停用'))).toBe(true)
+  })
+
+  it('fails with the frame causes when grok reports error_during_execution at exit 0', async () => {
+    const cli = fakeCliSpawn(false)
+    const { deps } = makeDeps(grokFixture(), cli.spawnFn)
+    await expect(runDispatch(deps, { ...assessment, cli: 'grok', task: 'x' }, new AbortController().signal))
+      .rejects.toThrow(/error_during_execution[\s\S]*upstream said no/)
+  })
+
+  it('rejects an anthropic-messages provider for grok in protocolProblem', async () => {
+    const cli = fakeCliSpawn(true)
+    const config = grokFixture({ dshModel: 'test-claude::test-claude-model' })
+    const { deps } = makeDeps(config, cli.spawnFn)
+    await expect(runDispatch(deps, { ...assessment, cli: 'grok', task: 'x' }, new AbortController().signal))
+      .rejects.toThrow(/grok 只认 OpenAI 兼容端点/)
   })
 })

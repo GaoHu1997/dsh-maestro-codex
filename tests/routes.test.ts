@@ -91,7 +91,7 @@ describe('handleOverview / handleTasks', () => {
     expect(handleOverview(makeDeps(effectiveOf({ claudeMinTaskDifficulty: 'low', codexMinTaskDifficulty: 'high' })).deps).body)
       .toMatchObject({ minTaskDifficulties: { claude: 'low', codex: 'high' } })
     expect(outcome.body).not.toHaveProperty('minTaskDifficulty')
-    expect(Object.keys(body.clis)).toEqual(['claude', 'codex'])
+    expect(Object.keys(body.clis)).toEqual(['claude', 'codex', 'grok'])
     expect(handleTasks(deps).status).toBe(200)
   })
 

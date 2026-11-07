@@ -4,11 +4,24 @@ import { scriptedSpawn } from './fake-child.js'
 
 describe('prepareInvocation', () => {
   it('uses cmd.exe on Windows so .cmd shims resolve', () => {
-    expect(prepareInvocation('git worktree add ../wt', 'win32')).toEqual({ file: 'cmd.exe', args: ['/d', '/s', '/c', 'git worktree add ../wt'] })
+    expect(prepareInvocation('git worktree add ../wt', 'win32')).toEqual({ file: 'cmd.exe', args: ['/d', '/s', '/c', '"git worktree add ../wt"'], windowsVerbatimArguments: true })
+  })
+
+  it('keeps embedded quotes intact through the verbatim wrapper', () => {
+    const plan = prepareInvocation('node -e "process.exit(3)"', 'win32')
+    expect(plan['args']).toEqual(['/d', '/s', '/c', '"node -e "process.exit(3)""'])
+    expect(plan['windowsVerbatimArguments']).toBe(true)
   })
 
   it('uses sh -c everywhere else', () => {
     expect(prepareInvocation('git worktree add ../wt', 'linux')).toEqual({ file: 'sh', args: ['-c', 'git worktree add ../wt'] })
+  })
+
+  it('propagates non-zero exit codes of quoted commands on real cmd.exe (regression: quoting used to swallow them)', async () => {
+    if (process.platform !== 'win32') return
+    const outcome = await runPrepare('node -e "process.exit(3)"', { cwd: process.cwd(), timeoutMs: 30_000 })
+    expect(outcome.ok).toBe(false)
+    expect(outcome.code).toBe(3)
   })
 })
 

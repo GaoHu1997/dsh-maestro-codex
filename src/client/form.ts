@@ -17,6 +17,7 @@ export interface SectionValue {
   minTaskDifficulty?: 'low' | 'medium' | 'high' | 'extreme'
   claudeMinTaskDifficulty?: 'low' | 'medium' | 'high' | 'extreme'
   codexMinTaskDifficulty?: 'low' | 'medium' | 'high' | 'extreme'
+  grokMinTaskDifficulty?: 'low' | 'medium' | 'high' | 'extreme'
   claudeEnabled?: boolean
   claudeTaskTypes?: string[]
   claudePermissionMode?: string
@@ -32,6 +33,14 @@ export interface SectionValue {
   codexConfigOverrides?: string[]
   codexDshModel?: string
   claudeDshModel?: string
+  grokEnabled?: boolean
+  grokTaskTypes?: string[]
+  grokPermissionMode?: string
+  grokBaseUrl?: string
+  grokApiKey?: string
+  grokCliPath?: string
+  grokDshModel?: string
+  grokThinking?: string
   /** 内置 dsh 子代理：只有类型与门槛两项可配。 */
   dshMinTaskDifficulty?: 'low' | 'medium' | 'high' | 'extreme'
   dshTaskTypes?: string[]
@@ -61,20 +70,20 @@ export interface SectionValue {
   maxConcurrentTasks?: number
 }
 
-/** Mirror host compatibility inheritance without coupling the two CLI settings. */
-export function cliMinTaskDifficulty(values: SectionValue, cli: 'claude' | 'codex'): NonNullable<SectionValue['minTaskDifficulty']> {
-  return (cli === 'claude' ? values.claudeMinTaskDifficulty : values.codexMinTaskDifficulty)
-    ?? values.minTaskDifficulty ?? 'medium'
+/** Mirror host compatibility inheritance without coupling the CLI settings. */
+export function cliMinTaskDifficulty(values: SectionValue, cli: 'claude' | 'codex' | 'grok'): NonNullable<SectionValue['minTaskDifficulty']> {
+  const own = cli === 'claude' ? values.claudeMinTaskDifficulty : cli === 'codex' ? values.codexMinTaskDifficulty : values.grokMinTaskDifficulty
+  return own ?? values.minTaskDifficulty ?? 'medium'
 }
 
 /** Fields persisted immediately on change. */
 export type ImmediateField =
-  | 'enabled' | 'claudeEnabled' | 'codexEnabled'
-  | 'defaultCli' | 'claudeMinTaskDifficulty' | 'codexMinTaskDifficulty' | 'claudePermissionMode' | 'codexSandbox'
-  | 'claudeDshModel' | 'codexDshModel'
+  | 'enabled' | 'claudeEnabled' | 'codexEnabled' | 'grokEnabled'
+  | 'defaultCli' | 'claudeMinTaskDifficulty' | 'codexMinTaskDifficulty' | 'grokMinTaskDifficulty' | 'claudePermissionMode' | 'grokPermissionMode' | 'codexSandbox'
+  | 'claudeDshModel' | 'codexDshModel' | 'grokDshModel'
   | 'dshMinTaskDifficulty' | 'dshTaskTypes'
-  | 'claudeThinking' | 'codexThinking'
-  | 'claudeTaskTypes' | 'codexTaskTypes'
+  | 'claudeThinking' | 'codexThinking' | 'grokThinking'
+  | 'claudeTaskTypes' | 'codexTaskTypes' | 'grokTaskTypes'
   | 'bridgeMcp'
   | 'bridgeSkills'
   | 'bridgeTools'
@@ -86,22 +95,24 @@ export type ImmediateField =
 /** A value an immediate field accepts. */
 export type ImmediateValue = string | boolean | readonly string[]
 
-/** The routable owners of task types: the two CLIs plus the built-in dsh fallback. */
-export type CliId = 'claude' | 'codex' | 'dsh'
+/** The routable owners of task types: the CLIs plus the built-in dsh fallback. */
+export type CliId = 'claude' | 'codex' | 'grok' | 'dsh'
 
 /** The task-type lists are mutually exclusive: a type names the executor that
  * can serve it, so two lists offering the same type would make routing a coin
  * flip. Shared by the toggle below and the card's per-owner hint. */
 export const TASK_TYPE_FIELDS: Readonly<Record<CliId, { own: ImmediateField; others: readonly { field: ImmediateField; owner: CliId }[] }>> = {
-  claude: { own: 'claudeTaskTypes', others: [{ field: 'codexTaskTypes', owner: 'codex' }, { field: 'dshTaskTypes', owner: 'dsh' }] },
-  codex: { own: 'codexTaskTypes', others: [{ field: 'claudeTaskTypes', owner: 'claude' }, { field: 'dshTaskTypes', owner: 'dsh' }] },
-  dsh: { own: 'dshTaskTypes', others: [{ field: 'claudeTaskTypes', owner: 'claude' }, { field: 'codexTaskTypes', owner: 'codex' }] },
+  claude: { own: 'claudeTaskTypes', others: [{ field: 'codexTaskTypes', owner: 'codex' }, { field: 'grokTaskTypes', owner: 'grok' }, { field: 'dshTaskTypes', owner: 'dsh' }] },
+  codex: { own: 'codexTaskTypes', others: [{ field: 'claudeTaskTypes', owner: 'claude' }, { field: 'grokTaskTypes', owner: 'grok' }, { field: 'dshTaskTypes', owner: 'dsh' }] },
+  grok: { own: 'grokTaskTypes', others: [{ field: 'claudeTaskTypes', owner: 'claude' }, { field: 'codexTaskTypes', owner: 'codex' }, { field: 'dshTaskTypes', owner: 'dsh' }] },
+  dsh: { own: 'dshTaskTypes', others: [{ field: 'claudeTaskTypes', owner: 'claude' }, { field: 'codexTaskTypes', owner: 'codex' }, { field: 'grokTaskTypes', owner: 'grok' }] },
 }
 
 /** Human name per task-type owner, for the "moved off X" note. */
 const OWNER_LABELS: Readonly<Record<CliId, string>> = {
   claude: 'claude cli',
   codex: 'codex cli',
+  grok: 'grok cli',
   dsh: 'dsh 子代理',
 }
 
@@ -110,19 +121,25 @@ const IMMEDIATE_LABELS: Readonly<Record<ImmediateField, string>> = {
   enabled: '插件总开关',
   claudeEnabled: 'claude CLI 开关',
   codexEnabled: 'codex CLI 开关',
+  grokEnabled: 'grok CLI 开关',
   defaultCli: '默认 CLI',
   claudeMinTaskDifficulty: 'claude 最低任务难度',
   codexMinTaskDifficulty: 'codex 最低任务难度',
+  grokMinTaskDifficulty: 'grok 最低任务难度',
   claudePermissionMode: 'claude 权限模式',
+  grokPermissionMode: 'grok 权限模式',
   codexSandbox: 'codex 沙箱',
   claudeDshModel: 'claude 模型',
   codexDshModel: 'codex 模型',
+  grokDshModel: 'grok 模型',
   dshMinTaskDifficulty: 'dsh 子代理最低任务难度',
   dshTaskTypes: 'dsh 子代理的任务类型',
   claudeThinking: 'claude 思考等级',
   codexThinking: 'codex 思考等级',
+  grokThinking: 'grok 思考等级',
   claudeTaskTypes: 'claude 的任务类型',
   codexTaskTypes: 'codex 的任务类型',
+  grokTaskTypes: 'grok 的任务类型',
   bridgeMcp: 'MCP 桥接',
   bridgeSkills: '技能桥接',
   bridgeTools: '工具桥接',
@@ -143,6 +160,7 @@ export type StagedField =
   | 'codexConfigOverrides'
   | 'claudeBaseUrl' | 'claudeAuthToken' | 'claudeCliPath'
   | 'codexBaseUrl' | 'codexApiKey' | 'codexCliPath'
+  | 'grokBaseUrl' | 'grokApiKey' | 'grokCliPath'
   | 'npmRegistry' | 'timeoutMinutes' | 'maxConcurrentTasks' | 'failureRetries'
   | 'bridgeToolAllowlist'
 
@@ -419,7 +437,7 @@ export class MaestroForm {
     // An immediate click shows at once; the snapshot catches up on its own.
     const draftValues = values as unknown as Record<string, ImmediateValue | undefined>
     for (const [field, value] of this.optimistic) draftValues[field] = value
-    for (const field of ['claudeTaskTypes', 'codexTaskTypes', 'dshTaskTypes'] as const) {
+    for (const field of ['claudeTaskTypes', 'codexTaskTypes', 'grokTaskTypes', 'dshTaskTypes'] as const) {
       const types = values[field]
       if (Array.isArray(types)) values[field] = normalizeTaskTypes(types)
     }

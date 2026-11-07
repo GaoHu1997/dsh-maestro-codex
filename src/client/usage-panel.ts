@@ -70,7 +70,7 @@ const ZERO_SUMMARY: UsageSummary = {
   requests: 0, ok: 0, failed: 0, cancelled: 0,
   inputTokens: 0, outputTokens: 0, cachedInputTokens: 0, cacheWriteTokens: 0,
   durationMs: 0, knownTokens: {},
-  perCli: { claude: EMPTY_BUCKET, codex: EMPTY_BUCKET },
+  perCli: { claude: EMPTY_BUCKET, codex: EMPTY_BUCKET, grok: EMPTY_BUCKET },
   recent: [],
   sessions: 0,
   daily: [],
@@ -101,7 +101,7 @@ export function summarizeUsage(
   const since = windowMs === USAGE_WINDOW_MS ? firstDate.getTime() : now - windowMs
   const knownTokens: Record<TokenKey, number> = { inputTokens: 0, outputTokens: 0, cachedInputTokens: 0, cacheWriteTokens: 0 }
   const unknown = new Set<TokenKey>()
-  const perCli: Record<MaestroCliId, UsageCliBucket> = { claude: { ...EMPTY_BUCKET }, codex: { ...EMPTY_BUCKET } }
+  const perCli: Record<MaestroCliId, UsageCliBucket> = { claude: { ...EMPTY_BUCKET }, codex: { ...EMPTY_BUCKET }, grok: { ...EMPTY_BUCKET } }
   let requests = 0
   let ok = 0
   let failed = 0
@@ -119,7 +119,7 @@ export function summarizeUsage(
     const records = state.recent ?? []
     if (records.length > 0) sessions += 1
     for (const record of records) {
-      if (record == null || typeof record.startedAt !== 'number' || !Number.isFinite(record.startedAt) || record.startedAt < since || record.startedAt > now || (record.cli !== 'claude' && record.cli !== 'codex')) continue
+      if (record == null || typeof record.startedAt !== 'number' || !Number.isFinite(record.startedAt) || record.startedAt < since || record.startedAt > now || (record.cli !== 'claude' && record.cli !== 'codex' && record.cli !== 'grok')) continue
       const isOk = record.phase === 'done'
       const isFailed = record.phase === 'failed' || record.phase === 'timeout'
       for (const key of TOKEN_KEYS) {

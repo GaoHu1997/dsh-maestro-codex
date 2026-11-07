@@ -31,20 +31,23 @@ describe('independent CLI status refresh', () => {
     const { store } = harness()
     expect(store.get().claude).toMatchObject({ installed: false, checking: true })
     expect(store.get().codex).toMatchObject({ installed: false, checking: true })
+    expect(store.get().grok).toMatchObject({ installed: false, checking: true })
     expect(store.get().claude.error).toBeUndefined()
   })
 
   it('publishes a fast CLI before the other probe finishes', async () => {
     const { store, probes } = harness()
     const pass = store.refresh()
-    expect(probes).toHaveLength(2)
+    expect(probes).toHaveLength(3)
     probes[0]!.resolve(detected('1.2.3', '/claude-v1'))
     await drain()
     expect(store.get().claude).toMatchObject({ installed: true, version: '1.2.3', checking: false })
     expect(store.get().codex.checking).toBe(true)
     probes[1]!.resolve(detected('4.5.6', '/codex-v1'))
+    probes[2]!.resolve(detected('7.0.0', '/grok-v1'))
     await pass
     expect(store.get().codex).toMatchObject({ version: '4.5.6', checking: false })
+    expect(store.get().grok).toMatchObject({ version: '7.0.0', checking: false })
   })
 
   it('coalesces full, periodic and single-CLI refresh requests', async () => {
@@ -52,12 +55,13 @@ describe('independent CLI status refresh', () => {
     const first = store.refresh()
     const second = store.refresh()
     const route = handleCliRefresh({ statusStore: store, pathCache: { invalidate: vi.fn() } } as unknown as RouteDeps, { cli: 'claude' })
-    expect(detector).toHaveBeenCalledTimes(2)
+    expect(detector).toHaveBeenCalledTimes(3)
     probes[0]!.resolve(detected('1.0.0'))
     probes[1]!.resolve(detected('2.0.0'))
+    probes[2]!.resolve(detected('3.0.0'))
     await Promise.all([first, second])
     expect((await route).status).toBe(200)
-    expect(detector).toHaveBeenCalledTimes(2)
+    expect(detector).toHaveBeenCalledTimes(3)
   })
 
   it('contains an unexpected detector rejection without losing the other CLI', async () => {
@@ -65,9 +69,11 @@ describe('independent CLI status refresh', () => {
     const pass = store.refresh()
     probes[0]!.reject(new Error('bad probe'))
     probes[1]!.resolve(detected('2.0.0'))
+    probes[2]!.resolve(detected('3.0.0'))
     await expect(pass).resolves.toBeUndefined()
     expect(store.get().claude).toMatchObject({ checking: false, error: 'CLI 检测失败：bad probe' })
     expect(store.get().codex).toMatchObject({ installed: true, version: '2.0.0' })
+    expect(store.get().grok).toMatchObject({ installed: true, version: '3.0.0' })
   })
 
   it('preserves the last successful installation on a transient probe exception', async () => {

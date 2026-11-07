@@ -8,7 +8,17 @@
 import { TASK_DIFFICULTIES, TASK_DIFFICULTY_LABELS, isTaskDifficulty, type EffectiveConfig, type TaskDifficulty } from './config.js'
 import { normalizeTaskTypes, taskTypeKeywords, type MaestroCliId } from './wire.js'
 
-export const CLI_IDS: readonly MaestroCliId[] = ['claude', 'codex']
+export const CLI_IDS: readonly MaestroCliId[] = ['claude', 'codex', 'grok']
+
+/** Whether one CLI is enabled; absent blocks (defensive against stale configs). */
+function enabledOf(config: EffectiveConfig, cli: MaestroCliId): boolean {
+  return config[cli]?.enabled === true
+}
+
+/** Task types configured for one CLI. */
+function taskTypesOf(config: EffectiveConfig, cli: MaestroCliId): readonly string[] {
+  return config[cli]?.taskTypes ?? []
+}
 
 /** The routing decision for one dispatch request. */
 export interface RoutingDecision {
@@ -92,22 +102,20 @@ export function pickCli(config: EffectiveConfig, requested: string, taskText: st
     if (!(CLI_IDS as readonly string[]).includes(wanted)) {
       throw new RoutingError(`未知 CLI "${requested}"（支持 ${CLI_IDS.join(' / ')} 或 auto）`)
     }
-    const enabled = wanted === 'claude' ? config.claude.enabled : config.codex.enabled
-    if (!enabled) {
-      const fallback = otherOf(wanted as MaestroCliId)
-      const fallbackEnabled = fallback === 'claude' ? config.claude.enabled : config.codex.enabled
-      if (!fallbackEnabled) throw new RoutingError(`${wanted} 已停用，且另一个 CLI 也未启用`)
+    if (!enabledOf(config, wanted as MaestroCliId)) {
+      const fallback = fallbackOf(config, wanted as MaestroCliId)
+      if (fallback === undefined) throw new RoutingError(`${wanted} 已停用，且没有其他已启用的 CLI`)
       return { cli: fallback, reason: 'default', note: `${wanted} 已停用，回落到 ${fallback}` }
     }
     return { cli: wanted as MaestroCliId, reason: 'requested', note: undefined }
   }
   const scored = CLI_IDS
-    .filter(cli => (cli === 'claude' ? config.claude.enabled : config.codex.enabled))
+    .filter(cli => enabledOf(config, cli))
     .map(cli => ({ cli, score: keywordScore(config, cli, taskText) }))
     .sort((a, b) => b.score - a.score)
-  if (scored.length === 0) throw new RoutingError('两个 CLI 都未启用，无法派发任务')
+  if (scored.length === 0) throw new RoutingError('没有已启用的 CLI，无法派发任务')
   const best = scored[0]
-  if (best === undefined) throw new RoutingError('两个 CLI 都未启用，无法派发任务')
+  if (best === undefined) throw new RoutingError('没有已启用的 CLI，无法派发任务')
   // A task type that belongs to the built-in dsh fallback is not a CLI job:
   // refuse it before the default CLI can silently take it. A tie keeps the CLI
   // (a stale config may still list one type on both sides).
@@ -134,19 +142,24 @@ export function pickCli(config: EffectiveConfig, requested: string, taskText: st
     }
   }
   const preferred = config.defaultCli
-  const preferredEnabled = preferred === 'claude' ? config.claude.enabled : config.codex.enabled
-  const chosen = preferredEnabled ? preferred : best.cli
+  const chosen = enabledOf(config, preferred) ? preferred : best.cli
   return { cli: chosen, reason: 'default', note: best.score === 0 ? `无任务类型命中，使用默认 ${chosen}` : undefined }
 }
 
-function otherOf(cli: MaestroCliId): MaestroCliId {
-  return cli === 'claude' ? 'codex' : 'claude'
+/**
+ * The CLI a disabled one falls back to: the configured default when enabled,
+ * otherwise any enabled CLI. With two CLIs this is exactly the old pairwise
+ * swap; with three it avoids surprising hops to a CLI the operator did not
+ * prefer.
+ */
+function fallbackOf(config: EffectiveConfig, cli: MaestroCliId): MaestroCliId | undefined {
+  if (config.defaultCli !== cli && enabledOf(config, config.defaultCli)) return config.defaultCli
+  return CLI_IDS.find(candidate => candidate !== cli && enabledOf(config, candidate))
 }
 
 /** Case-insensitive keyword hit count of one CLI's task types in the task text. */
 export function keywordScore(config: EffectiveConfig, cli: MaestroCliId, taskText: string): number {
-  const types = cli === 'claude' ? config.claude.taskTypes : config.codex.taskTypes
-  return hitTaskTypes(types, taskText).length
+  return hitTaskTypes(taskTypesOf(config, cli), taskText).length
 }
 
 /**
@@ -180,6 +193,14 @@ export function routingHint(config: EffectiveConfig, toolName: string, unavailab
       + `，沙箱 ${config.codex.sandbox}`,
     )
   }
+  if (config.grok.enabled) {
+    const permission = config.grok.permissionMode === 'inherit' ? 'CLI 默认策略' : config.grok.permissionMode
+    sections.push(
+      `- grok cli：擅长 ${normalizeTaskTypes(config.grok.taskTypes).join('、') || '（未配置任务类型）'}`
+      + `，最低任务难度：${TASK_DIFFICULTY_LABELS[config.grok.minTaskDifficulty]}（${config.grok.minTaskDifficulty}）`
+      + `，权限 ${permission}`,
+    )
+  }
   if (sections.length === 0) return ''
   const dshMin = dshMinimum(config)
   sections.push(
@@ -196,7 +217,7 @@ export function routingHint(config: EffectiveConfig, toolName: string, unavailab
     '- 高（high）：跨模块重构、多个组件协作且有明显依赖或回归风险的任务。',
     '- 极高（extreme）：系统级复杂任务，涉及架构级约束、广泛依赖或高风险迁移。',
     '- 调用必须填写 task_difficulty（low / medium / high / extreme）和非空 difficulty_reason（说明范围、步骤、依赖或风险，最多 2000 字符）；不要为了触发 CLI 夸大难度。旧调用缺评估保守按 low，不根据关键词推断为高难度。',
-    '- 运行端先确定真实 CLI，再在创建任务或启动进程前检查该 CLI 的门槛；指定 cli="claude" / "codex" 或用户点名也不能绕过。被请求的 CLI 停用时，检查回落 CLI 的门槛；不会因为另一个 CLI 门槛较低而重新路由。',
+    '- 运行端先确定真实 CLI，再在创建任务或启动进程前检查该 CLI 的门槛；指定 cli="claude" / "codex" / "grok" 或用户点名也不能绕过。被请求的 CLI 停用时，检查回落 CLI 的门槛；不会因为另一个 CLI 门槛较低而重新路由。',
     '路由表（确定真实 CLI 后检查其独立门槛）：',
     ...sections,
     `不指定 cli 参数时按任务类型自动路由，缺省使用 ${config.defaultCli}。调用要求：`,

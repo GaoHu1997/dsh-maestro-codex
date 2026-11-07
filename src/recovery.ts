@@ -39,7 +39,7 @@ function seedOf(row: EffectRow): InterruptedSeed | undefined {
   const record = value as Record<string, unknown>
   const taskId = textOf(record['taskId']) ?? textOf(row.key)
   const cli = record['cli']
-  if (taskId === undefined || (cli !== 'claude' && cli !== 'codex')) return undefined
+  if (taskId === undefined || (cli !== 'claude' && cli !== 'codex' && cli !== 'grok')) return undefined
   return {
     taskId,
     cli,

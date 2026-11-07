@@ -190,7 +190,14 @@ export async function runNpmJob(options: {
     onStdoutLine: options.onLine,
   })
   const ended = await outcome
-  return { ok: !ended.timedOut && ended.code === 0, exitCode: ended.code, stderrTail: ended.stderrTail, timedOut: ended.timedOut }
+  // EBADPLATFORM（真机实测踩过）：npm 镜像源的 dist-tags 可能过期，把 latest
+  // 解析到一个不支持当前平台的远古版本。提示里给出可操作的解法，而不是让
+  // 用户面对一行裸 npm 错误。
+  let stderrTail = ended.stderrTail
+  if (!ended.timedOut && ended.code !== 0 && /EBADPLATFORM/.test(stderrTail)) {
+    stderrTail = `${stderrTail}\n提示：该安装包声明了平台限制，且当前 registry 解析到的版本可能已过期。请在插件配置页把 npm registry 换成官方源（https://registry.npmjs.org/）后重试。`
+  }
+  return { ok: !ended.timedOut && ended.code === 0, exitCode: ended.code, stderrTail, timedOut: ended.timedOut }
 }
 
 /**

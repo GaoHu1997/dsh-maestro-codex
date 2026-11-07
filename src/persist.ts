@@ -152,7 +152,7 @@ function isPersistedRecord(value: unknown): value is PersistedTask {
   if (typeof value !== 'object' || value === null) return false
   const record = value as Record<string, unknown>
   return typeof record['id'] === 'string' && record['id'].startsWith('task-')
-    && (record['cli'] === 'claude' || record['cli'] === 'codex')
+    && (record['cli'] === 'claude' || record['cli'] === 'codex' || record['cli'] === 'grok')
     && typeof record['phase'] === 'string'
     && (TERMINAL_PHASES as readonly string[]).includes(record['phase'])
     && typeof record['startedAt'] === 'number'

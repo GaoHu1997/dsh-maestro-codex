@@ -16,3 +16,5 @@ scripts/import-task-renderer.mjs
 /release-tests/
 /session-history-*.json
 /session-repair-scan-*.json
+/zcode/
+/.zcode/

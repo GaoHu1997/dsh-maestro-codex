@@ -18,15 +18,24 @@ export class FakeChild extends EventEmitter implements Partial<ChildProcess> {
   stdinText: string | undefined
   readonly spawnArgs: string[]
   readonly spawnFile: string
+  /** The options runProcess passed to spawn (cwd/env/…) — captured for assertions. */
+  readonly spawnOptions: Record<string, unknown>
 
-  constructor(file: string, args: readonly string[]) {
+  constructor(file: string, args: readonly string[], options: Record<string, unknown> = {}) {
     super()
     this.spawnFile = file
     this.spawnArgs = [...args]
+    this.spawnOptions = options
     this.stdin.end = (input?: string) => {
       this.stdinText = input
       this.onStdin?.(input ?? '')
     }
+  }
+
+  /** The child env overlay (runProcess passes only the extra vars). */
+  env(): Record<string, string> | undefined {
+    const env = this.spawnOptions['env']
+    return typeof env === 'object' && env !== null ? env as Record<string, string> : undefined
   }
 
   onStdin: ((input: string) => void) | undefined
@@ -56,13 +65,13 @@ export class FakeChild extends EventEmitter implements Partial<ChildProcess> {
   private killSignal: NodeJS.Signals | null = null
 }
 
-export type ScriptedSpawn = (file: string, args: readonly string[]) => FakeChild
+export type ScriptedSpawn = (file: string, args: readonly string[], options?: Record<string, unknown>) => FakeChild
 
 /** Build a spawnFn that routes by the argv shape and records every launch. */
 export function scriptedSpawn(script: (child: FakeChild) => void): { spawnFn: ScriptedSpawn; launches: FakeChild[] } {
   const launches: FakeChild[] = []
-  const spawnFn: ScriptedSpawn = (file, args) => {
-    const child = new FakeChild(file, args)
+  const spawnFn: ScriptedSpawn = (file, args, options) => {
+    const child = new FakeChild(file, args, options)
     launches.push(child)
     script(child)
     return child as unknown as FakeChild

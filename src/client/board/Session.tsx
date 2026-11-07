@@ -299,6 +299,8 @@ const SESSION_CSS = `
 .dms-cli-badge[data-cli="claude"] .dms-cli-logo { -webkit-mask-image: ${EXECUTOR_BRANDS['claude']!.mask}; mask-image: ${EXECUTOR_BRANDS['claude']!.mask}; }
 .dms-cli-badge[data-cli="codex"] { color: ${EXECUTOR_BRANDS['codex']!.color}; }
 .dms-cli-badge[data-cli="codex"] .dms-cli-logo { -webkit-mask-image: ${EXECUTOR_BRANDS['codex']!.mask}; mask-image: ${EXECUTOR_BRANDS['codex']!.mask}; }
+.dms-cli-badge[data-cli="grok"] { color: ${EXECUTOR_BRANDS['grok']!.color}; }
+.dms-cli-badge[data-cli="grok"] .dms-cli-logo { -webkit-mask-image: ${EXECUTOR_BRANDS['grok']!.mask}; mask-image: ${EXECUTOR_BRANDS['grok']!.mask}; }
 .dms-toolrow-actions { display: flex; align-items: center; gap: 8px; margin-left: auto; }
 /* 发送：宿主 InputBar 的 primary 圆钮（34px，上箭头）。 */
 .dms-send {

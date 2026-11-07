@@ -10,7 +10,7 @@ dsh 的 CLI 子代理编排插件：把会话中的任务按类型派发给 **co
 
 - **按类型把任务派发给多执行器**：主会话注册 `dispatch_cli_task` 工具，主代理先判断该不该开子代理——不需要就自己完成；需要时评估难度并给出理由，达到门槛才派给 claude cli / codex cli，未达门槛改用内置 dsh 子代理，结果自动回填主会话。
 - **门槛与路由自己定**：claude / codex 各自独立的最低难度（低 / 中 / 高 / 极高），互不影响；13 个内置任务类型在配置页按卡片点选分配给任一 CLI，显式指定 `cli` 也绕不过门槛。
-- **CLI 装卸与权限一站式**：配置页检测版本、npm -g 安装 / 卸载 Claude Code 与 Codex（支持自定义 registry）；claude 权限策略（`default / acceptEdits / plan / bypassPermissions`）与 codex 沙箱档位、并发上限都在配置页设置；连续无输出超时是 claude / codex 共用的一项配置。
+- **CLI 装卸与权限一站式**：配置页检测版本、npm -g 安装 / 卸载 Claude Code、Codex 与 Grok CLI（`@xai-official/grok`，支持自定义 registry）；claude / grok 权限策略与 codex 沙箱档位、并发上限都在配置页设置；连续无输出超时是所有 CLI 共用的一项配置。
 - **模型与思考等级沿用 dsh**：下拉直选 dsh 中已配置的供应商与模型，插件自动注入端点、密钥与协议方言并在 spawn 前做模型预检；思考等级取自所选模型自身的 `reasoningEfforts` 档位。
 - **技能与工具随任务桥接**：dsh 技能目录（两段式按需加载全文）与宿主工具经随包的 `dsh_bridge` MCP 服务器交给子代理，claude 可选原生 `.claude/skills` 暂存模式。
 - **执行过程全程可见**：任务监视看进度事件流、取消、超时与并发；任务看板看主智能体与全部子智能体的分层树状图；CLI 会话页回放对话、统计 Token 用量，并可直接续发消息（resume）接着跑。
@@ -67,6 +67,7 @@ dsh 的 CLI 子代理编排插件：把会话中的任务按类型派发给 **co
 
 - claude：`claude -p --output-format stream-json --verbose`，任务文本走 stdin；`resume` 时追加 `--resume <sessionId>`。
 - codex：`codex exec --json --skip-git-repo-check --ignore-user-config -`，任务文本走 stdin；`resume` 时为 `codex exec resume <threadId> --json …`，续接指令同样走 stdin。
+- grok：`grok -p - --output-format streaming-messages-json`，任务文本走 stdin；模型/密钥/端点经 `XAI_API_KEY` 与 `GROK_XAI_API_BASE_URL` 注入，思考等级走 `--reasoning-effort`，dsh_bridge MCP 服务器写进 maestro 专属的 `GROK_HOME` config.toml（隔离操作员自己的 `~/.grok` 配置，会话持久化在该目录以支持 resume）；`resume` 时追加 `-r <sessionId>`。
 
 ## 安装包内容与入口
 
@@ -75,6 +76,14 @@ dsh 的 CLI 子代理编排插件：把会话中的任务按类型派发给 **co
 主入口仍为 [lib/index.js](<lib/index.js>)，声明为 [lib/index.d.ts](<lib/index.d.ts>)。`dsh-maestro-codex/client` 的声明由真实 [客户端入口](https://github.com/GaoHu1997/dsh-maestro-codex/blob/master/src/client/index.ts) 生成到 [lib/client.d.cts](<lib/client.d.cts>)；对应 [lib/client.js](<lib/client.js>) 是交给 DSH Web `__ModuleLoader__` 的 CJS factory，不是独立 Node 命令或可在 Node 直接执行的浏览器模块。下列开发命令只在源码仓库使用；安装包的运行桥是 [lib/bridge-shim.js](<lib/bridge-shim.js>)，不需要开发期 `build-upstream` 脚本。
 
 ## 版本日志
+
+### 0.1.13
+
+- **新增 grok cli 执行器**：支持把任务派发给 xAI 官方 Grok Build CLI（`@xai-official/grok`，headless `grok -p - --output-format streaming-messages-json`）。该输出与 claude stream-json 同构（Anthropic Messages wire），帧解析复用 claude 通道；错误帧退出码可为 0，按帧判定成败。模型/密钥/端点经 `XAI_API_KEY` 与 `GROK_XAI_API_BASE_URL` 注入，思考等级走 `--reasoning-effort`（档位不认时跳过并提示），`resume` 用 `-r <sessionId>`。
+- **派发隔离与配置**：每次派发写入 maestro 专属 `GROK_HOME`（`$DSH_HOME/maestro/grok-home`）的 config.toml，只含当前桥接的 dsh MCP 服务器——密钥不落盘，经 mcp-env-shim 从子进程环境还原（与 codex 同款 `MAESTRO_MCP_SECRET_*` 别名），并 `--allow mcp__<server>` 预授权；操作员自己的 `~/.grok` 配置不参与派发，会话持久化在专属 home 以支持跨运行续接。配置页新增 grok 卡片（开关、任务类型、最低难度、权限模式、dsh 模型、思考等级、连接设置），默认关闭，不影响现有路由。
+- **路由泛化**：`cli` 参数与 auto 路由支持 `grok`；被点名 CLI 停用时回落到默认 CLI（启用时），否则任一启用 CLI，不再假设只有两个 CLI。协议闸门对 grok 只放行 OpenAI 兼容端点，预检按 chat completions 方言探测（grok 实际上游），端点声明 responses 也照此改写。
+- **Windows 启动修复**：npm 安装的 grok.cmd shim 与 codex 同样经 cmd.exe 转发 `%*` 破坏引号，识别后改 node 直启 `@xai-official/grok/bin/grok`（兄弟 node.exe 优先、PATH 回退）；`prepareCommand` 在 Windows 上改用 verbatim 引号包裹，`node -e "process.exit(3)"` 这类含引号命令的退出码不再被静默吞成 0。
+- **杂项**：npm 安装遇 EBADPLATFORM 时提示换官方 registry 重试（镜像 dist-tags 可能过期）；看板与任务列表增加 grok 品牌色与徽标；locale 与 SDK 卡片同步 grok 文案。
 
 ### 0.1.12
 

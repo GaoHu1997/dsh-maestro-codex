@@ -20,7 +20,7 @@ export interface CliChildRecordEventData {
   readonly source: string
   readonly usageId: string
   readonly accounting: 'native-mirror-of-parent-cli-ledger'
-  readonly cli?: 'claude' | 'codex'
+  readonly cli?: 'claude' | 'codex' | 'grok'
   readonly provider?: string
   readonly model?: string
   readonly inputSemantics?: 'uncached' | 'includes-cache' | 'unknown'

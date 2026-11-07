@@ -23,10 +23,14 @@ describe('pickCli', () => {
     expect(decision.note).toContain('回落')
   })
 
-  it('fails when both CLIs are disabled', () => {
+  it('fails when no CLI is enabled', () => {
     const base = effectiveOf({})
-    const cfg = config({ claude: { ...base.claude, enabled: false }, codex: { ...base.codex, enabled: false } })
-    expect(() => pickCli(cfg, 'auto', 'x')).toThrow(/都未启用/)
+    const cfg = config({
+      claude: { ...base.claude, enabled: false },
+      codex: { ...base.codex, enabled: false },
+      grok: { ...base.grok, enabled: false },
+    })
+    expect(() => pickCli(cfg, 'auto', 'x')).toThrow(/没有已启用的 CLI/)
   })
 
   it('routes by task-type keywords', () => {
@@ -80,6 +84,33 @@ describe('pickCli', () => {
     cfg.defaultCli = 'codex'
     expect(pickCli(cfg, 'auto', '无命中').cli).toBe('codex')
     expect(pickCli(cfg, 'auto', '重构项目测试').cli).toBe('codex')
+  })
+
+  it('routes to an enabled grok by keywords and honors an explicit request', () => {
+    const cfg = effectiveOf({ grokEnabled: true, grokTaskTypes: ['资料检索'] })
+    expect(pickCli(cfg, 'grok', '随便').reason).toBe('requested')
+    const decision = pickCli(cfg, 'auto', '帮我做一次资料检索')
+    expect(decision.cli).toBe('grok')
+    expect(decision.reason).toBe('keyword')
+  })
+
+  it('never scores a disabled grok and falls a grok request back to the default', () => {
+    // grok defaults to disabled: a type only it owns cannot route while off.
+    const cfg = effectiveOf({ grokTaskTypes: ['知识索引'] })
+    expect(pickCli(cfg, 'auto', '帮我做一次知识索引').reason).toBe('default')
+    const decision = pickCli(cfg, 'grok', 'x')
+    expect(decision.cli).toBe('claude')
+    expect(decision.note).toContain('grok 已停用')
+    // The default wins the fallback when it is not the requested CLI.
+    const grokDefault = effectiveOf({ grokEnabled: true, defaultCli: 'grok', claudeEnabled: false })
+    expect(pickCli(grokDefault, 'claude', 'x').cli).toBe('grok')
+  })
+
+  it('prefers the default over a surprising hop when the requested CLI is disabled', () => {
+    // default grok, claude+codex disabled: a codex request falls back to grok
+    // (the default), not to claude just because it sorts first.
+    const cfg = effectiveOf({ grokEnabled: true, defaultCli: 'grok', claudeEnabled: false, codexEnabled: false })
+    expect(pickCli(cfg, 'codex', 'x').cli).toBe('grok')
   })
 })
 

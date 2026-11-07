@@ -27,7 +27,7 @@ const markup = (nodes: TasksAgentNode[]) => [
 ]
 
 describe('CLI executor identity and measured usage', () => {
-  it.each(['codex', 'claude'] as const)('labels %s in the right-aligned identity row of both renderers', cli => {
+  it.each(['codex', 'claude', 'grok'] as const)('labels %s in the right-aligned identity row of both renderers', cli => {
     const input = boardRendererInput(attachRows(buildSessionTree({ rootId: 'root', sessions }), { tasks: [task(cli)] }), 'root')
     const nodes = renderBoardNodes(input, { folded: false }).filter((node): node is TasksAgentNode => node.kind === 'agent')
     expect(nodes.find(node => node.id === 'cli:task-a')?.executor).toBe(cli)

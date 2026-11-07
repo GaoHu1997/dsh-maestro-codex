@@ -97,6 +97,7 @@ export class StatusStore {
   private snapshot: Record<MaestroCliId, MaestroCliStatus> = {
     claude: { installed: false, version: '', path: '', checking: true },
     codex: { installed: false, version: '', path: '', checking: true },
+    grok: { installed: false, version: '', path: '', checking: true },
   }
   private readonly refreshing = new Map<MaestroCliId, { override: string; controller: AbortController; promise: Promise<void> }>()
   private readonly overrides = new Map<MaestroCliId, string>()
@@ -105,7 +106,11 @@ export class StatusStore {
 
   /** A copy — callers never mutate the store's internal snapshot. */
   get(): Record<MaestroCliId, MaestroCliStatus> {
-    return { claude: { ...this.snapshot.claude }, codex: { ...this.snapshot.codex } }
+    return {
+      claude: { ...this.snapshot.claude },
+      codex: { ...this.snapshot.codex },
+      grok: { ...this.snapshot.grok },
+    }
   }
 
   set(cli: MaestroCliId, status: MaestroCliStatus): void {
@@ -183,8 +188,8 @@ export function handleOverview(deps: RouteDeps): RouteOutcome {
     clis: deps.statusStore.get(),
     enabled: config.enabled,
     defaultCli: config.defaultCli,
-    minTaskDifficulties: { claude: config.claude.minTaskDifficulty, codex: config.codex.minTaskDifficulty },
-    dshModels: { claude: config.claude.dshModel, codex: config.codex.dshModel },
+    minTaskDifficulties: { claude: config.claude.minTaskDifficulty, codex: config.codex.minTaskDifficulty, grok: config.grok.minTaskDifficulty },
+    dshModels: { claude: config.claude.dshModel, codex: config.codex.dshModel, grok: config.grok.dshModel },
     dsh: {
       minTaskDifficulty: config.dsh.minTaskDifficulty,
       taskTypes: config.dsh.taskTypes,

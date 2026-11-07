@@ -16,6 +16,7 @@
 
 import type { DshModelEndpoint, DshModelInfo } from './dsh-models.js'
 import { publicEndpointUrl, transportDiagnostic } from './public-diagnostics.js'
+import type { MaestroCliId } from './wire.js'
 
 /** How long the probe may take before the dispatch stops waiting for it. */
 export const PREFLIGHT_TIMEOUT_MS = 8_000
@@ -111,16 +112,22 @@ export function classifyProbe(endpoint: DshModelEndpoint, status: number, bodyTe
  * Ask the endpoint to serve one token of this model.
  *
  * Transport failures become `unknown`; caller cancellation always propagates
- * unchanged and must never authorize a CLI launch.
+ * unchanged and must never authorize a CLI launch. The probe speaks the dialect
+ * the CLI actually talks, not the declared one: codex drives completions-declared
+ * providers over `/responses`, and grok calls `/chat/completions` upstream — so
+ * a grok dispatch probes the completions shape regardless of the declaration.
  */
 export async function probeDshEndpoint(
   endpoint: DshModelEndpoint,
-  options: { fetchImpl?: typeof fetch | undefined; timeoutMs?: number | undefined; cli?: 'codex' | 'claude' | undefined; signal?: AbortSignal | undefined } = {},
+  options: { fetchImpl?: typeof fetch | undefined; timeoutMs?: number | undefined; cli?: MaestroCliId | undefined; signal?: AbortSignal | undefined } = {},
 ): Promise<DshPreflight> {
   const fetchImpl = options.fetchImpl ?? fetch
   const timeoutMs = options.timeoutMs ?? PREFLIGHT_TIMEOUT_MS
   const actualEndpoint: DshModelEndpoint = options.cli === 'codex' && endpoint.api === 'openai-completions'
-    ? { ...endpoint, api: 'openai-responses' } : endpoint
+    ? { ...endpoint, api: 'openai-responses' }
+    : options.cli === 'grok' && endpoint.api === 'openai-responses'
+      ? { ...endpoint, api: 'openai-completions' }
+      : endpoint
   const { url, init } = probeRequest(actualEndpoint)
   options.signal?.throwIfAborted()
   const controller = new AbortController()
@@ -148,7 +155,7 @@ export async function probeDshEndpoint(
 export async function preflightDshModel(
   endpoint: DshModelEndpoint,
   declared: readonly DshModelInfo[],
-  options: { fetchImpl?: typeof fetch | undefined; timeoutMs?: number | undefined; cli?: 'codex' | 'claude' | undefined; signal?: AbortSignal | undefined } = {},
+  options: { fetchImpl?: typeof fetch | undefined; timeoutMs?: number | undefined; cli?: MaestroCliId | undefined; signal?: AbortSignal | undefined } = {},
 ): Promise<DshPreflight> {
   const note = declaredModelProblem(endpoint, declared)
   const verdict = await probeDshEndpoint(endpoint, options)

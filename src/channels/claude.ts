@@ -23,8 +23,12 @@ export interface ClaudeRunResult {
   error: string | undefined
 }
 
-/** Claude stream-json frames this channel understands (fields it reads only). */
-interface ClaudeFrame {
+/**
+ * Claude stream-json frames this channel understands (fields it reads only).
+ * Grok's `--output-format streaming-messages-json` speaks the same
+ * Anthropic Messages NDJSON wire, so the grok channel reuses these parsers.
+ */
+export interface ClaudeFrame {
   type?: string
   subtype?: string
   session_id?: string
@@ -170,7 +174,7 @@ function toolUseSummary(block: { name?: string; input?: Record<string, unknown> 
 }
 
 /** Ignore malformed/null content blocks without losing subsequent frames. */
-function claudeBlocks(frame: ClaudeFrame): NonNullable<NonNullable<ClaudeFrame['message']>['content']> {
+export function claudeBlocks(frame: ClaudeFrame): NonNullable<NonNullable<ClaudeFrame['message']>['content']> {
   const blocks = frame.message?.content
   return Array.isArray(blocks) ? blocks.filter(block => typeof block === 'object' && block !== null && !Array.isArray(block)) : []
 }

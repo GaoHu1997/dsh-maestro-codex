@@ -16,7 +16,7 @@ export interface UsageJournalStatus {
   readonly hostFlushAcknowledged: number
   readonly hostFlushUnavailable: number
 }
-interface PendingRecord { version: 1; taskId: string; cli: 'codex' | 'claude'; sessionId?: string | undefined; startedAt: number; model: string }
+interface PendingRecord { version: 1; taskId: string; cli: 'codex' | 'claude' | 'grok'; sessionId?: string | undefined; startedAt: number; model: string }
 const digest = (value: unknown): string => createHash('sha256').update(JSON.stringify(value)).digest('hex')
 const pendingKey = (record: Pick<CliUsageRecord, 'sessionId' | 'cli' | 'taskId' | 'startedAt'>): string => digest([record.sessionId ?? null, record.cli, record.taskId, record.startedAt])
 const recordKey = (record: CliUsageRecord): string => digest([record.sessionId ?? null, cliUsageIdentityOf(record)])
@@ -25,7 +25,7 @@ function pendingOf(value: unknown): PendingRecord | undefined {
   if (typeof value !== 'object' || value === null || Array.isArray(value)) return undefined
   const data = value as Record<string, unknown>
   return data['version'] === 1 && typeof data['taskId'] === 'string' && data['taskId'] !== ''
-    && (data['cli'] === 'codex' || data['cli'] === 'claude') && typeof data['model'] === 'string'
+    && (data['cli'] === 'codex' || data['cli'] === 'claude' || data['cli'] === 'grok') && typeof data['model'] === 'string'
     && typeof data['startedAt'] === 'number' && Number.isFinite(data['startedAt']) && data['startedAt'] >= 0
     && (data['sessionId'] === undefined || typeof data['sessionId'] === 'string') ? data as unknown as PendingRecord : undefined
 }

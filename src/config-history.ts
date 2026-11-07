@@ -94,7 +94,7 @@ export function diffEffective(before: EffectiveConfig, after: EffectiveConfig): 
 
 function codeOf(field: string, after: string): ConfigChangeCode {
   if (field === 'enabled') return after === 'true' ? 'enabledOn' : 'enabledOff'
-  if (field === 'claude.enabled' || field === 'codex.enabled') return after === 'true' ? 'cliEnabled' : 'cliDisabled'
+  if (field === 'claude.enabled' || field === 'codex.enabled' || field === 'grok.enabled') return after === 'true' ? 'cliEnabled' : 'cliDisabled'
   return 'fieldChanged'
 }
 

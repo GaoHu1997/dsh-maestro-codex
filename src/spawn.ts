@@ -176,9 +176,33 @@ function codexNodeLaunchPlan(file: string, args: readonly string[]): LaunchPlan 
   }
 }
 
+/**
+ * Same hazard as codex's npm shim: grok's launcher forwards `%*` through
+ * cmd.exe, so embedded quotes (the MCP shim's JSON argv) corrupt. On Windows
+ * the @xai-official/grok entry stays a Node bootstrap (`bin/grok`), so launch
+ * it through Node directly when the shim matches.
+ */
+function grokNodeLaunchPlan(file: string, args: readonly string[]): LaunchPlan | undefined {
+  if (path.basename(file).toLowerCase() !== 'grok.cmd') return undefined
+  try {
+    const shim = readFileSync(file, 'utf8')
+    // Global installs shim `%dp0%\node_modules\…`; local ones `%dp0%\..\…`.
+    if (!/"%_prog%"\s+"%dp0%[\\/](?:node_modules[\\/]|\.\.[\\/])@xai-official[\\/]grok[\\/]bin[\\/]grok"\s+%\*\s*$/im.test(shim)
+      || !/SET\s+"_prog=node"/i.test(shim)) return undefined
+    const dir = path.dirname(path.resolve(file))
+    const entry = [path.join(dir, 'node_modules', '@xai-official', 'grok', 'bin', 'grok'), path.join(dir, '..', '@xai-official', 'grok', 'bin', 'grok')]
+      .find(candidate => existsSync(candidate))
+    if (entry === undefined) return undefined
+    const node = path.join(dir, 'node.exe')
+    return { file: existsSync(node) ? node : 'node.exe', args: [entry, ...args] }
+  } catch {
+    return undefined
+  }
+}
+
 export function launchPlan(file: string, args: readonly string[]): LaunchPlan {
   if (process.platform === 'win32' && /\.(cmd|bat)$/i.test(file)) {
-    const nodePlan = codexNodeLaunchPlan(file, args)
+    const nodePlan = codexNodeLaunchPlan(file, args) ?? grokNodeLaunchPlan(file, args)
     if (nodePlan !== undefined) return nodePlan
     const line = `""${file}" ${args.map(windowsQuote).join(' ')}"`
     return {
