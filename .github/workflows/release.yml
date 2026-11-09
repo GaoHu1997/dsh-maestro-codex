@@ -55,6 +55,32 @@ jobs:
           echo "tag=$tag package=$pkg"
           test "$pkg" = "$tag"
 
+      # The plugin market renders the GitHub Release body verbatim; a
+      # --generate-notes body on a repo that pushes straight to main is one
+      # compare link. Refuse to publish a version whose hand-written body is
+      # missing or thin, so an empty changelog can never reach the market.
+      - name: Verify release notes
+        if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+        run: |
+          set -euo pipefail
+          notes=".github/releases/${GITHUB_REF_NAME}.md"
+          if [ ! -f "$notes" ]; then
+            echo "::error::$notes is missing — every tag needs a committed release body (see AGENTS.md)"
+            exit 1
+          fi
+          bytes="$(wc -c < "$notes" | tr -d ' ')"
+          lines="$(grep -c . "$notes" || true)"
+          sections="$(grep -c '^## ' "$notes" || true)"
+          echo "$notes: ${bytes} bytes, ${lines} non-empty lines, ${sections} sections"
+          if [ "$bytes" -lt 300 ] || [ "$lines" -lt 8 ] || [ "$sections" -lt 1 ]; then
+            echo "::error::$notes is too thin — need >=300 bytes, >=8 non-empty lines and >=1 '## ' section"
+            exit 1
+          fi
+          if ! grep -q 'Full Changelog' "$notes"; then
+            echo "::error::$notes has no '**Full Changelog**' line"
+            exit 1
+          fi
+
       - name: Publish to npm
         if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
         env:
@@ -69,9 +95,15 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release create "$GITHUB_REF_NAME" \
-            --verify-tag \
-            --title "$GITHUB_REF_NAME" \
-            --generate-notes \
-            dist/*.tgz \
-          || gh release upload "$GITHUB_REF_NAME" dist/*.tgz --clobber
+          notes=".github/releases/${GITHUB_REF_NAME}.md"
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            gh release upload "$GITHUB_REF_NAME" dist/*.tgz --clobber
+            # A re-run must not leave stale generated notes behind.
+            gh release edit "$GITHUB_REF_NAME" --notes-file "$notes"
+          else
+            gh release create "$GITHUB_REF_NAME" \
+              --verify-tag \
+              --title "$GITHUB_REF_NAME" \
+              --notes-file "$notes" \
+              dist/*.tgz
+          fi
