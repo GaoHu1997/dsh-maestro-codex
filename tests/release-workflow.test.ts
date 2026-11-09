@@ -15,6 +15,9 @@ const steps = workflow.jobs.release.steps
 const pkg = JSON.parse(readFileSync(join(root, 'package.json'), 'utf8')) as { version: string }
 const protectedNames = ['Tag matches package.json', 'Publish to npm', 'Create GitHub Release']
 const fixtures: string[] = []
+// Git Bash (and the tag check's Node child) needs startup headroom on Windows.
+const BASH_TIMEOUT_MS = 15_000
+const BASH_TEST_TIMEOUT_MS = BASH_TIMEOUT_MS + 5_000
 
 function step(name: string): ReleaseStep {
   const value = steps.find(item => item.name === name)
@@ -66,7 +69,7 @@ const bashCandidates = process.platform === 'win32'
   : ['bash']
 const bash = bashCandidates.find(candidate => {
   const probe = spawnSync(candidate, ['--noprofile', '--norc', '-c', 'printf maestro-release-bash'], {
-    encoding: 'utf8', timeout: 5000, windowsHide: true,
+    encoding: 'utf8', timeout: BASH_TIMEOUT_MS, windowsHide: true,
   })
   return probe.status === 0 && probe.stdout === 'maestro-release-bash'
 })
@@ -74,7 +77,7 @@ const bash = bashCandidates.find(candidate => {
 function runBash(source: string, cwd: string, env: NodeJS.ProcessEnv = {}) {
   if (!bash) throw new Error('Release workflow integration tests require Bash')
   return spawnSync(bash, ['--noprofile', '--norc', '-e', '-o', 'pipefail', '-c', source], {
-    cwd, encoding: 'utf8', timeout: 10_000, windowsHide: true,
+    cwd, encoding: 'utf8', timeout: BASH_TIMEOUT_MS, windowsHide: true,
     env: { ...process.env, BASH_ENV: '', ENV: '', ...env },
   })
 }
@@ -147,7 +150,7 @@ describe.skipIf(!bash)('actual release Bash commands with isolated fixtures', ()
     })
     expect(result.error).toBeUndefined()
     expect(result.status, result.stderr).toBe(status)
-  })
+  }, BASH_TEST_TIMEOUT_MS)
 
   it('passes the complete create command and does not upload after success', () => {
     const { result, invocations, asset } = release(0)
@@ -157,7 +160,7 @@ describe.skipIf(!bash)('actual release Bash commands with isolated fixtures', ()
       'release', 'create', `v${pkg.version}`, '--verify-tag', '--title', `v${pkg.version}`,
       '--generate-notes', asset,
     ]])
-  })
+  }, BASH_TEST_TIMEOUT_MS)
 
   it('uploads the same tarball with clobber when the release already exists', () => {
     const { result, invocations, asset } = release(1)
@@ -165,19 +168,19 @@ describe.skipIf(!bash)('actual release Bash commands with isolated fixtures', ()
     expect(result.status, result.stderr).toBe(0)
     expect(invocations).toHaveLength(2)
     expect(invocations[1]).toEqual(['release', 'upload', `v${pkg.version}`, asset, '--clobber'])
-  })
+  }, BASH_TEST_TIMEOUT_MS)
 
   it('propagates failure when both create and fallback upload fail', () => {
     const { result, invocations } = release(1, 7)
     expect(result.error).toBeUndefined()
     expect(result.status, result.stderr).toBe(7)
     expect(invocations).toHaveLength(2)
-  })
+  }, BASH_TEST_TIMEOUT_MS)
 
   it('expands every tarball without a stray backslash argument', () => {
     const { result, invocations, asset } = release(0, 0, true)
     expect(result.error).toBeUndefined()
     expect(result.status, result.stderr).toBe(0)
     expect(invocations[0]?.slice(-2)).toEqual([asset, 'dist/second.tgz'])
-  })
+  }, BASH_TEST_TIMEOUT_MS)
 })

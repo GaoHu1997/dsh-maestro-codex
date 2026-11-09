@@ -763,8 +763,13 @@ describe('grok argv/env', () => {
     ], '/shim/mcp-env-shim.js')
     // Dotted names are quoted (a bare dotted key would parse as a nested table).
     expect(body).toContain('[mcp_servers."plain.server"]')
-    expect(body).toContain('command = "node"')
-    // Secret-carrying servers go through the shim; values ride the child env only.
+    expect(body.match(/^command = /gm)).toHaveLength(2)
+    expect(body).toContain(`command = ${JSON.stringify(process.execPath)}`)
+    const argumentsByServer = body.split('\n').filter(line => line.startsWith('args = '))
+      .map(line => JSON.parse(line.slice('args = '.length)) as string[])
+    expect(argumentsByServer.every(args => args[0] === '/shim/mcp-env-shim.js')).toBe(true)
+    expect(JSON.parse(argumentsByServer[0]![1]!)).toEqual({ command: 'node', args: ['server.js'], keys: [], aliases: [] })
+    // Even env-empty servers go through the shim; values ride the child env only.
     expect(body).toContain('/shim/mcp-env-shim.js')
     expect(body).toContain('MAESTRO_MCP_SECRET_1_0')
     expect(body).toContain('MAESTRO_MCP_SECRET_1_1')

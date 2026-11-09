@@ -7,7 +7,7 @@
 
 import { spawn, type ChildProcess } from 'node:child_process'
 import { execFile } from 'node:child_process'
-import { constants, existsSync, readFileSync } from 'node:fs'
+import { constants, existsSync, readFileSync, statSync } from 'node:fs'
 import { access, stat } from 'node:fs/promises'
 import path from 'node:path'
 import { StringDecoder } from 'node:string_decoder'
@@ -153,47 +153,43 @@ export interface LaunchPlan {
   windowsVerbatimArguments?: boolean
 }
 
-/**
- * npm's Codex shim forwards `%*` through cmd.exe. That extra parse corrupts
- * quotes in TOML overrides containing JSON. Recognize the npm launcher and use
- * its JS entry + Node directly; custom batch launchers retain their semantics.
- */
-function codexNodeLaunchPlan(file: string, args: readonly string[]): LaunchPlan | undefined {
-  if (path.basename(file).toLowerCase() !== 'codex.cmd') return undefined
-  try {
-    const shim = readFileSync(file, 'utf8')
-    if (!/"%_prog%"\s+"%dp0%[\\/]node_modules[\\/]@openai[\\/]codex[\\/]bin[\\/]codex\.js"\s+%\*\s*$/im.test(shim)
-      || !/SET\s+"_prog=node"/i.test(shim)) return undefined
-    const dir = path.dirname(path.resolve(file))
-    const entry = path.join(dir, 'node_modules', '@openai', 'codex', 'bin', 'codex.js')
-    if (!existsSync(entry)) return undefined
-    const node = path.join(dir, 'node.exe')
-    // Match npm's sibling-Node preference and PATH fallback. Do not use
-    // process.execPath: in the desktop host that is the Electron application.
-    return { file: existsSync(node) ? node : 'node.exe', args: [entry, ...args] }
-  } catch {
-    return undefined
-  }
+/** Standard npm setup, excluding the package-specific forwarding line. */
+const NPM_NODE_SHIM_SETUP = [
+  '@echo off', 'goto start', ':find_dp0', 'set dp0=%~dp0', 'exit /b',
+  ':start', 'setlocal', 'call :find_dp0', 'if exist "%dp0%/node.exe" (',
+  'set "_prog=%dp0%/node.exe"', ') else (', 'set "_prog=node"',
+  'set pathext=%pathext:;.js;=;%', ')',
+]
+
+const NPM_NODE_ENTRIES: Readonly<Record<string, RegExp>> = {
+  'codex.cmd': /^(?:node_modules[\\/]|\.\.[\\/])@openai[\\/]codex[\\/]bin[\\/]codex\.js$/i,
+  'grok.cmd': /^(?:node_modules[\\/]|\.\.[\\/])@xai-official[\\/]grok[\\/]bin[\\/]grok$/i,
 }
 
 /**
- * Same hazard as codex's npm shim: grok's launcher forwards `%*` through
- * cmd.exe, so embedded quotes (the MCP shim's JSON argv) corrupt. On Windows
- * the @xai-official/grok entry stays a Node bootstrap (`bin/grok`), so launch
- * it through Node directly when the shim matches.
+ * npm's `%*` forwarding adds a cmd parse that corrupts nested JSON, paths and
+ * percent literals. Bypass only the standard npm Node bootstrap, never a custom
+ * launcher's hooks/arguments. Unknown templates retain the original cmd path.
+ * Both global (`node_modules/...`) and local (`../...`) entries are taken from
+ * the shim itself: an existing alternate installation must not redirect it.
  */
-function grokNodeLaunchPlan(file: string, args: readonly string[]): LaunchPlan | undefined {
-  if (path.basename(file).toLowerCase() !== 'grok.cmd') return undefined
+function npmNodeLaunchPlan(file: string, args: readonly string[]): LaunchPlan | undefined {
+  const entryPattern = NPM_NODE_ENTRIES[path.basename(file).toLowerCase()]
+  if (entryPattern === undefined) return undefined
   try {
-    const shim = readFileSync(file, 'utf8')
-    // Global installs shim `%dp0%\node_modules\…`; local ones `%dp0%\..\…`.
-    if (!/"%_prog%"\s+"%dp0%[\\/](?:node_modules[\\/]|\.\.[\\/])@xai-official[\\/]grok[\\/]bin[\\/]grok"\s+%\*\s*$/im.test(shim)
-      || !/SET\s+"_prog=node"/i.test(shim)) return undefined
+    // Only ASCII indentation is harmless; trailing spaces affect unquoted SET.
+    const lines = readFileSync(file, 'utf8').replace(/^\uFEFF/, '').split(/\r?\n/).map(line => line.replace(/^[ \t]+/, '')).filter(line => line !== '')
+    const forwarding = lines.pop() ?? ''
+    if (lines.length !== NPM_NODE_SHIM_SETUP.length
+      || lines.some((line, index) => line.replaceAll('\\', '/').toLowerCase() !== NPM_NODE_SHIM_SETUP[index])) return undefined
+    const relativeEntry = /^endLocal\s+&\s+goto\s+#_undefined_#\s+2>NUL\s+\|\|\s+title\s+%COMSPEC%\s+&\s+"%_prog%"\s+"%dp0%[\\/]([^"]+)"\s+%\*$/i.exec(forwarding)?.[1]
+    if (relativeEntry === undefined || !entryPattern.test(relativeEntry)) return undefined
     const dir = path.dirname(path.resolve(file))
-    const entry = [path.join(dir, 'node_modules', '@xai-official', 'grok', 'bin', 'grok'), path.join(dir, '..', '@xai-official', 'grok', 'bin', 'grok')]
-      .find(candidate => existsSync(candidate))
-    if (entry === undefined) return undefined
+    const entry = path.resolve(dir, ...relativeEntry.split(/[\\/]/))
+    if (!statSync(entry).isFile()) return undefined
     const node = path.join(dir, 'node.exe')
+    // Match npm's sibling-Node preference and PATH fallback. process.execPath
+    // may be the desktop Electron application, not a standalone Node binary.
     return { file: existsSync(node) ? node : 'node.exe', args: [entry, ...args] }
   } catch {
     return undefined
@@ -202,7 +198,7 @@ function grokNodeLaunchPlan(file: string, args: readonly string[]): LaunchPlan |
 
 export function launchPlan(file: string, args: readonly string[]): LaunchPlan {
   if (process.platform === 'win32' && /\.(cmd|bat)$/i.test(file)) {
-    const nodePlan = codexNodeLaunchPlan(file, args) ?? grokNodeLaunchPlan(file, args)
+    const nodePlan = npmNodeLaunchPlan(file, args)
     if (nodePlan !== undefined) return nodePlan
     const line = `""${file}" ${args.map(windowsQuote).join(' ')}"`
     return {
@@ -255,6 +251,8 @@ export function runProcess(options: {
   let settled = false
   let stderrTail = ''
   let stopping = false
+  let exited = false
+  let closer: ReturnType<typeof watchChildClose>
   let timeoutTimer: ReturnType<typeof setTimeout> | undefined
   let warningTimer: ReturnType<typeof setTimeout> | undefined
   const clearTimers = (): void => {
@@ -264,13 +262,13 @@ export function runProcess(options: {
     warningTimer = undefined
   }
   const armTimeout = (): void => {
-    if (settled || stopping) return
+    if (settled || stopping || exited) return
     clearTimers()
     timeoutTimer = setTimeout(() => {
       stopping = true
       timedOut = true
       clearTimers()
-      void killTree(child)
+      closer.stop()
     }, options.timeoutMs)
     const leadMs = Math.min(options.timeoutMs, Math.max(0,
       options.timeoutWarningLeadMs ?? Math.min(2 * 60_000, Math.round(options.timeoutMs / 5))))
@@ -289,29 +287,28 @@ export function runProcess(options: {
   }
   child.stdout?.on('data', activity)
   child.stderr?.on('data', activity)
+  const onExit = (): void => {
+    exited = true
+    clearTimers()
+  }
+  child.once('exit', onExit)
   armTimeout()
 
   const abort = (): void => {
+    if (settled || stopping) return
     stopping = true
     clearTimers()
-    void killTree(child)
-  }
-  if (options.signal.aborted) abort()
-  else options.signal.addEventListener('abort', abort, { once: true })
-
-  if (child.stdin !== null) {
-    // EPIPE when the child exits before the pipe closes — the exit code
-    // carries the failure; an unhandled 'error' here would kill the host.
-    child.stdin.on('error', () => { /* ignored */ })
-    if (options.stdin !== undefined) child.stdin.end(options.stdin)
-    else child.stdin.end()
+    closer.stop()
   }
 
+  const flushers: Array<() => void> = []
+  const unwire: Array<() => void> = []
   const wire = (stream: NodeJS.ReadableStream | null, onLine: ((line: string) => void) | undefined, isStderr: boolean): void => {
     if (stream === null) return
     const decoder = new StringDecoder('utf8')
     let buffer = ''
     let discarding = false
+    let ended = false
     const accept = (text: string): void => {
       if (isStderr) stderrTail = appendTail(stderrTail, text)
       if (onLine === undefined) return
@@ -337,15 +334,26 @@ export function runProcess(options: {
         start = newline + 1
       }
     }
-    stream.on('data', (chunk: Buffer) => accept(decoder.write(chunk)))
-    stream.on('end', () => {
+    const flush = (): void => {
+      if (ended || settled) return
+      ended = true
       accept(decoder.end())
       const rest = buffer.replace(/\r$/, '')
       if (!discarding && rest.trim() !== '') onLine?.(rest)
       buffer = ''
+    }
+    flushers.push(flush)
+    const onData = (chunk: Buffer): void => {
+      if (!settled && !ended) accept(decoder.write(chunk))
+    }
+    stream.on('data', onData)
+    stream.on('end', flush)
+    unwire.push(() => {
+      stream.removeListener('data', onData)
+      stream.removeListener('end', flush)
     })
     stream.on('error', (error: Error) => {
-      stderrTail = appendTail(stderrTail, `\n[maestro] ${isStderr ? 'stderr' : 'stdout'} stream error: ${error.message}`)
+      if (!settled) stderrTail = appendTail(stderrTail, `\n[maestro] ${isStderr ? 'stderr' : 'stdout'} stream error: ${error.message}`)
     })
   }
   wire(child.stdout, options.onStdoutLine, false)
@@ -354,32 +362,101 @@ export function runProcess(options: {
   const outcome = new Promise<ChildOutcome>((resolvePromise) => {
     const settle = (code: number | null, signal: NodeJS.Signals | null): void => {
       if (settled) return
+      for (const flush of flushers) flush()
       settled = true
+      for (const cleanup of unwire) cleanup()
       clearTimers()
+      closer.dispose()
+      child.removeListener('exit', onExit)
       child.stdout?.removeListener('data', activity)
       child.stderr?.removeListener('data', activity)
       options.signal.removeEventListener('abort', abort)
       resolvePromise({ code, signal, timedOut, stderrTail })
     }
-    child.on('error', (error) => {
-      settle(null, null)
-      // Surface spawn failures (ENOENT, access denied) through the exit path:
-      // encode them into the stderr tail the caller reports.
-      stderrTail = appendTail(stderrTail, String(error instanceof Error ? error.message : error))
-      ;(child as ChildProcess & { __spawnError?: string }).__spawnError = stderrTail
+    closer = watchChildClose(child, (code, signal, forced) => {
+      if (forced) stderrTail = appendTail(stderrTail, '\n[maestro] 未收到子进程 close；已结束等待，进程终止或输出完整性未确认')
+      settle(code, signal)
     })
-    child.on('close', (code, signal) => settle(code, signal))
+    child.on('error', (error) => {
+      if (settled) return
+      // Surface spawn failures (ENOENT, access denied) through the exit path.
+      stderrTail = appendTail(stderrTail, String(error instanceof Error ? error.message : error))
+      settle(null, null)
+    })
   })
 
-  return { child, outcome: outcome.then(result => ({
-    ...result,
-    stderrTail: (child as ChildProcess & { __spawnError?: string }).__spawnError ?? result.stderrTail,
-  })) }
+  if (options.signal.aborted) abort()
+  else options.signal.addEventListener('abort', abort, { once: true })
+  if (child.stdin !== null) {
+    // EPIPE when the child exits before the pipe closes must not kill the host.
+    child.stdin.on('error', () => { /* ignored */ })
+    if (options.stdin !== undefined) child.stdin.end(options.stdin)
+    else child.stdin.end()
+  }
+  return { child, outcome }
 }
 
 function appendTail(current: string, addition: string): string {
   const next = (current + addition).slice(-STDERR_TAIL_LIMIT)
   return next
+}
+
+/** Allow buffered output to drain, but never wait forever for inherited pipes. */
+export const PROCESS_CLOSE_GRACE_MS = 5_000
+/** Includes the Windows taskkill command's five-second timeout. */
+export const PROCESS_STOP_GRACE_MS = 6_000
+
+/** Observe close independently of output/idle timers, including after termination. */
+export function watchChildClose(
+  child: ChildProcess,
+  onClose: (code: number | null, signal: NodeJS.Signals | null, forced: boolean) => void,
+): { stop(): void; dispose(): void } {
+  let timer: ReturnType<typeof setTimeout> | undefined
+  let disposed = false
+  let stopping = false
+  const dispose = (): void => {
+    if (disposed) return
+    disposed = true
+    if (timer !== undefined) clearTimeout(timer)
+    child.removeListener('exit', onExit)
+    child.removeListener('close', close)
+  }
+  const close = (code: number | null, signal: NodeJS.Signals | null): void => {
+    if (disposed) return
+    dispose()
+    onClose(code, signal, false)
+  }
+  const arm = (graceMs: number): void => {
+    if (timer !== undefined) clearTimeout(timer)
+    timer = setTimeout(() => {
+      if (disposed) return
+      dispose()
+      // No close means output/termination is unconfirmed. Never manufacture
+      // exit 0 from the wrapper's exit event while a descendant holds pipes.
+      if (child.exitCode === null && child.signalCode === null) {
+        try { child.kill('SIGKILL') } catch { /* best effort */ }
+      }
+      onClose(null, null, true)
+      child.stdin?.destroy?.()
+      child.stdout?.destroy?.()
+      child.stderr?.destroy?.()
+      child.unref?.()
+    }, graceMs)
+  }
+  const onExit = (): void => {
+    if (!disposed && !stopping) arm(PROCESS_CLOSE_GRACE_MS)
+  }
+  child.once('exit', onExit)
+  child.once('close', close)
+  return {
+    stop: () => {
+      if (disposed || stopping) return
+      stopping = true
+      arm(PROCESS_STOP_GRACE_MS)
+      void killTree(child).catch(() => { /* bounded fallback above owns settlement */ })
+    },
+    dispose,
+  }
 }
 
 /**

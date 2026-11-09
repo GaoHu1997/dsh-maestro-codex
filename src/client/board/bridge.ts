@@ -1,6 +1,7 @@
 /** Adapt the scoped Maestro model to the original, unmodified Tasks renderer. */
 import type { MaestroTaskSummary } from '../../wire.js'
 import type { BoardHost, BoardSessionList } from './data.js'
+import { interruptedStateLabel } from './copy.js'
 import { type BoardNode, type BoardJobRow, type BoardSession, type BoardTokenUsage } from './model.js'
 import { cliSessionAddress } from './session-tab.js'
 import {
@@ -125,13 +126,17 @@ export function withBoardNative(
       live: mergedLive, runs, teamMembers, teamTasks },
   }
 }
-/** Genuine upstream folding, followed only by CLI/ghost status enrichment. */
+/** Scoped CLI states enter original fold derivation; remaining enrichment follows it. */
 
 export function renderBoardNodes(
   source: BoardRendererInput,
   folding: Pick<TasksModelInput, 'folded' | 'autoFoldSettled' | 'autoFoldBranches' | 'autoFoldIdle' | 'foldedIds' | 'expandedGroups'>,
 ): TasksNode[] {
-  return buildTasksModel({ ...source.input, ...folding }).map((node): TasksNode => {
+  const cliStates = new Map<string, TasksNodeState>()
+  for (const row of source.byNodeId.values()) {
+    if (row.task?.phase === 'interrupted') cliStates.set(row.id, 'idle')
+  }
+  return buildTasksModel({ ...source.input, ...folding, cliStates }).map((node): TasksNode => {
     if (node.kind === 'workflow') return node
     if (node.kind === 'fold') {
       const errors = node.memberIds.filter(id => source.byNodeId.get(id)?.status === 'failed').length
@@ -144,9 +149,16 @@ export function renderBoardNodes(
     // mode 不受影响，跳转语义不变。
     const { childAddress: address, mode: _mode, ...withoutMode } = node
     const navigable = row.kind === 'agent' && row.hasSession
+    // 中断的 CLI 任务：上游四态挑不出「已中断」，占 idle 位——它不是进行中
+    // （不转圈、不扫光），也不进 settled 折叠组（等人处理的任务不能藏起来）；
+    // 状态词由 stateText 补上，卡片与详情浮层从此同词。
+    const interrupted = row.task?.phase === 'interrupted'
     return {
       ...withoutMode,
-      ...(row.task !== undefined || !row.hasSession ? { state: nativeState(row) } : {}),
+      ...(row.task !== undefined || !row.hasSession
+        ? { state: interrupted ? 'idle' : nativeState(row) }
+        : {}),
+      ...(interrupted ? { stateText: interruptedStateLabel() } : {}),
       ...(row.subtitle === undefined || (row.task === undefined && row.hasSession) ? {} : { title: row.subtitle }),
       // 右上角来源标识：CLI 行沿用 executor（claude/codex）；dsh 原生子智能体
       // 借同一徽标槽位显示 DSH（主智能体、external 幽灵行、折叠组不显示）。

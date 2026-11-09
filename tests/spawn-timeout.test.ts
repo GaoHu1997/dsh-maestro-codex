@@ -79,6 +79,7 @@ describe('process timeout clocks', () => {
     const run = watchdog(mode)
     run.controller.abort()
     expect(run.child.killed).toBe(true)
+    await vi.advanceTimersByTimeAsync(0)
     expect(vi.getTimerCount()).toBe(0)
     run.child.stderr.emit('data', Buffer.from('late output'))
     await vi.advanceTimersByTimeAsync(1000)

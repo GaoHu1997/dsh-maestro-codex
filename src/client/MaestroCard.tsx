@@ -542,15 +542,18 @@ const NO_HOST: BoardHost = { get: () => undefined }
 
 /**
  * 任务监视页顶部的「用量统计」：把各会话的 `maestroCliUsage` 投影折成近 7 天
- * 每个 CLI 的调用 / 成功 / 失败统计。会话 feed 缺席时显示空态，绝不挡住任务记录。
+ * 每个 CLI 的可见调用 / 成功 / 失败样本。会话 feed 缺席时显示不可用，不误报零调用。
  */
 export function UsageGroup(props: { ctx: BoardHost | undefined }): ReactNode {
   const usage = useUsageSummary(props.ctx ?? NO_HOST)
   return (
     <div className="dmc-group">
-      <p className="dmc-grouptitle">用量统计（最近 7 天）</p>
-      {usage.requests === 0 ? (
-        <span className="dmc-hint">近 7 天还没有 CLI 调用。</span>
+      <p className="dmc-grouptitle">用量统计（近 7 天可见样本）</p>
+      <p className="dmc-hint">每个会话仅最近 20 次调用；不是完整账本。</p>
+      {!usage.available ? (
+        <span className="dmc-hint">会话用量 feed 不可用，无法统计调用次数。</span>
+      ) : usage.requests === 0 ? (
+        <span className="dmc-hint">近 7 天可见样本中没有 CLI 调用。</span>
       ) : (
         <div className="dmc-usage">
           <div className="dmc-usagehead" aria-hidden>

@@ -12,6 +12,11 @@ import { parseRepairArgs, repairSessionLogFile } from '../scripts/repair-maestro
 import { createOwnedTestFixture, type OwnedTestFixture } from './owned-test-fixture.js'
 
 const SECRET = 'SYNTHETIC_ONLY_NEVER_PRINT_THIS_VALUE'
+const CLI_TIMEOUT_MS = 15_000
+// This integration case starts two real Node processes sequentially.
+const CLI_TEST_TIMEOUT_MS = 2 * CLI_TIMEOUT_MS + 5_000
+// At most two owned fixtures, each with a bounded 30s Windows cleanup process.
+const FIXTURE_CLEANUP_TIMEOUT_MS = process.platform === 'win32' ? 2 * 30_000 + 5_000 : undefined
 const header = '{"type":"session","version":4,"id":"synthetic-session","createdAt":1,"isSeeded":false,"delegationDepth":0}\r\n'
 const rows = [
   '{"type":"turn/start","seq":0,"time":1,"data":{}}\n',
@@ -49,7 +54,7 @@ async function vacantPort() {
 }
 afterEach(() => {
   for (const directory of directories.splice(0)) directory.remove()
-})
+}, FIXTURE_CLEANUP_TIMEOUT_MS)
 
 describe('bounded byte-preserving Maestro metadata codec', () => {
   it('marks exactly three root envelopes without reserializing header/core/data/numeric spellings', () => {
@@ -264,18 +269,18 @@ describe('offline file repair with exclusive verified backups', () => {
     }
   })
 
-  it('runs the CLI as a default read-only command with redacted success and failure output', { timeout: 25_000 }, async () => {
+  it('runs the CLI as a default read-only command with redacted success and failure output', { timeout: CLI_TEST_TIMEOUT_MS }, async () => {
     const { path, directory } = await fixture()
     const script = fileURLToPath(new URL('../scripts/repair-maestro-session-logs.mjs', import.meta.url))
     const run = promisify(execFile)
     // Two real Node processes share a busy Windows worker pool; keep each bounded.
-    const success = await run(process.execPath, [script, path], { timeout: 10_000, windowsHide: true })
+    const success = await run(process.execPath, [script, path], { timeout: CLI_TIMEOUT_MS, windowsHide: true })
     expect(JSON.parse(success.stdout).status).toBe('dry-run')
     expect(success.stdout + success.stderr).not.toContain(SECRET)
     expect(await readdir(directory)).toHaveLength(1)
     const broken = await fixture(Buffer.from(header + `{"${SECRET}": broken}\n`))
     try {
-      await run(process.execPath, [script, broken.path], { timeout: 10_000, windowsHide: true })
+      await run(process.execPath, [script, broken.path], { timeout: CLI_TIMEOUT_MS, windowsHide: true })
       throw new Error('invalid synthetic log was accepted')
     } catch (error: any) {
       expect(error.code).toBe(1)

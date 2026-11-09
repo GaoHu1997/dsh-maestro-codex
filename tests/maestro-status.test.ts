@@ -7,6 +7,9 @@ import { renderStatus } from '../scripts/maestro-status.mjs'
 
 const run = promisify(execFile)
 const script = fileURLToPath(new URL('../scripts/maestro-status.mjs', import.meta.url))
+// Budget Node startup as well as the script's own bounded 5s request.
+const CLI_TIMEOUT_MS = 15_000
+const CLI_TEST_TIMEOUT_MS = CLI_TIMEOUT_MS + 5_000
 
 describe('renderStatus', () => {
   it('summarises the counters a person actually reads', () => {
@@ -33,12 +36,14 @@ describe('renderStatus', () => {
 
 describe('maestro-status script', () => {
   it('prints usage for --help and exits clean', async () => {
-    const { stdout } = await run(process.execPath, [script, '--help'])
+    const { stdout } = await run(process.execPath, [script, '--help'], { timeout: CLI_TIMEOUT_MS, windowsHide: true })
     expect(stdout).toContain('maestro status')
     expect(stdout).toContain('--json')
-  })
+  }, CLI_TEST_TIMEOUT_MS)
 
   it('exits 1 when the web server is not listening', async () => {
-    await expect(run(process.execPath, [script, '--url', 'http://127.0.0.1:9'])).rejects.toMatchObject({ code: 1 })
-  })
+    await expect(run(process.execPath, [script, '--url', 'http://127.0.0.1:9'], {
+      timeout: CLI_TIMEOUT_MS, windowsHide: true,
+    })).rejects.toMatchObject({ code: 1 })
+  }, CLI_TEST_TIMEOUT_MS)
 })

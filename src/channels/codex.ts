@@ -7,6 +7,7 @@
 
 import { fileURLToPath } from 'node:url'
 import { runProcess, type ChildOutcome } from '../spawn.js'
+import { bridgeNodeCommand } from '../bridge.js'
 import { CODEX_REASONING_EFFORTS, type MaestroChannelEvent } from '../wire.js'
 import type { CodexSandboxMode } from '../config.js'
 import { mergeCodexUsageStats, startRolloutUsageTail, usageFromTotals, type RolloutUsageStats, type RolloutUsageTail } from './codex-rollout.js'
@@ -177,7 +178,7 @@ export function codexMcpArgs(servers: ReadonlyArray<{ name: string; transport?: 
     const aliases = keys.map((_, keyIndex) => mcpSecretAlias(index, keyIndex))
     // Codex env_vars copies named environment values, it does not interpolate TOML.
     // Each server gets disjoint aliases; the shim restores only its own key names.
-    const command = keys.length === 0 ? server.command : process.execPath
+    const command = keys.length === 0 ? server.command : bridgeNodeCommand()
     const serverArgs = keys.length === 0 ? server.args : [fileURLToPath(new URL('../mcp-env-shim.js', import.meta.url)), JSON.stringify({ command: server.command, args: server.args, keys, aliases })]
     const parts = [`command = ${tomlString(command)}`]
     if (serverArgs.length > 0) parts.push(`args = [${serverArgs.map(tomlString).join(', ')}]`)
@@ -409,6 +410,27 @@ export async function runCodexTask(options: {
   let pendingStreamError = false
   const failureReasons: string[] = []
   let stats: RolloutUsageStats = {}
+  const reconnectController = new AbortController()
+  const processSignal = AbortSignal.any([options.signal, reconnectController.signal])
+  let reconnectTimer: ReturnType<typeof setTimeout> | undefined
+  let reconnectTimedOut = false
+  const reconnectFailure = `Codex 持续重连 ${String(Math.round(options.timeoutMs / 1000))} 秒仍未恢复，已请求终止进程（重连日志不会延长等待）`
+  const clearReconnect = (): void => {
+    if (reconnectTimer !== undefined) clearTimeout(reconnectTimer)
+    reconnectTimer = undefined
+  }
+  const observeReconnect = (message: string): void => {
+    if (!/\breconnecting\b/i.test(message) || reconnectTimer !== undefined || processSignal.aborted) return
+    // A separate recovery deadline: repeated diagnostics must not keep a
+    // broken connection alive forever by resetting the byte-idle watchdog.
+    reconnectTimer = setTimeout(() => {
+      if (processSignal.aborted) return
+      reconnectTimedOut = true
+      reconnectController.abort()
+      options.onEvent('error', reconnectFailure)
+    }, options.timeoutMs)
+    options.onEvent('note', `Codex 正在重连；若持续 ${String(Math.round(options.timeoutMs / 1000))} 秒未恢复，将按超时结束`)
+  }
 
   // `codex exec` only reports usage on `turn.completed`, but the CLI appends a
   // `token_count` row to its rollout transcript after every model response
@@ -440,9 +462,17 @@ export async function runCodexTask(options: {
       frame = parsed
     } catch {
       if (line.trim().startsWith('{')) return
+      observeReconnect(line)
       options.onEvent('note', line.slice(0, 300))
       return
     }
+    if (frame.type === 'error' || frame.type === 'turn.failed') observeReconnect(frameErrorMessage(frame))
+    else if (frame.item?.type === 'error') observeReconnect(frame.item.message ?? frame.item.text ?? '')
+    else if (frame.msg?.type === 'error') observeReconnect(frame.msg.message ?? '')
+    else if (frame.type === 'turn.completed'
+      || (['item.started', 'item.updated', 'item.completed'].includes(frame.type ?? '')
+        && ['command_execution', 'mcp_tool_call', 'file_change', 'reasoning', 'agent_message'].includes(frame.item?.type ?? ''))
+      || (frame.msg?.type === 'agent_message' && (frame.msg.message ?? '').trim() !== '')) clearReconnect()
     if (frame.thread_id !== undefined && threadId === '') {
       threadId = frame.thread_id
       startUsageTail(threadId)
@@ -494,25 +524,32 @@ export async function runCodexTask(options: {
       onTimeoutWarning: remainingMs => {
         options.onEvent('note', `CLI 已连续无 stdout/stderr 输出；若仍无输出，将在约 ${String(Math.round(remainingMs / 1000))} 秒后超时终止（无输出保护，不代表任务语义进展）`)
       },
-      signal: options.signal,
+      signal: processSignal,
       onStdoutLine: handleLine,
       // stderr is diagnostics, not protocol — surface it while the run is active.
-      onStderrLine: (line: string) => { options.onEvent('note', `stderr: ${line.slice(0, 300)}`) },
+      onStderrLine: (line: string) => {
+        observeReconnect(line)
+        options.onEvent('note', `stderr: ${line.slice(0, 300)}`)
+      },
     })
     ended = await outcome
   } finally {
+    clearReconnect()
     usageTail?.stop()
   }
 
+  const timedOut = ended.timedOut || reconnectTimedOut
   const runStats: Record<string, string | number | boolean> = { ...mergeCodexUsageStats(liveUsage, stats), usageNormalization: 'codex-turn-delta-v2' }
   if (threadId !== '') runStats['threadId'] = threadId
-  if (ended.timedOut) runStats['timedOut'] = true
+  if (timedOut) runStats['timedOut'] = true
+  if (reconnectTimedOut) runStats['reconnectTimedOut'] = true
   // Individual tool errors are recoverable. Final turn/stream state, process
   // exit, and an actual answer decide whether this CLI task returned a result.
   const noAnswer = finalText.trim() === ''
-  const ok = !ended.timedOut && !options.signal.aborted && ended.code === 0 && turnStatus !== 'failed' && !pendingStreamError && !noAnswer
+  const ok = !timedOut && !options.signal.aborted && ended.code === 0 && turnStatus !== 'failed' && !pendingStreamError && !noAnswer
   if (!ok) {
-    if (ended.timedOut) failureReasons.push(`连续无 stdout/stderr 输出 ${String(Math.round(options.timeoutMs / 1000))} 秒超时，进程已被终止（无输出保护，不代表任务语义进展）`)
+    if (reconnectTimedOut) failureReasons.push(reconnectFailure)
+    else if (ended.timedOut) failureReasons.push(`连续无 stdout/stderr 输出 ${String(Math.round(options.timeoutMs / 1000))} 秒超时，进程已被终止（无输出保护，不代表任务语义进展）`)
     else if (options.signal.aborted) failureReasons.push('任务已取消，进程已被终止')
     if (ended.code !== 0) failureReasons.push(`进程退出码 ${ended.code ?? 'null'}`)
     if (noAnswer) failureReasons.push('Codex CLI 未返回最终答复（缺少非空 agent_message）')

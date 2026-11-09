@@ -176,6 +176,8 @@ export function CardBar(props: {
   foldLabel?: string
   /** Render the state WORD next to the dot (off for the aggregate's action bar). */
   stateWord?: boolean
+  /** CLI-only wording that keeps the state slot for a state the native four cannot name. */
+  stateText?: string
   /** Replace the whole bar's content (the aggregate's action row). */
   children?: ReactNode
 }): ReactNode {
@@ -202,7 +204,7 @@ export function CardBar(props: {
       {props.children ?? (
         <>
           <StateDot state={nodeDotState(state)} size={6} className={css.barDot} />
-          {showStateWord && <span className={css.barState}>{stateLabel(state)}</span>}
+          {showStateWord && <span className={css.barState}>{props.stateText ?? stateLabel(state)}</span>}
           {line !== undefined && (
             <span className={css.barActivity} title={line}>{line}</span>
           )}

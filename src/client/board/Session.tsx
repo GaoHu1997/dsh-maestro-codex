@@ -1127,7 +1127,7 @@ function SessionPageContent(props: Parameters<typeof SessionPage>[0] & { access:
                     : '这个会话里没有可续接的 CLI 会话引用，无法续发（重新派发一个可续接的任务吧）'
               }
               value={draft}
-              disabled={lastRunning || replyAnchorId === undefined}
+              disabled={sending || lastRunning || replyAnchorId === undefined}
               onChange={event => { setDraft(event.target.value) }}
               onKeyDown={(event) => {
                 if (event.key === 'Enter' && !event.shiftKey && !event.nativeEvent.isComposing) {

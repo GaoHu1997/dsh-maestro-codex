@@ -13,6 +13,9 @@ export default defineConfig({
   oxc: { jsx: { runtime: 'automatic', importSource: 'react' } },
   test: {
     environment: 'node',
+    // Real Node/PowerShell/Git Bash launches contend for the same host resources.
+    // Bound concurrency, not the default timeout of ordinary unit tests.
+    maxWorkers: 2,
     include: ['tests/**/*.test.ts', 'tests/**/*.test.tsx'],
   },
 })

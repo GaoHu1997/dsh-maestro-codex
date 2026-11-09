@@ -19,6 +19,7 @@ import { tmpdir } from 'node:os'
 import { fileURLToPath } from 'node:url'
 import type { EffectiveConfig } from './config.js'
 import type { DshMcpServer } from './mcp.js'
+import { awaitWithin, DeadlineError } from './deadline.js'
 
 /** The MCP server name the bridge registers under for both CLIs. */
 export const BRIDGE_SERVER_NAME = 'dsh_bridge'
@@ -280,6 +281,26 @@ export interface NativeSkillsStaging {
   readonly count: number
 }
 
+/**
+ * Host-service budgets for the bridge. Discovery and skill bodies are reads
+ * that must answer quickly; a bridged host tool may legitimately run for
+ * minutes and gets its own, larger bound. All of them exist so a registry that
+ * ignores its AbortSignal cannot pin the HTTP route — and the dispatch waiting
+ * on that route before it spawns a CLI — forever.
+ */
+export const BRIDGE_DISCOVERY_TIMEOUT_MS = 20_000
+export const BRIDGE_SKILL_TIMEOUT_MS = 20_000
+export const BRIDGE_TOOL_TIMEOUT_MS = 10 * 60_000
+export const BRIDGE_CLEANUP_TIMEOUT_MS = 30_000
+
+/** Overrides for the budgets above (tests use small values). */
+export interface BridgeLimits {
+  readonly discoveryMs?: number | undefined
+  readonly skillMs?: number | undefined
+  readonly toolMs?: number | undefined
+  readonly cleanupMs?: number | undefined
+}
+
 export interface BridgeHandleParts {
   /** Lazy read of the skills service — it arrives with a deferred inject. */
   skills: () => SkillsFace | undefined
@@ -292,11 +313,21 @@ export interface BridgeHandleParts {
   shimPath?: () => string | undefined
   state?: BridgeState | undefined
   logger?: { warn(message: string): void } | undefined
+  /** Bounded host awaits; production uses the exported defaults. */
+  limits?: BridgeLimits | undefined
 }
 
 /** Build the plugin's bridge handle (one per apply; tests build their own). */
 export function createBridgeHandle(parts: BridgeHandleParts): BridgeHandle {
   const state = parts.state ?? new BridgeState()
+  const limits = {
+    discoveryMs: parts.limits?.discoveryMs ?? BRIDGE_DISCOVERY_TIMEOUT_MS,
+    skillMs: parts.limits?.skillMs ?? BRIDGE_SKILL_TIMEOUT_MS,
+    toolMs: parts.limits?.toolMs ?? BRIDGE_TOOL_TIMEOUT_MS,
+    cleanupMs: parts.limits?.cleanupMs ?? BRIDGE_CLEANUP_TIMEOUT_MS,
+  }
+  const within = <T>(label: string, timeoutMs: number, work: () => Promise<T>, signal?: AbortSignal): Promise<T> =>
+    awaitWithin(work, { ...(signal === undefined ? {} : { signal }), timeoutMs, label })
   const skillsActive = (): boolean => parts.readConfig().bridgeSkills !== false && parts.skills() !== undefined
   const toolsActive = (): boolean => {
     const face = parts.tools()
@@ -329,14 +360,18 @@ export function createBridgeHandle(parts: BridgeHandleParts): BridgeHandle {
   const listSkills = async (cwd: string | undefined, signal?: AbortSignal): Promise<BridgeSkillSummary[]> => {
     try {
       signal?.throwIfAborted()
-      const raw = await parts.skills()?.list({ ...(cwd === undefined ? {} : { cwd }), ...(signal === undefined ? {} : { signal }) })
+      const face = parts.skills()
+      const raw = await within('技能目录发现', limits.discoveryMs,
+        async () => await face?.list({ ...(cwd === undefined ? {} : { cwd }), ...(signal === undefined ? {} : { signal }) }), signal)
       signal?.throwIfAborted()
       if (!Array.isArray(raw)) return []
       return [...new Map(raw.map(skillSummaryOf).filter((skill): skill is BridgeSkillSummary => skill !== undefined).map(skill => [skill.name, skill])).values()]
         .sort((left, right) => left.name < right.name ? -1 : left.name > right.name ? 1 : 0)
     } catch (error) {
       signal?.throwIfAborted()
-      parts.logger?.warn('dsh-maestro-codex: skill discovery failed (exception details omitted)')
+      parts.logger?.warn(error instanceof DeadlineError
+        ? `dsh-maestro-codex: 技能目录发现在 ${String(Math.round(limits.discoveryMs / 1000))} 秒内没有返回，已按空目录继续`
+        : 'dsh-maestro-codex: skill discovery failed (exception details omitted)')
       return []
     }
   }
@@ -431,7 +466,9 @@ export function createBridgeHandle(parts: BridgeHandleParts): BridgeHandle {
       const operationSignal = signal === undefined ? run.controller.signal : AbortSignal.any([signal, run.controller.signal])
       try {
         const effectiveCwd = boundCwd(run, cwd)
-        const raw = await parts.skills()?.get(name, { ...(effectiveCwd === undefined ? {} : { cwd: effectiveCwd }), signal: operationSignal })
+        const face = parts.skills()
+        const raw = await within('技能加载', limits.skillMs,
+          async () => await face?.get(name, { ...(effectiveCwd === undefined ? {} : { cwd: effectiveCwd }), signal: operationSignal }), operationSignal)
         if (state.resolve(token) !== run || operationSignal.aborted) return { ok: false, status: 401, error: 'bridge token 无效或已过期' }
         if (!skillsActive()) return { ok: false, status: 403, error: '本次运行未开启技能桥接' }
         const skill = skillContentOf(raw)
@@ -441,10 +478,10 @@ export function createBridgeHandle(parts: BridgeHandleParts): BridgeHandle {
           return { ok: false, status: 404, error: `技能不存在或不可模型调用：${name}` }
         }
         return { ok: true, text: renderSkillBody(skill) }
-      } catch {
-        return operationSignal.aborted
-          ? { ok: false, status: 401, error: 'bridge token 无效或已过期' }
-          : { ok: false, status: 500, error: '技能加载失败（详细错误未向子代理公开）' }
+      } catch (error) {
+        if (operationSignal.aborted) return { ok: false, status: 401, error: 'bridge token 无效或已过期' }
+        if (error instanceof DeadlineError) return { ok: false, status: 504, error: `技能 ${name} 加载超时，已停止等待（底层读取可能仍在运行）` }
+        return { ok: false, status: 500, error: '技能加载失败（详细错误未向子代理公开）' }
       }
     },
     async callTool(token, name, args) {
@@ -467,13 +504,15 @@ export function createBridgeHandle(parts: BridgeHandleParts): BridgeHandle {
       const rootCallId = run.context.rootCallId ?? run.context.callId
       let outcome: unknown
       try {
-        outcome = await face.execute({ callId, name, arguments: args ?? {}, signal: run.controller.signal, agent,
-          ...(rootCallId === undefined ? {} : { rootCallId }),
-          ...(run.context.parent === undefined ? {} : { parent: run.context.parent }) })
-      } catch {
-        return run.controller.signal.aborted
-          ? { ok: false, status: 401, error: 'bridge token 无效或已过期' }
-          : { ok: false, status: 500, error: `工具 ${name} 执行异常（详细错误未向子代理公开）` }
+        outcome = await within(`工具 ${name} 执行`, limits.toolMs,
+          async () => await face.execute({ callId, name, arguments: args ?? {}, signal: run.controller.signal, agent,
+            ...(rootCallId === undefined ? {} : { rootCallId }),
+            ...(run.context.parent === undefined ? {} : { parent: run.context.parent }) }),
+          run.controller.signal)
+      } catch (error) {
+        if (run.controller.signal.aborted) return { ok: false, status: 401, error: 'bridge token 无效或已过期' }
+        if (error instanceof DeadlineError) return { ok: false, status: 504, error: `工具 ${name} 在 ${String(Math.round(limits.toolMs / 60_000))} 分钟内没有返回，已停止等待（底层执行可能仍在运行）` }
+        return { ok: false, status: 500, error: `工具 ${name} 执行异常（详细错误未向子代理公开）` }
       }
       if (state.resolve(token) !== run) return { ok: false, status: 401, error: 'bridge token 无效或已过期' }
       const projected = toolOutcomeOf(outcome)
@@ -499,7 +538,8 @@ export function createBridgeHandle(parts: BridgeHandleParts): BridgeHandle {
         for (const summary of summaries.slice(0, MAX_NATIVE_SKILLS)) {
           signal?.throwIfAborted()
           try {
-            const raw = await face.get(summary.name, { ...(cwd === undefined ? {} : { cwd }), ...(signal === undefined ? {} : { signal }) })
+            const raw = await within('原生技能读取', limits.skillMs,
+              async () => await face.get(summary.name, { ...(cwd === undefined ? {} : { cwd }), ...(signal === undefined ? {} : { signal }) }), signal)
             signal?.throwIfAborted()
             const skill = skillStageOf(raw)
             if (skill === undefined || skill.name !== summary.name) continue
@@ -513,19 +553,23 @@ export function createBridgeHandle(parts: BridgeHandleParts): BridgeHandle {
             staged += 1
           } catch (error) {
             signal?.throwIfAborted()
-            parts.logger?.warn(`dsh-maestro-codex: native staging of skill "${summary.name}" failed (exception details omitted)`)
+            parts.logger?.warn(error instanceof DeadlineError
+              ? `dsh-maestro-codex: native staging of skill "${summary.name}" timed out and was skipped`
+              : `dsh-maestro-codex: native staging of skill "${summary.name}" failed (exception details omitted)`)
           }
         }
         signal?.throwIfAborted()
         if (staged > 0) return { dir: root, count: staged }
       } catch (error) {
-        await rm(root, { recursive: true, force: true }).catch(() => {})
+        await within('原生技能清理', limits.cleanupMs, async () => { await rm(root, { recursive: true, force: true }) }).catch(() => {})
         throw error
       }
-      await rm(root, { recursive: true, force: true }).catch(() => {})
+      await within('原生技能清理', limits.cleanupMs, async () => { await rm(root, { recursive: true, force: true }) }).catch(() => {})
       return undefined
     },
-    async discardStagedSkills(dir) { await rm(dir, { recursive: true, force: true }).catch(() => {}) },
+    async discardStagedSkills(dir) {
+      await within('原生技能清理', limits.cleanupMs, async () => { await rm(dir, { recursive: true, force: true }) }).catch(() => {})
+    },
     async diagnose(cwd) {
       const config = parts.readConfig()
       const httpReady = parts.portOf() > 0

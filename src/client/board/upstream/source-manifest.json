@@ -56,23 +56,26 @@
     {
       "path": "client/TasksGraph.tsx",
       "source": "src/client/TasksGraph.tsx",
-      "mode": "adapted-cli-badge",
+      "mode": "adapted-cli-badge-and-interrupted-state",
       "sourceSha256": "8bf7cea9e36eb76c7ff1c54f684cef2dd02b570abd0c157754777c5b851b652c",
-      "sha256": "c7bd57929e240a197e71066693620c9205a3cf1539a67675096375d8af9e0a0e"
+      "sha256": "807b5b4ef487bcb701b3b1a1d2bfdce82be4307d169318cda20b1bb2af724cfe",
+      "adaptations": ["Optional CLI executor badge", "Opt-in CLI state wording in the existing state slot and accessible name"]
     },
     {
       "path": "client/TasksTree.tsx",
       "source": "src/client/TasksTree.tsx",
-      "mode": "adapted-cli-badge",
+      "mode": "adapted-cli-badge-and-interrupted-state",
       "sourceSha256": "71ea4c8950aa4303ca1779c6b75a102cc1005da4c1b3c199a20a5397225d2271",
-      "sha256": "a561241b52d7a6e601e850d46fd0ec19892753a376c65454c5669203c0e234d6"
+      "sha256": "11c2b128d37c79ced5203a06024e762cf1289e6ce9fbf2bba04cd60f65958eab",
+      "adaptations": ["Optional CLI executor badge", "Opt-in CLI state wording in the existing state slot and accessible name"]
     },
     {
       "path": "client/tasks-card.tsx",
       "source": "src/client/tasks-card.tsx",
-      "mode": "adapted-cli-badge",
+      "mode": "adapted-cli-badge-and-interrupted-state",
       "sourceSha256": "017391388ab9b083c01341ef21adfff6786fc77de9e2955ba3578c66c153917f",
-      "sha256": "508825685126b13f6c8ec57ebbae240355170998314b2961b5ae0d7b9d2600a9"
+      "sha256": "759c1049b16228f909fd55e19e1734499ab7a5695711eaab6ae76095940d28a4",
+      "adaptations": ["Optional CLI executor badge", "Optional CLI state word with the original native-state fallback"]
     },
     {
       "path": "client/tasks-graph-layout.ts",
@@ -119,9 +122,10 @@
     {
       "path": "client/tasks-model.ts",
       "source": "src/client/tasks-model.ts",
-      "mode": "adapted-cli-badge",
+      "mode": "adapted-cli-badge-and-interrupted-state",
       "sourceSha256": "2dce027e42e3bfb5ba74c308a8ec953846180b4ba83dadb7c68e01b5f563a453",
-      "sha256": "3cecc44f5e8ace2505c5b3ef265fe38a65ca3bccb6650df3ed350a69eb3566b9"
+      "sha256": "1deec5222786155b3eadabeae90c75f5529b6e69c7adabf55b44dd453b7331c6",
+      "adaptations": ["Optional CLI executor and state-word fields", "Opt-in scoped CLI state map applied before original folding; native running facts stay unchanged"]
     },
     {
       "path": "client/locales.ts",

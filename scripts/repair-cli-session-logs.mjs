@@ -17,7 +17,8 @@ const HELP = `Usage:
   node scripts/repair-cli-session-logs.mjs --dsh-root ABSOLUTE_DSH_ROOT ABSOLUTE_LOG_PATH
   node scripts/repair-cli-session-logs.mjs --dsh-root ABSOLUTE_DSH_ROOT --apply --expect-sha256 HASH ABSOLUTE_LOG_PATH
 
-Default: read-only dry-run. Use the same installed DSH runtime as the log writer.
+Default: read-only dry-run. --apply and --dry-run are mutually exclusive.
+Use the same installed DSH runtime as the log writer.
 With packaged Electron, run with ELECTRON_RUN_AS_NODE=1 so ASAR modules are available.
 Only the exact legacy four-event CLI accounting shape is repaired. All other corrupt
 logs are refused. The installed v4 catalog validates the complete replacement.
@@ -230,16 +231,18 @@ export async function repairCliSessionLogFile(input, options = {}) {
 
 export async function main(argv = process.argv.slice(2)) {
   if (argv.includes('--help')) { console.log(HELP); return }
-  let dshRoot, path, expectSha256, apply = false
+  let dshRoot, path, expectSha256, apply = false, dryRun = false
   for (let index = 0; index < argv.length; index++) {
     const arg = argv[index]
     if (arg === '--apply') apply = true
-    else if (arg === '--dry-run') continue
+    else if (arg === '--dry-run') dryRun = true
     else if (arg === '--dsh-root') dshRoot = argv[++index]
     else if (arg === '--expect-sha256') expectSha256 = argv[++index]
     else if (arg.startsWith('-') || path) fail('INVALID_ARGUMENTS')
     else path = arg
   }
+  // Reject incompatible modes before loading the host or opening any log.
+  if (apply && dryRun) fail('INVALID_ARGUMENTS')
   if (!dshRoot || !path) fail('DSH_ROOT_AND_LOG_REQUIRED')
   const { loadArtifactRuntime } = await import('./lib/session-artifact-runtime.mjs')
   const runtime = await loadArtifactRuntime(dshRoot)

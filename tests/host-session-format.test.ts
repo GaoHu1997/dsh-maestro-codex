@@ -1,5 +1,5 @@
 import { existsSync } from 'node:fs'
-import { spawnSync } from 'node:child_process'
+import { runHostProcess } from './host-process-fixture'
 import path from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 import { build } from 'esbuild'
@@ -35,18 +35,19 @@ describe.skipIf(!enabled)('released host v4 CLI child lifecycle', () => {
     code = result.outputFiles[0]!.text
   })
 
-  it.each(['producer', 'retry', 'recovery'])('validates %s output using the installed codec and Session', suite => {
+  it.each(['producer', 'retry', 'recovery'])('validates %s output using the installed codec and Session', async suite => {
     const spawnedAt = Date.now()
     if (process.env.DSH_HOST_TEST_TRACE === '1') console.info(JSON.stringify({ phase: 'spawn-start', suite, at: spawnedAt, hostExe }))
-    const result = spawnSync(hostExe, [runner], {
+    const result = await runHostProcess(hostExe, [runner], {
       cwd: repo, env: { ...process.env, ELECTRON_RUN_AS_NODE: '1', DSH_SESSION_FORMAT_HOST_ROOT: hostRoot },
-      input: JSON.stringify({ code, suite }), encoding: 'utf8', timeout: 60_000, maxBuffer: 2 * 1024 * 1024,
+      timeout: 60_000, maxBuffer: 2 * 1024 * 1024, windowsHide: true,
+      input: JSON.stringify({ code, suite }),
     })
     if (process.env.DSH_HOST_TEST_TRACE === '1') console.info(JSON.stringify({ phase: 'spawn-returned', suite,
-      at: Date.now(), elapsed: Date.now() - spawnedAt, error: result.error?.message, status: result.status, signal: result.signal,
+      at: Date.now(), elapsed: Date.now() - spawnedAt, status: result.exitCode, signal: result.signalCode,
       stdout: result.stdout, stderr: result.stderr }))
-    expect(result.error, result.stderr).toBeUndefined()
-    expect(result.status, `${result.stdout}\n${result.stderr}`).toBe(0)
+    // execFile rejects non-zero exits and timeouts; successful stdout never overrides an error.
+    expect(result.exitCode, `${result.stdout}\n${result.stderr}`).toBe(0)
     const report = JSON.parse(result.stdout.trim()) as { suite: string; versions: Record<string, string>; completed: string[] }
     expect(report.suite).toBe(suite)
     expect(report.versions['dsh-session']).toBeTruthy()

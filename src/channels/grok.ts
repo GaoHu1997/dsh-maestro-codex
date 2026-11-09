@@ -12,15 +12,21 @@
  * a private router). The home is stable, not per-run, so grok sessions persist
  * on disk and `-r <session-id>` resume keeps working across runs. Its
  * config.toml is plugin-owned and carries ONLY the bridged dsh MCP servers of
- * the current run; secrets never ride the file — the mcp-env-shim restores the
- * real names from the child process env, exactly like the codex bridge.
+ * the current run. Runs sharing this home are serialized for their complete
+ * lifetime, and a file lease rejects a competing host process. Secrets never
+ * ride the file — the mcp-env-shim restores the real names from the child
+ * process env, exactly like the codex bridge.
  */
 
 import { fileURLToPath } from 'node:url'
-import { mkdir, writeFile } from 'node:fs/promises'
+import { randomUUID } from 'node:crypto'
+import { mkdir, open, readFile, realpath, unlink, writeFile } from 'node:fs/promises'
 import { homedir } from 'node:os'
 import { join } from 'node:path'
+import { awaitWithin, DeadlineError } from '../deadline.js'
 import { runProcess, type ChildOutcome } from '../spawn.js'
+import { createRecoveryBudget, type RecoveryBudget } from '../recovery-budget.js'
+import { bridgeNodeCommand } from '../bridge.js'
 import { GROK_REASONING_EFFORTS, type MaestroChannelEvent } from '../wire.js'
 import type { GrokPermissionMode } from '../config.js'
 import {
@@ -28,6 +34,87 @@ import {
   lastLines, type ClaudeFrame,
 } from './claude.js'
 import { mcpSecretAlias, tomlKey, tomlString } from './codex.js'
+
+interface GrokHomeWaiter { grant: () => void; abort: () => void }
+interface GrokHomeGate { active: boolean; queue: GrokHomeWaiter[] }
+// A plugin reload or a second installation in this process must share the gate.
+const GROK_HOME_GATES = Symbol.for('dsh-maestro-codex.grok-home-gates')
+const gateGlobal = globalThis as typeof globalThis & { [GROK_HOME_GATES]?: Map<string, GrokHomeGate> }
+const homeGates = gateGlobal[GROK_HOME_GATES] ??= new Map<string, GrokHomeGate>()
+
+/**
+ * Pre-run filesystem work (home dir, config write, cross-process lease) is
+ * local and normally instant. A hung network home must fail the run cleanly
+ * instead of blocking dispatch forever, so every step is bounded.
+ */
+export const GROK_FS_TIMEOUT_MS = 30_000
+
+/** Hold a canonical home until the child closes, not just until config is written. */
+function acquireGrokHome(home: string, signal: AbortSignal, onWait: () => void): Promise<() => void> {
+  signal.throwIfAborted()
+  const key = process.platform === 'win32' ? home.toLowerCase() : home
+  const gate: GrokHomeGate = homeGates.get(key) ?? { active: false, queue: [] }
+  if (gate.active) onWait()
+  signal.throwIfAborted()
+  homeGates.set(key, gate)
+  return new Promise((resolve, reject) => {
+    const waiter: GrokHomeWaiter = {
+      grant: () => {
+        signal.removeEventListener('abort', waiter.abort)
+        gate.active = true
+        let released = false
+        resolve(() => {
+          if (released) return
+          released = true
+          const next = gate.queue.shift()
+          if (next !== undefined) next.grant()
+          else { gate.active = false; homeGates.delete(key) }
+        })
+      },
+      abort: () => {
+        const index = gate.queue.indexOf(waiter)
+        if (index < 0) return
+        gate.queue.splice(index, 1)
+        signal.removeEventListener('abort', waiter.abort)
+        reject(signal.reason ?? new Error('Grok 等待期间任务已取消'))
+      },
+    }
+    signal.addEventListener('abort', waiter.abort, { once: true })
+    if (gate.active) gate.queue.push(waiter)
+    else waiter.grant()
+  })
+}
+
+/** Cross-process exclusion. Never guess that a lease is stale and delete it. */
+async function acquireGrokHomeFile(home: string): Promise<() => Promise<void>> {
+  const file = join(home, '.maestro-run.lock')
+  const payload = JSON.stringify({ pid: process.pid, token: randomUUID() })
+  const handle = await open(file, 'wx', 0o600).catch((error: unknown) => {
+    if ((error as NodeJS.ErrnoException).code === 'EEXIST') {
+      throw new Error('Grok 会话目录已有运行租约；请等待其它宿主进程结束。若上次异常退出，请确认全部 Grok/DSH 进程已关闭后再清理 .maestro-run.lock', { cause: error })
+    }
+    throw error
+  })
+  try {
+    await handle.writeFile(payload, 'utf8')
+    await handle.close()
+  } catch (error) {
+    await handle.close().catch(() => {})
+    await unlink(file).catch(() => {})
+    throw error
+  }
+  let released = false
+  return async () => {
+    if (released) return
+    released = true
+    try {
+      if (await readFile(file, 'utf8') !== payload) throw new Error('Grok 目录租约已改变，拒绝删除未知文件')
+      await unlink(file)
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error
+    }
+  }
+}
 
 /** Parsed outcome of one grok run. */
 export interface GrokRunResult {
@@ -98,9 +185,10 @@ export function grokHomeOf(dshHome?: string, home: string = homedir(), envDshHom
 }
 
 /** Secrets ride the child env under these aliases; the file never sees values. */
-export function grokMcpEnv(servers: ReadonlyArray<{ env: Readonly<Record<string, string>> }>): Record<string, string> {
+export function grokMcpEnv(servers: ReadonlyArray<{ env: Readonly<Record<string, string>>; transport?: 'stdio' | 'http'; command?: string }>): Record<string, string> {
   const env: Record<string, string> = {}
   for (const [index, server] of servers.entries()) {
+    if (server.transport === 'http' || server.command?.trim() === '') continue
     Object.values(server.env).forEach((value, keyIndex) => { env[mcpSecretAlias(index, keyIndex)] = value })
   }
   return env
@@ -108,9 +196,9 @@ export function grokMcpEnv(servers: ReadonlyArray<{ env: Readonly<Record<string,
 
 /**
  * The `config.toml` body for the maestro-owned grok home: ONLY the bridged
- * dsh MCP servers of the current run. Servers with env values go through the
- * mcp-env-shim (values restored from the child process env, never from this
- * file); plain servers keep their command/args verbatim.
+ * dsh MCP servers of the current run. Every stdio server goes through the
+ * mcp-env-shim, including servers with no declared env: Grok otherwise passes
+ * its model credentials and every server's aliases to the plain child.
  */
 export function grokHomeConfig(servers: ReadonlyArray<{ name: string; transport?: 'stdio' | 'http'; command: string; args: readonly string[]; env: Readonly<Record<string, string>> }>, shimPath: string): string {
   const lines: string[] = [
@@ -121,10 +209,8 @@ export function grokHomeConfig(servers: ReadonlyArray<{ name: string; transport?
     // `http` servers cannot be spawned by grok either — skip, like codex does.
     if (server.transport === 'http' || server.command.trim() === '') continue
     const keys = Object.keys(server.env)
-    const command = keys.length === 0 ? server.command : process.execPath
-    const serverArgs = keys.length === 0
-      ? server.args
-      : [shimPath, JSON.stringify({ command: server.command, args: server.args, keys, aliases: keys.map((_, keyIndex) => mcpSecretAlias(index, keyIndex)) })]
+    const command = bridgeNodeCommand()
+    const serverArgs = [shimPath, JSON.stringify({ command: server.command, args: server.args, keys, aliases: keys.map((_, keyIndex) => mcpSecretAlias(index, keyIndex)) })]
     lines.push(`[mcp_servers.${tomlKey(server.name)}]`)
     lines.push(`command = ${tomlString(command)}`)
     if (serverArgs.length > 0) lines.push(`args = [${serverArgs.map(tomlString).join(', ')}]`)
@@ -196,14 +282,67 @@ export async function runGrokTask(options: {
   /** Bridged dsh MCP servers, written into the home's config.toml. */
   mcpServers?: ReadonlyArray<{ name: string; transport?: 'stdio' | 'http'; command: string; args: readonly string[]; env: Readonly<Record<string, string>> }>
   timeoutMs: number
+  /** Bound for pre-run home/config/lease filesystem steps; tests use a small value. */
+  fsTimeoutMs?: number
   signal: AbortSignal
   onEvent: (kind: MaestroChannelEvent['kind'], text: string, detail?: string) => void
   /** Running usage snapshot, one call per frame that carries counts. */
   onUsage?: (stats: Record<string, string | number | boolean>) => void
 }): Promise<GrokRunResult> {
-  const mcpServers = options.mcpServers ?? []
+  options.signal.throwIfAborted()
   const grokHome = options.grokHome ?? grokHomeOf()
-  await writeGrokHomeConfig(grokHome, mcpServers)
+  const fsTimeoutMs = options.fsTimeoutMs ?? GROK_FS_TIMEOUT_MS
+  const canonicalHome = await awaitWithin(async () => {
+    await mkdir(grokHome, { recursive: true })
+    return realpath(grokHome)
+  }, { signal: options.signal, timeoutMs: fsTimeoutMs, label: 'Grok 会话目录准备' })
+  options.signal.throwIfAborted()
+  const release = await acquireGrokHome(canonicalHome, options.signal,
+    () => options.onEvent('note', 'Grok 共享会话目录正在使用，本任务等待上一轮结束（等待期间可取消）'))
+  let releaseFile: (() => Promise<void>) | undefined
+  // Reconnect/retry diagnostics are output but not progress; bound the recovery
+  // so a dead upstream cannot refresh the idle watchdog forever.
+  const recovery = createRecoveryBudget(options.signal, options.timeoutMs, () => {
+    options.onEvent('note', `CLI 持续重连/重试 ${String(Math.round(options.timeoutMs / 1000))} 秒仍未恢复，已请求终止进程（重连诊断不会延长等待）`)
+  })
+  try {
+    options.signal.throwIfAborted()
+    releaseFile = await awaitWithin(() => acquireGrokHomeFile(canonicalHome), {
+      signal: options.signal,
+      timeoutMs: fsTimeoutMs,
+      label: 'Grok 目录租约获取',
+    })
+    options.signal.throwIfAborted()
+    return await runGrokTaskInHome(options, canonicalHome, recovery)
+  } finally {
+    recovery.dispose()
+    const releaseLease = releaseFile
+    try {
+      if (releaseLease !== undefined) {
+        // Bounded: a hung home must not keep this home's memory gate held forever.
+        await awaitWithin(() => releaseLease(), { timeoutMs: fsTimeoutMs, label: 'Grok 目录租约清理' })
+      }
+    } catch (error) {
+      // Cleanup must not erase a completed result or its recovery session ID.
+      const timedOut = error instanceof DeadlineError
+      try {
+        options.onEvent('note', timedOut
+          ? `Grok 目录租约清理在 ${String(Math.round(fsTimeoutMs / 1000))} 秒内没有完成；已停止等待并释放内存锁，再次运行前请确认 .maestro-run.lock`
+          : 'Grok 目录租约未能清理；再次运行前请在确认全部进程关闭后检查 .maestro-run.lock')
+      } catch { /* observational only */ }
+    } finally { release() }
+  }
+}
+
+async function runGrokTaskInHome(options: Parameters<typeof runGrokTask>[0], grokHome: string, recovery: RecoveryBudget): Promise<GrokRunResult> {
+  const mcpServers = options.mcpServers ?? []
+  options.signal.throwIfAborted()
+  await awaitWithin(() => writeGrokHomeConfig(grokHome, mcpServers), {
+    signal: options.signal,
+    timeoutMs: options.fsTimeoutMs ?? GROK_FS_TIMEOUT_MS,
+    label: 'Grok 配置写入',
+  })
+  options.signal.throwIfAborted()
   const args = grokArgs(options.model, options.permissionMode, options.thinking, options.resume,
     mcpServers.filter(server => server.transport !== 'http' && server.command.trim() !== '').map(server => `mcp__${server.name}`))
   if (options.thinking !== undefined && options.thinking !== '' && !(GROK_REASONING_EFFORTS as readonly string[]).includes(options.thinking)) {
@@ -237,9 +376,12 @@ export async function runGrokTask(options: {
     } catch {
       // Non-JSON chatter (update banners, plain error lines) — visible, harmless.
       if (line.trim().startsWith('{')) return
+      recovery.observeDiagnostic(line)
       options.onEvent('note', line.slice(0, 300))
       return
     }
+    // A parsed protocol frame means the CLI is doing real work again.
+    if (frame.type !== 'error') recovery.markProgress()
     if (frame.session_id !== undefined && sessionId === '') sessionId = frame.session_id
     for (const event of claudeFrameEvents(frame)) options.onEvent(event.kind, event.text, event.detail)
     for (const event of grokFrameEvents(frame)) options.onEvent(event.kind, event.text, event.detail)
@@ -267,6 +409,7 @@ export async function runGrokTask(options: {
     if (frame.type === 'error') {
       pendingStreamError = true
       const message = errorMessage ?? 'grok stream error'
+      recovery.observeDiagnostic(message)
       streamErrors.push(message)
       options.onEvent('error', message)
     }
@@ -293,11 +436,14 @@ export async function runGrokTask(options: {
       onTimeoutWarning: remainingMs => {
         options.onEvent('note', `CLI 已连续无 stdout/stderr 输出；若仍无输出，将在约 ${String(Math.round(remainingMs / 1000))} 秒后超时终止（无输出保护，不代表任务语义进展）`)
       },
-      signal: options.signal,
+      signal: recovery.signal,
       onStdoutLine: handleLine,
       // stderr is diagnostics, not protocol — surface it so a hung or failing
       // run is visible while it runs, not only in the final error string.
-      onStderrLine: (line: string) => { options.onEvent('note', `stderr: ${line.slice(0, 300)}`) },
+      onStderrLine: (line: string) => {
+        recovery.observeDiagnostic(line)
+        options.onEvent('note', `stderr: ${line.slice(0, 300)}`)
+      },
     })
     ended = await outcome
   }
@@ -305,15 +451,17 @@ export async function runGrokTask(options: {
   const stats = { ...resultStats }
   if (sessionId !== '') stats['sessionId'] = sessionId
   if (ended.timedOut) stats['timedOut'] = true
+  if (recovery.timedOut) stats['reconnectTimedOut'] = true
   // Exit 0 with an error frame is a real failure (measured: grok exits 0 after
   // `error_during_execution`); frames, not the exit code, decide the outcome.
-  const ok = !ended.timedOut && !options.signal.aborted && ended.code === 0 && finalText.trim() !== '' && resultError === undefined && !pendingStreamError
+  const ok = !ended.timedOut && !recovery.timedOut && !options.signal.aborted && ended.code === 0 && finalText.trim() !== '' && resultError === undefined && !pendingStreamError
   const failureReasons: string[] = []
   if (!ok) {
     if (resultError !== undefined) failureReasons.push(resultError)
     for (const message of streamErrors) failureReasons.push(message)
     if (pendingStreamError && resultError === undefined) failureReasons.push('grok 流式输出报错，且未收到成功的 result 帧')
     if (options.signal.aborted) failureReasons.push('任务已取消，进程已被终止')
+    if (recovery.timedOut) failureReasons.push(`CLI 持续重连/重试 ${String(Math.round(options.timeoutMs / 1000))} 秒仍未恢复，进程已被终止（重连诊断不会延长等待）`)
     if (ended.timedOut) failureReasons.push(`连续无 stdout/stderr 输出 ${String(Math.round(options.timeoutMs / 1000))} 秒超时，进程已被终止（无输出保护，不代表任务语义进展）`)
     if (ended.code !== 0) failureReasons.push(`进程退出码 ${ended.code ?? 'null'}${ended.stderrTail.trim() === '' ? '' : `：${lastLines(ended.stderrTail)}`}`)
     if (finalText.trim() === '') failureReasons.push('Grok CLI 未返回文本结果（result 帧缺失或为空）')

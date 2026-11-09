@@ -30,6 +30,27 @@ import type { EffectQueue } from './effects.js'
 import type { HealthReporter } from './health.js'
 import { parseResultLine, RESULT_PROTOCOL_LINE } from './result-protocol.js'
 import { runPrepare } from './prepare.js'
+import { awaitWithin, DeadlineError } from './deadline.js'
+
+/**
+ * Host-side awaits in a dispatch (journal, effect queue, skill cleanup) have no
+ * child process to kill: when an implementation ignores its AbortSignal the
+ * tool call used to wait forever. These bounds keep the dispatch settling; the
+ * underlying work keeps its own signal and may still finish.
+ */
+export const DISPATCH_STARTUP_TIMEOUT_MS = 30_000
+export const DISPATCH_SETTLE_TIMEOUT_MS = 30_000
+export const DISPATCH_CLEANUP_TIMEOUT_MS = 30_000
+/** A cancelled run gets a short flush window instead of the full settle budget. */
+export const DISPATCH_CANCELLED_FLUSH_MS = 5_000
+
+/** Overrides for the bounds above (tests use small values). */
+export interface DispatchIoTimeouts {
+  readonly startupMs?: number | undefined
+  readonly settleMs?: number | undefined
+  readonly cleanupMs?: number | undefined
+  readonly cancelledMs?: number | undefined
+}
 
 /** Channel stats use normalized camelCase buckets; retain native aliases too
  * if a channel reports them. Missing usage is unknown, never a fabricated zero.
@@ -122,6 +143,8 @@ export interface DispatchDeps {
   /** 收尾协议那一行（可从提示模板覆盖，见 prompts.ts）。 */
   protocolLine?: (() => string) | undefined
   logger?: { warn(message: string): void; error?(message: string): void }
+  /** Bounded host awaits; production uses the exported defaults. */
+  ioTimeouts?: DispatchIoTimeouts | undefined
 }
 
 /** One dispatch request (already validated by the caller). */
@@ -406,6 +429,13 @@ export async function runDispatch(deps: DispatchDeps, params: DispatchParams, si
   const requestedCwd = params.cwd
   const cwd = requestedCwd ?? process.cwd()
   if (requestedCwd === undefined) notes.push(`未指定 cwd，沿用宿主进程目录：${cwd}`)
+  const io = {
+    startupMs: deps.ioTimeouts?.startupMs ?? DISPATCH_STARTUP_TIMEOUT_MS,
+    settleMs: deps.ioTimeouts?.settleMs ?? DISPATCH_SETTLE_TIMEOUT_MS,
+    cleanupMs: deps.ioTimeouts?.cleanupMs ?? DISPATCH_CLEANUP_TIMEOUT_MS,
+    cancelledMs: deps.ioTimeouts?.cancelledMs ?? DISPATCH_CANCELLED_FLUSH_MS,
+  }
+  const flushMs = (): number => abort.signal.aborted ? io.cancelledMs : io.settleMs
 
   const releaseResume = params.resume === undefined ? undefined : deps.registry.claimResume(decision.cli, params.resume)
   // 幂等：同一父会话对同一件事的重复派发只启动一次（窗口见 dedupe.ts）。
@@ -468,29 +498,40 @@ export async function runDispatch(deps: DispatchDeps, params: DispatchParams, si
   // 先记账再干活：这一行在进程被杀时会留下来，下次启动据此把它标成
   // interrupted（而不是当成从没发生过，也不是当成它自己失败）。
   try {
-    await deps.effects?.enqueue('launch', id, {
-      taskId: id,
-      cli: decision.cli,
-      taskName: task.title,
-      prompt: params.task,
-      cwd,
-      taskDifficulty,
-      ...(params.difficultyReason === undefined ? {} : { difficultyReason: params.difficultyReason }),
-      model,
-      ...(params.sessionId === undefined ? {} : { sessionId: params.sessionId }),
-      ...(params.replyTo === undefined ? {} : { replyTo: params.replyTo }),
-      ...(task.replySessionIds === undefined ? {} : { replySessionIds: [...task.replySessionIds] }),
-      startedAt: task.startedAt,
-    })
-  } catch { deps.registry.push(task, 'note', '副作用队列不可用，本次派发无法在重启后恢复') }
+    if (deps.effects !== undefined) {
+      const effects = deps.effects
+      await awaitWithin(() => effects.enqueue('launch', id, {
+        taskId: id,
+        cli: decision.cli,
+        taskName: task.title,
+        prompt: params.task,
+        cwd,
+        taskDifficulty,
+        ...(params.difficultyReason === undefined ? {} : { difficultyReason: params.difficultyReason }),
+        model,
+        ...(params.sessionId === undefined ? {} : { sessionId: params.sessionId }),
+        ...(params.replyTo === undefined ? {} : { replyTo: params.replyTo }),
+        ...(task.replySessionIds === undefined ? {} : { replySessionIds: [...task.replySessionIds] }),
+        startedAt: task.startedAt,
+      }), { signal: abort.signal, timeoutMs: io.startupMs, label: '副作用队列记账' })
+    }
+  } catch (error) {
+    if (!abort.signal.aborted) {
+      deps.registry.push(task, 'note', error instanceof DeadlineError
+        ? `副作用队列在 ${String(Math.round(io.startupMs / 1000))} 秒内没有完成记账，本次派发可能无法在重启后恢复`
+        : '副作用队列不可用，本次派发无法在重启后恢复')
+    }
+  }
 
   try {
     abort.signal.throwIfAborted()
     if (deps.beginUsage !== undefined) {
+      const beginUsage = deps.beginUsage
       try {
-        await deps.beginUsage(task)
+        await awaitWithin(() => beginUsage(task), { signal: abort.signal, timeoutMs: io.startupMs, label: '用量记账开始' })
         task.stats = { ...task.stats, accountingBeginState: 'stored' }
       } catch (error) {
+        abort.signal.throwIfAborted()
         task.stats = { ...task.stats, accountingBeginState: 'failed' }
         throw error
       }
@@ -970,7 +1011,11 @@ export async function runDispatch(deps: DispatchDeps, params: DispatchParams, si
             throw new DispatchError(`${decision.cli} 任务失败：${message}`)
           } finally {
             revokeBridge()
-            if (mcpConfigPath !== undefined) await unlinkQuiet(mcpConfigPath)
+            if (mcpConfigPath !== undefined) {
+              const configPath = mcpConfigPath
+              await awaitWithin(() => unlinkQuiet(configPath), { timeoutMs: io.cleanupMs, label: 'MCP 配置清理' })
+                .catch(() => { /* the config is per-run; a stuck unlink must not pin the slot */ })
+            }
           }
         }
       }
@@ -1004,10 +1049,13 @@ export async function runDispatch(deps: DispatchDeps, params: DispatchParams, si
     // Commit the plugin-owned source before publishing standard record usage.
     // Failure stays machine-readable and does not erase valid CLI output.
     if (deps.settleUsage !== undefined) {
-      try { await deps.settleUsage(task, params.usageSession) }
-      catch {
+      const settleUsage = deps.settleUsage
+      try { await awaitWithin(() => settleUsage(task, params.usageSession), { timeoutMs: flushMs(), label: '用量结算' }) }
+      catch (error) {
         if (typeof task.stats?.['accountingState'] !== 'string' || !task.stats['accountingState'].startsWith('canonical-stored')) task.stats = { ...task.stats, accountingState: 'unconfirmed' }
-        const message = 'CLI 已结算，但持久化用量或宿主投影尚未确认；请查看 accountingState 和插件账本恢复状态'
+        const message = error instanceof DeadlineError
+          ? 'CLI 已结算，但持久化用量在期限内没有返回；请查看 accountingState 和插件账本恢复状态'
+          : 'CLI 已结算，但持久化用量或宿主投影尚未确认；请查看 accountingState 和插件账本恢复状态'
         deps.registry.push(task, 'note', message)
         notes.push(message)
         reportCliUsage(params.usageSession, task)
@@ -1029,7 +1077,11 @@ export async function runDispatch(deps: DispatchDeps, params: DispatchParams, si
     if (deps.settleUsage === undefined) reportCliUsage(params.usageSession, task)
     if (typeof task.stats?.['accountingState'] === 'string') notes.push(`accountingState: ${task.stats['accountingState']}`)
     // The claude native-skills staging tree dies with the run.
-    if (stagedSkillsDir !== undefined) await deps.bridge?.discardStagedSkills(stagedSkillsDir)
+    if (stagedSkillsDir !== undefined) {
+      const stagingDir = stagedSkillsDir
+      await awaitWithin(async () => { await deps.bridge?.discardStagedSkills(stagingDir) }, { timeoutMs: io.cleanupMs, label: '原生技能清理' })
+        .catch(() => { /* staging tree is disposable */ })
+    }
     // And to disk, so the task board survives a host restart (best effort).
     try {
       deps.persist?.(task)
@@ -1037,9 +1089,13 @@ export async function runDispatch(deps: DispatchDeps, params: DispatchParams, si
     // 副作用队列：走到终态才清账；没走到终态的留着重试（进程被杀时这行
     // 根本到不了这里，正好被下次启动当成"没跑完"）。
     if (deps.effects !== undefined) {
+      const effects = deps.effects
       try {
-        if (isTerminalPhase(task.phase)) await deps.effects.settle('launch', id)
-        else await deps.effects.fail('launch', id, '派发未走到终态')
+        const settleEffect = async (): Promise<void> => {
+          if (isTerminalPhase(task.phase)) await effects.settle('launch', id)
+          else await effects.fail('launch', id, '派发未走到终态')
+        }
+        await awaitWithin(settleEffect, { timeoutMs: flushMs(), label: '副作用队列结算' })
       } catch { deps.logger?.warn('副作用队列结算失败') }
     }
     // 健康条目：成功即清除；失败留一条人话，面板不翻日志也知道卡在哪。

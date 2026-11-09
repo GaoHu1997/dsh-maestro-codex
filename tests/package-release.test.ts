@@ -18,6 +18,10 @@ const temporaryRelative = relative(root, temporaryRoot)
 const fixtureParent = !isAbsolute(temporaryRelative) && temporaryRelative !== '..' && !/^\.\.[\\/]/.test(temporaryRelative)
   ? temporaryRoot : join(root, 'tests')
 const fixtures: OwnedTestFixture[] = []
+// Each clean-build guard / owned-fixture cleanup has a bounded 30s PowerShell call.
+function windowsProcessTestTimeout(processes: number): number {
+  return process.platform === 'win32' ? processes * 30_000 + 5_000 : 5_000
+}
 function fixture() {
   const owned = createOwnedTestFixture(fixtureParent, '.package-release-clean-')
   fixtures.push(owned)
@@ -26,7 +30,7 @@ function fixture() {
 
 afterEach(() => {
   for (const owned of fixtures.splice(0)) owned.remove()
-})
+}, process.platform === 'win32' ? windowsProcessTestTimeout(2) : undefined)
 
 describe('release export and build configuration', () => {
   it('keeps the host contract and connects client types to the real CJS entry', async () => {
@@ -175,33 +179,34 @@ describe('controlled build cleanup', () => {
     expect(existsSync(join(path, 'lib'))).toBe(false)
     expect(readFileSync(join(path, 'src', 'keep.ts'), 'utf8')).toBe('export const keep = true\n')
     expect(cleanBuildOutputs(path).removed).toBe(false)
-  })
+  }, windowsProcessTestTimeout(3))
 
   it('rejects relative/outside roots and CLI path arguments without touching live lib', () => {
     expect(() => cleanBuildOutputs('.')).toThrow('absolute')
     expect(() => cleanBuildOutputs(parse(root).root)).toThrow('outside the plugin')
     expect(() => cleanBuildOutputs(dirname(root))).toThrow(/^Build root is outside the plugin:/)
     expect(() => cleanBuildOutputs(resolve(root, '../not-this-plugin'))).toThrow(/^Build root is outside the plugin:/)
+    // Bound the real Node launch below this integration case's 20s budget.
     expect(() => execFileSync(process.execPath, [join(root, 'scripts', 'clean-build.mjs'), '..'], {
-      encoding: 'utf8', stdio: 'pipe',
-    })).toThrow()
-  })
+      encoding: 'utf8', stdio: 'pipe', timeout: 15_000, windowsHide: true,
+    })).toThrow('clean-build accepts no path arguments')
+  }, 20_000)
 
   it('rejects a non-directory output before writing', () => {
     const path = fixture()
     writeFileSync(join(path, 'lib'), 'not output')
-    expect(() => cleanBuildOutputs(path)).toThrow()
+    expect(() => cleanBuildOutputs(path)).toThrow('Build directory is not a directory:')
     expect(readFileSync(join(path, 'lib'), 'utf8')).toBe('not output')
-  })
+  }, windowsProcessTestTimeout(2))
 
   it('rejects a linked output root without following a Windows junction', () => {
     const path = fixture()
     mkdirSync(join(path, 'protected'))
     writeFileSync(join(path, 'protected', 'keep'), 'untouched')
     symlinkSync(join(path, 'protected'), join(path, 'lib'), 'junction')
-    expect(() => cleanBuildOutputs(path)).toThrow()
+    expect(() => cleanBuildOutputs(path)).toThrow(/Refusing (reparse|linked or special|redirected) build path:/)
     expect(readFileSync(join(path, 'protected', 'keep'), 'utf8')).toBe('untouched')
-  })
+  }, windowsProcessTestTimeout(2))
 
   it('validates every child before deleting anything', () => {
     const path = fixture()
@@ -210,20 +215,20 @@ describe('controlled build cleanup', () => {
     writeFileSync(join(path, 'protected', 'keep'), 'untouched')
     writeFileSync(join(path, 'lib', 'old.js'), 'stale')
     symlinkSync(join(path, 'protected'), join(path, 'lib', 'redirect'), 'junction')
-    expect(() => cleanBuildOutputs(path)).toThrow()
+    expect(() => cleanBuildOutputs(path)).toThrow(/Refusing (reparse|linked or special|redirected) build path:/)
     expect(readFileSync(join(path, 'protected', 'keep'), 'utf8')).toBe('untouched')
     expect(readFileSync(join(path, 'lib', 'old.js'), 'utf8')).toBe('stale')
-  })
+  }, windowsProcessTestTimeout(2))
 
   it('rejects a linked plugin-root component even when no lib exists', () => {
     const path = fixture()
     mkdirSync(join(path, 'protected'))
     writeFileSync(join(path, 'protected', 'keep'), 'untouched')
     symlinkSync(join(path, 'protected'), join(path, 'redirect'), 'junction')
-    expect(() => cleanBuildOutputs(join(path, 'redirect'))).toThrow()
+    expect(() => cleanBuildOutputs(join(path, 'redirect'))).toThrow(/Refusing (reparse|linked or special|redirected) build path:/)
     expect(existsSync(join(path, 'protected'))).toBe(true)
     expect(readFileSync(join(path, 'protected', 'keep'), 'utf8')).toBe('untouched')
-  })
+  }, windowsProcessTestTimeout(1))
 
   it('cleans its exact owned fixture without following a junction to a protected target', () => {
     const path = fixture()
@@ -236,7 +241,7 @@ describe('controlled build cleanup', () => {
     owned.remove()
     expect(existsSync(path)).toBe(false)
     expect(readFileSync(join(protectedPath, 'keep'), 'utf8')).toBe('untouched')
-  })
+  }, windowsProcessTestTimeout(1))
 })
 
 describe('release delivery whitelist', () => {

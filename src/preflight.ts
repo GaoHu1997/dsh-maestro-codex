@@ -34,9 +34,15 @@ export interface DshPreflight {
   note?: string | undefined
 }
 
-/** Model-name words used to tell "bad model" apart from "bad request". */
-const MODEL_WORD = /\bmodel\b|模型/i
-const MISSING_WORD = /not\s*found|does\s+not\s+exist|no\s+such|unknown|unsupported|not\s+supported|invalid|不存在|不支持|无效|未找到/i
+/** Only definite model errors may block; unrelated request failures are advisory. */
+const MISSING_MODEL_CODES = new Set([
+  'model_not_found', 'model_not_exists', 'model_does_not_exist', 'unknown_model',
+  'unsupported_model', 'invalid_model', 'model_not_supported', 'no_such_model',
+])
+const GENERIC_ERROR_CODES = new Set(['bad_request', 'invalid_request', 'invalid_request_error', 'invalid_argument', 'not_found', 'not_found_error'])
+const NON_MODEL_CODE = /(?:^|_)(?:parameters?|params?|arguments?|context|quota|rate_limit|billing|credits?|tokens?|overloaded|resource_exhausted)(?:_|$)|^invalid_value$/i
+const NON_MODEL_WORD = /\b(?:parameters?|params?|arguments?|context|quota|billing|credits?|rate[ _-]?limits?|tokens?|max_(?:output_|completion_)?tokens|reasoning|effort|input|output|messages?|prompt|configuration)\b|unsupported\s+value|too\s+many\s+requests|too\s+long|参数|上下文|配额|额度|余额|限流|频率|过载|令牌|长度/i
+const MISSING_MODEL_TEXT = /\b(?:unknown|unsupported|invalid|no\s+such)\s+(?:requested\s+)?model\b|\bmodel\b(?:\s+(?:["'`][^"'`\r\n]{1,200}["'`]|[\w./:-]+))?\s+(?:(?:is|was)\s+)?(?:not\s+(?:found|supported)|does\s+not\s+exist|doesn't\s+exist|unknown|unsupported|invalid)\b|模型(?:\s*["'`][^"'`\r\n]{1,200}["'`]|\s*[\w./:-]+)?\s*(?:不存在|未找到|不支持|无效|未知)|(?:未知|无效|不支持)(?:的)?模型|(?:未找到|找不到|没有找到|无此|无该|不存在的)\s*模型/i
 
 /**
  * A provider that declares its models is making a promise the selection has to
@@ -81,6 +87,42 @@ export function probeRequest(endpoint: DshModelEndpoint): { url: string; init: R
   return { url: `${base}${path}`, init: { method: 'POST', headers, body: JSON.stringify(body) } }
 }
 
+function errorObject(value: unknown): Record<string, unknown> | undefined {
+  return typeof value === 'object' && value !== null && !Array.isArray(value) ? value as Record<string, unknown> : undefined
+}
+
+function errorTag(value: unknown): string {
+  return typeof value === 'string' ? value.trim().toLowerCase().replace(/[\s.-]+/g, '_') : ''
+}
+
+/** Structured code/param takes precedence over legacy error-message wording. */
+function explicitlyMissingModel(bodyText: string): boolean {
+  let raw: unknown
+  try { raw = JSON.parse(bodyText) } catch {
+    return !NON_MODEL_WORD.test(bodyText) && MISSING_MODEL_TEXT.test(bodyText)
+  }
+  const root = errorObject(raw)
+  if (root === undefined) return false
+  // An error envelope owns its verdict. Ignore echoed request/debug fields on
+  // the outer object rather than searching the entire serialized response.
+  const nested = root['error']
+  const error = errorObject(nested) ?? (nested === undefined ? root : {})
+  const code = errorTag(error['code'])
+  const type = errorTag(error['type'])
+  const param = typeof error['param'] === 'string' ? error['param'].trim().toLowerCase() : ''
+  if ((error['code'] != null && typeof error['code'] !== 'string')
+    || (error['param'] != null && typeof error['param'] !== 'string')) return false
+  if ((NON_MODEL_CODE.test(code) && !GENERIC_ERROR_CODES.has(code))
+    || (NON_MODEL_CODE.test(type) && !GENERIC_ERROR_CODES.has(type))) return false
+  if (param !== '' && param !== 'model' && param !== 'model_id') return false
+  // Conflicting non-model codes/params remain unknown, even when another field
+  // says model_not_found: a tiny advisory probe must not guess past validation.
+  if (MISSING_MODEL_CODES.has(code) || MISSING_MODEL_CODES.has(type)) return true
+  if (code !== '' && !GENERIC_ERROR_CODES.has(code)) return false
+  const message = typeof nested === 'string' ? nested : typeof error['message'] === 'string' ? error['message'] : ''
+  return !NON_MODEL_WORD.test(message) && MISSING_MODEL_TEXT.test(message)
+}
+
 /** Turn one probe response into a verdict. */
 export function classifyProbe(endpoint: DshModelEndpoint, status: number, bodyText: string): DshPreflight {
   const label = `${endpoint.provider}::${endpoint.model}`
@@ -102,7 +144,8 @@ export function classifyProbe(endpoint: DshModelEndpoint, status: number, bodyTe
   if (status === 401 || status === 403) {
     return { status: 'mismatch', detail: `模型预检失败：${label} 被端点拒绝鉴权（HTTP ${String(status)}），请检查端点鉴权配置` }
   }
-  if (MODEL_WORD.test(bodyText) && MISSING_WORD.test(bodyText)) {
+  // Payment/rate-limit/server responses do not establish a model-name failure.
+  if (status !== 402 && status !== 429 && status < 500 && explicitlyMissingModel(bodyText)) {
     return { status: 'mismatch', detail: `模型预检失败：端点不认这个模型 ${label}（HTTP ${String(status)}）` }
   }
   return { status: 'unknown', detail: `模型预检返回 HTTP ${String(status)}，无法判定 ${label} 是否可用（仍尝试派发）` }

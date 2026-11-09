@@ -60,7 +60,7 @@ export const TOOL_PARAMETER_SCHEMA = {
     cwd: { type: 'string', description: '执行目录（绝对路径）。省略时沿用本会话工作区，并在返回的 notes 里标注实际使用的目录。' },
     resume: { type: 'string', description: '续接之前的 CLI 子代理会话：传上次结果里的 sessionRef（claude 的 session id、codex 的 thread id 或 grok 的 session id），本次任务作为该会话的后续指令执行。原会话对话不会自动带入，需要的结论要写进 task；不带此参数则开全新会话。' },
     model: { type: 'string', description: '临时指定 DSH 模型：provider::model 固定供应商且失败不回退；裸模型名绑定主代理或配置页的可信 DSH 供应商，保留该模型名逐一解析、校验协议并预检，不能借用 CLI 自带配置。省略时沿用主代理模型（协议不兼容或不可用则回退配置页的 dsh 模型）。无可用 DSH 端点时直接报错。' },
-    timeout_minutes: { type: 'number', description: 'CLI 连续无 stdout/stderr 输出超时（分钟，1–240），不是总运行时长；非空输出分片重置计时。这是无输出保护，不代表任务语义进展。缺省用配置页的统一超时。' },
+    timeout_minutes: { type: 'number', description: 'CLI 连续无 stdout/stderr 输出超时（分钟，1–240），不是总运行时长；非空输出分片重置计时。这是无输出保护，不代表任务语义进展。各 CLI 通道（Codex/Claude/Grok）持续重连另有同长度恢复期限，重复重连日志不会续期。缺省用配置页的统一超时。' },
     dedupe_key: { type: 'string', description: '可选幂等键：同一个键在 10 分钟窗口内只会真正启动一次（重复调用直接返回"已派发过"）。不传则按 父会话+cli+任务名+cwd 自动推导；续接（resume）不参与去重。' },
   },
   required: ['task', 'task_difficulty', 'difficulty_reason'],

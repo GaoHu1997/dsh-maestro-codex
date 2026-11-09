@@ -9,7 +9,7 @@
 - 标题栏使用原版 36px 高度、字体、间距、分隔线和宿主 ghost 刷新按钮。
 - 图/树切换、自动折叠、缩放与适配按钮保留原版位置。取消旧的独立筛选工具栏，不往原版 UI 增加设计元素。
 - 使用宿主的 React 和 UI primitives，原版 `--dsw-*` 主题变量直接继承亮/暗主题。
-- 核心源码与 CSS 按原始字节保存；只有 4 个渲染文件加入隔离的 CLI `executor` 字段/右对齐标识，测试移除这些精确插入后验证原始 SHA-256。源文件哈希见 [source-manifest.json](https://github.com/GaoHu1997/dsh-maestro-codex/blob/master/src/client/board/upstream/source-manifest.json)，MIT 许可见 [THIRD_PARTY_NOTICES](../THIRD_PARTY_NOTICES)。CSS Modules 编译后内联进客户端包，不依赖宿主额外加载样式文件。
+- 布局、动画与 CSS 按原始字节保存；4 个渲染文件以 `adapted-cli-badge-and-interrupted-state` 明确记录白名单适配：隔离的 CLI `executor` 标识、既有状态槽及读屏名称中的可选 `stateText`，以及折叠计算前的作用域内 CLI 状态映射。已中断 CLI 按空闲/等待处理，不伪造原生运行标记，不藏进“已完成”组；真正完成的兄弟仍正常折叠，原生节点未传适配字段时输出保持原样。测试逐一还原精确插入/替换，并对比独立固定的 0.28.2 原版 SHA-256，不以修改基准哈希代替验收。源文件哈希见 [source-manifest.json](https://github.com/GaoHu1997/dsh-maestro-codex/blob/master/src/client/board/upstream/source-manifest.json)，MIT 许可见 [THIRD_PARTY_NOTICES](../THIRD_PARTY_NOTICES)。CSS Modules 编译后内联进客户端包，不依赖宿主额外加载样式文件。
 
 ## 座位与数据
 

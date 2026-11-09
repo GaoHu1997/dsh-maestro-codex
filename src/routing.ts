@@ -98,10 +98,24 @@ export function assertTaskDifficulty(config: EffectiveConfig, cli: MaestroCliId,
  */
 export function pickCli(config: EffectiveConfig, requested: string, taskText: string): RoutingDecision {
   const wanted = requested.trim() === '' ? 'auto' : requested.trim().toLowerCase()
+  if (wanted !== 'auto' && !(CLI_IDS as readonly string[]).includes(wanted)) {
+    throw new RoutingError(`未知 CLI "${requested}"（支持 ${CLI_IDS.join(' / ')} 或 auto）`)
+  }
+  const scored = CLI_IDS
+    .filter(cli => enabledOf(config, cli))
+    .map(cli => ({ cli, score: keywordScore(config, cli, taskText) }))
+    .sort((a, b) => b.score - a.score)
+  const best = scored[0]
+  // A built-in dsh task must not become an external job through an explicit
+  // CLI request or a disabled-CLI fallback. A tie still keeps the CLI for
+  // stale configurations that list one task type on both sides.
+  const dshHits = hitTaskTypes(dshTaskTypes(config), taskText)
+  if (dshHits.length > 0 && dshHits.length > (best?.score ?? 0)) {
+    throw new RoutingError(
+      `任务类型命中 dsh 子代理（${dshHits.join('、')}）：这类任务不派发给外部 CLI，请改用 dsh 子代理（subagent / subagent_fork），或由主代理直接完成。`,
+    )
+  }
   if (wanted !== 'auto') {
-    if (!(CLI_IDS as readonly string[]).includes(wanted)) {
-      throw new RoutingError(`未知 CLI "${requested}"（支持 ${CLI_IDS.join(' / ')} 或 auto）`)
-    }
     if (!enabledOf(config, wanted as MaestroCliId)) {
       const fallback = fallbackOf(config, wanted as MaestroCliId)
       if (fallback === undefined) throw new RoutingError(`${wanted} 已停用，且没有其他已启用的 CLI`)
@@ -109,22 +123,7 @@ export function pickCli(config: EffectiveConfig, requested: string, taskText: st
     }
     return { cli: wanted as MaestroCliId, reason: 'requested', note: undefined }
   }
-  const scored = CLI_IDS
-    .filter(cli => enabledOf(config, cli))
-    .map(cli => ({ cli, score: keywordScore(config, cli, taskText) }))
-    .sort((a, b) => b.score - a.score)
-  if (scored.length === 0) throw new RoutingError('没有已启用的 CLI，无法派发任务')
-  const best = scored[0]
   if (best === undefined) throw new RoutingError('没有已启用的 CLI，无法派发任务')
-  // A task type that belongs to the built-in dsh fallback is not a CLI job:
-  // refuse it before the default CLI can silently take it. A tie keeps the CLI
-  // (a stale config may still list one type on both sides).
-  const dshHits = hitTaskTypes(dshTaskTypes(config), taskText)
-  if (dshHits.length > 0 && dshHits.length > best.score) {
-    throw new RoutingError(
-      `任务类型命中 dsh 子代理（${dshHits.join('、')}）：这类任务不派发给外部 CLI，请改用 dsh 子代理（subagent / subagent_fork），或由主代理直接完成。`,
-    )
-  }
   if (best.score > 0) {
     // A stable sort would otherwise always hand a tie to the first CLI_IDS
     // entry, silently ignoring the configured default. Break ties explicitly.

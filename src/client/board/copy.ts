@@ -22,6 +22,17 @@ export function jobsEmptyLabel(): string {
   return t('jobsEmpty' as Parameters<typeof t>[0])
 }
 
+/**
+ * 中断任务的看板状态词。上游只有「运行中 / 待命 / 已完成 / 出错」四态词条，
+ * 而中断是第五种：没有结论、也不是失败，等人决定要不要重新派发。上游渲染器
+ * 通过 `TasksAgentNode.stateText` 槽位接收这枚词，卡片状态位与树 meta 行共用。
+ * 先补写字典再取词，避免任何调用顺序下拿到裸 key。
+ */
+export function interruptedStateLabel(): string {
+  applyBoardCopy()
+  return t('tasksStateInterrupted' as Parameters<typeof t>[0])
+}
+
 /** 应用看板词条覆盖（幂等；客户端 apply 时调用一次即可）。 */
 export function applyBoardCopy(): void {
   zh.tasksNodeJump = '查看会话'
@@ -35,4 +46,7 @@ export function applyBoardCopy(): void {
   // 新键：上游字典没有空后台任务列表的文案，运行时补（同上就地改写，t() 现读生效）。
   ;(zh as Record<string, string>).jobsEmpty = '暂无后台任务'
   ;(en as Record<string, string>).jobsEmpty = 'No background jobs'
+  // 第五种状态词：中断（等人决定是否重新派发），与详情浮层的「已中断」同词。
+  ;(zh as Record<string, string>).tasksStateInterrupted = '已中断'
+  ;(en as Record<string, string>).tasksStateInterrupted = 'Interrupted'
 }

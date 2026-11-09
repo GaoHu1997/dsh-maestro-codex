@@ -3,6 +3,7 @@ import { useState, type ReactNode } from 'react'
 import { Button, IconCodeOutlineRegular, IconRightUpOutlineRegular, StateDot, type StateDotState } from '@deepseek-ai/dsh-client-ui-primitives'
 import type { MaestroTaskSummary } from '../../wire.js'
 import { taskCancellable, taskDuration, type BoardNode, type BoardTokenUsage } from './model.js'
+import { interruptedStateLabel } from './copy.js'
 import { formatJobDuration, t } from './upstream/index.js'
 import { chatT } from './upstream/client/locales.js'
 import { totalTokens } from './upstream/client/session-metrics.js'
@@ -22,7 +23,7 @@ function phaseWord(phase: MaestroTaskSummary['phase']): string {
     case 'failed':
     case 'timeout': return t('tasksStateError')
     case 'cancelled': return '已取消'
-    case 'interrupted': return '已中断'
+    case 'interrupted': return interruptedStateLabel()
   }
 }
 function phaseDot(phase: MaestroTaskSummary['phase']): StateDotState {

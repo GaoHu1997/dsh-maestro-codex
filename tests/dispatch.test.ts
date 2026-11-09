@@ -202,42 +202,48 @@ describe('runDispatch', () => {
   })
 
   it('streams running usage onto the task list before the run settles', async () => {
+    let startCli!: (controls: { emitUsage: () => void, finish: () => void }) => void
+    const started = new Promise<{ emitUsage: () => void, finish: () => void }>(resolve => { startCli = resolve })
     const spawn = scriptedSpawn(child => {
       if (child.spawnArgs[0] === '--version') {
         child.finish('claude version 9.9.9 (CCL)')
         return
       }
-      // Stream the assistant frame first, settle a beat later: the assertion
-      // below inspects the list inside that window, exactly like the board's
-      // 2.5s poll does while a CLI task is still running.
-      setTimeout(() => {
-        child.stdout.emit('data', Buffer.from(`${JSON.stringify({
-          type: 'assistant',
-          message: { content: [{ type: 'text', text: '写' }], usage: { input_tokens: 640, output_tokens: 12, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 } },
-        })}\n`))
-      }, 5)
-      setTimeout(() => {
-        child.finish(JSON.stringify({
-          type: 'result', subtype: 'success', result: 'claude 完成',
-          usage: { input_tokens: 900, output_tokens: 30, cache_read_input_tokens: 100, cache_creation_input_tokens: 0 },
-        }))
-      }, 800)
+      if (child.spawnFile === 'git') {
+        // Git context is a separate probe, not the CLI transcript under test.
+        child.finish('## acceptance')
+        return
+      }
+      // Keep the CLI running until the live snapshot has been observed. An
+      // 800ms wall-clock finish can race heavy installed-host tests on Windows.
+      startCli({
+        emitUsage: () => {
+          child.stdout.emit('data', Buffer.from(`${JSON.stringify({
+            type: 'assistant',
+            message: { content: [{ type: 'text', text: '写' }], usage: { input_tokens: 640, output_tokens: 12, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 } },
+          })}\n`))
+        },
+        finish: () => {
+          child.finish(JSON.stringify({
+            type: 'result', subtype: 'success', result: 'claude 完成',
+            usage: { input_tokens: 900, output_tokens: 30, cache_read_input_tokens: 100, cache_creation_input_tokens: 0 },
+          }))
+        },
+      })
     })
     const { deps, registry } = makeDeps(fixture(), spawn.spawnFn)
     const run = runDispatch(deps, { ...assessment, cli: 'claude', task: '做个分析' }, new AbortController().signal)
-    // Poll the list the way the board does, and remember what it showed while
-    // the task was still running.
-    let live: ReturnType<typeof registry.list>[number] | undefined
-    for (let i = 0; i < 200; i += 1) {
-      const row = registry.list()[0]
-      if (row?.usage !== undefined) {
-        live = row
-        break
-      }
-      await new Promise(resolve => setTimeout(resolve, 10))
+    const controls = await started
+    try {
+      controls.emitUsage()
+      await vi.waitFor(() => {
+        const live = registry.list()[0]
+        expect(live?.phase).toBe('running')
+        expect(live?.usage).toMatchObject({ uncachedInputTokens: 640, outputTokens: 12 })
+      }, { timeout: 2000, interval: 10 })
+    } finally {
+      controls.finish()
     }
-    expect(live?.phase).toBe('running')
-    expect(live?.usage).toMatchObject({ uncachedInputTokens: 640, outputTokens: 12 })
     const value = await run
     expect(value.ok).toBe(true)
     // Settled totals replace the running snapshot.

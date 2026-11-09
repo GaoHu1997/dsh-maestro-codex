@@ -716,7 +716,7 @@ function renderAgentNode(
       data-depth={node.depth}
       role="button"
       tabIndex={-1}
-      aria-label={`${node.label} ${agentMeta(node)}`}
+      aria-label={`${node.label} ${node.stateText ?? agentMeta(node)}`}
       aria-current={node.current ? 'true' : undefined}
       className={clsx(
         css.node,
@@ -791,6 +791,7 @@ const AgentCardContents = memo(function AgentCardContents(props: {
         state={node.state}
         running={node.state === 'running'}
         {...(activity === undefined ? {} : { activity })}
+        {...(node.stateText === undefined ? {} : { stateText: node.stateText })}
         {...(foldable && !node.current && onFold !== undefined
           ? { onFold: () => { onFold(node) } }
           : {})}

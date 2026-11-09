@@ -88,6 +88,24 @@ node scripts/maestro-status.mjs --url http://127.0.0.1:11061
 
 读 `GET /plugin/dsh-maestro-codex/status`，退出码 **0** 无健康问题 / **1** 连接、HTTP 或 JSON 读取失败 / **2** 存在 `degraded` 或 `error` 健康条目。脚本随安装包交付，只依赖 Node（与插件相同的 `>=22.19`，使用内置 `fetch` 与 `AbortSignal.timeout`），不依赖其他 `scripts` 或源码。请在安装包目录执行；`--url` 或 `MAESTRO_WEB_URL` 应指向正在运行的真实 DSH 地址，示例端口不保证与当前宿主相同。
 
+## 11. CLI 重连与进程收尾
+
+CLI 的 `timeout_minutes` 仍表示连续无 stdout/stderr 输出超时，任意非空输出分片会续期，不限制正常任务的总运行时长。Codex 另有同长度的持续重连期限：从首次明确的 `Reconnecting` 诊断开始，重复重连、普通 stderr、空白或未知 JSON 帧均不会续期；识别到任务执行、文件变更、推理、答复或完成帧时解除重连期限，后续再次断线重新计时。到期请求终止 CLI，返回 `stats.timedOut=true` 和 `stats.reconnectTimedOut=true`，由派发层记录为超时；不触发自动重试，也不把内部恢复超时误报为用户取消。
+
+CLI 与就绪命令共用有限的进程收尾：收到 `exit` 后最多保留 5 秒读取管道尾部；超时或取消后先设置 6 秒的收尾期限，再请求终止进程。重复输出不会延长这些期限。正常 `close` 会结算真实退出码；期限届满仍未收到 `close` 时，刷新已收到的尾行、关闭本地管道并返回失败（退出码 `null`），明确提示进程终止或输出完整性未确认。父进程已退出时不会对旧 PID 盲目执行树杀。
+
+Claude 与 Grok 通道复用同一条恢复期限（`src/recovery-budget.ts`）：首个 `Reconnecting` / `Retrying` / 网络错误诊断起算，重复诊断不续期，解析到真实协议帧即解除；到期同样记 `timedOut` / `reconnectTimedOut`，不当作取消。
+
+## 12. 宿主侧等待与桥接收尾
+
+CLI 之外的宿主调用同样不能无限等待——它们没有进程可杀，旧实现遇到不响应 `AbortSignal` 的实现或卡住的文件系统会永远挂起，工具调用一样不返回。`src/deadline.ts` 的 `awaitWithin` 只保证「等到期限就返回」，并把同一个 signal 继续往下传；底层晚到的结算只被消费，不会变成未处理拒绝，也不表示底层副作用已被物理终止。
+
+- 桥接（`src/bridge.ts`）：技能目录发现 20 秒、技能读取 20 秒、宿主工具执行 10 分钟、原生技能清理 30 秒。发现超时按空目录继续；读取/执行超时返回 504 并说明底层可能仍在运行；鉴权（401）与脱敏（500）语义不变。
+- 派发收尾（`src/dispatch.ts`）：启动记账 30 秒、结算/清理 30 秒、取消后结算冲洗 5 秒。开始用量记账超时会按失败关闭本次派发；结算用量超时仍保留已完成的结果，只把记账标为未确认并给出告警，不重试、不伪造 `0`。
+- `dsh_bridge` 垫片（`src/bridge-shim.ts`）：单次请求的 fetch 与响应体共用一个期限（目录 20 秒、工具调用 15 分钟），响应头到达不等于响应体到达；stdin 关闭时中止所有在途请求，并在最多 2 秒的冲洗窗口后退出，不再等待绝不返回的 HTTP 调用。
+- Grok 运行前的文件系统步骤（`src/channels/grok.ts`）：会话目录准备、`config.toml` 写入、跨进程 `.maestro-run.lock` 租约获取与清理各 30 秒。超时按失败处理（不会带着未确认的租约硬跑），finally 仍会释放进程内 home 门锁，避免同目录队列被永久占住。Claude 的一次性 settings 文件清理有 5 秒上限，清理超时不会掩盖已完成的运行结果。
+- MCP 环境垫片（`src/mcp-env-shim.ts`）：收到 SIGINT/SIGTERM 后转发给 MCP 子进程，5 秒内仍未退出则升级 SIGKILL；子进程退出即以它的退出码结束垫片，避免继承的 stdio 让垫片在取消后继续存活。
+
 ## 兼容性
 
 - `stage` / `result` 是摘要上的**新增可选字段**，老客户端忽略即可。
@@ -141,3 +159,10 @@ test "$actual" = "$published"
 | `tests/persist-reliability.test.ts` | `result` 与 `interrupted` 的落盘/读回 |
 | `tests/task-registry-reliability.test.ts` | 中断任务的终态语义、npm 作业落 `idle` |
 | `tests/limiter-priority.test.ts` | 人优先、溢出槽、abort、容量变更 |
+| `tests/deadline.test.ts` | `awaitWithin` 成功/超时/取消/晚结算/同步抛出 |
+| `tests/recovery-budget.test.ts` | 首个重连起算、重复不续期、进展解除、到期中止 |
+| `tests/codex-reconnect.test.ts` | Codex 重连期限：杂音不续期、恢复、取消竞态 |
+| `tests/claude-reconnect.test.ts` | Claude 重连期限：持续诊断终止、真实帧后保留 idle 保护 |
+| `tests/process-close.test.ts` | 进程收尾：超时/取消无 close 有界、尾行刷新、prepare 镜像 |
+| `tests/bridge-shim-bounds.test.ts` | 垫片请求/响应体期限、EOF 中止、notifications/cancelled |
+| `tests/dispatch-io-bounds.test.ts` | 启动/结算宿主 IO 永不返回时的有界返回与资源释放 |

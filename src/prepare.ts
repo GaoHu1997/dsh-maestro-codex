@@ -8,7 +8,7 @@
  */
 
 import type { ChildProcess } from 'node:child_process'
-import { killTree, systemSpawn, type SpawnFn } from './spawn.js'
+import { systemSpawn, watchChildClose, type SpawnFn } from './spawn.js'
 
 /** 输出上限：就绪命令的输出只用来解释失败，不承载结果，保留开头更有用。 */
 export const PREPARE_OUTPUT_CAP = 2000
@@ -64,6 +64,7 @@ function appendOutput(current: string, chunk: string): string {
  * 调用方用同一条路径报错。
  */
 export async function runPrepare(command: string, options: PrepareOptions): Promise<PrepareOutcome> {
+  if (options.signal?.aborted) return { ok: false, code: null, timedOut: false, output: '就绪命令已取消' }
   const invocation = prepareInvocation(command, options.platform ?? process.platform)
   const spawnFn = options.spawnFn ?? systemSpawn
   const timeoutMs = options.timeoutMs ?? PREPARE_TIMEOUT_MS
@@ -85,31 +86,39 @@ export async function runPrepare(command: string, options: PrepareOptions): Prom
       if (settled) return
       settled = true
       clearTimeout(timer)
+      closer.dispose()
+      child.removeListener('exit', onExit)
       options.signal?.removeEventListener('abort', onAbort)
       resolve(outcome)
     }
+    const closer = watchChildClose(child, (code, _signal, forced) => {
+      const diagnostic = forced ? '\n[maestro] 未收到子进程 close；已结束等待，进程终止或输出完整性未确认' : ''
+      finish({ ok: code === 0 && !timedOut && !options.signal?.aborted, code, timedOut, output: `${output.trim()}${diagnostic}`.trim() })
+    })
     const timer = setTimeout(() => {
       timedOut = true
-      void killTree(child)
+      closer.stop()
     }, timeoutMs)
     const onAbort = (): void => {
-      void killTree(child)
+      clearTimeout(timer)
+      closer.stop()
     }
-    if (options.signal?.aborted === true) onAbort()
-    else options.signal?.addEventListener('abort', onAbort, { once: true })
+    const onExit = (): void => { clearTimeout(timer) }
+    child.once('exit', onExit)
     child.stdout?.on('data', (chunk: unknown) => {
+      if (settled) return
       if (typeof chunk === 'string') output = appendOutput(output, chunk)
       else if (chunk instanceof Uint8Array) output = appendOutput(output, Buffer.from(chunk).toString('utf8'))
     })
     child.stderr?.on('data', (chunk: unknown) => {
+      if (settled) return
       if (typeof chunk === 'string') output = appendOutput(output, chunk)
       else if (chunk instanceof Uint8Array) output = appendOutput(output, Buffer.from(chunk).toString('utf8'))
     })
     child.on('error', error => {
-      finish({ ok: false, code: null, timedOut: false, output: appendOutput(output, error.message) })
+      finish({ ok: false, code: null, timedOut, output: appendOutput(output, error.message) })
     })
-    child.on('close', code => {
-      finish({ ok: code === 0 && !timedOut, code, timedOut, output: output.trim() })
-    })
+    if (options.signal?.aborted === true) onAbort()
+    else options.signal?.addEventListener('abort', onAbort, { once: true })
   })
 }

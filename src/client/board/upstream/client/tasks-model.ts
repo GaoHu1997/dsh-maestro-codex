@@ -59,6 +59,8 @@ export interface TasksAgentNode {
   title?: string
   /** Maestro CLI executor identity; absent on native agents. */
   executor?: string
+  /** CLI-only state word (interrupted tasks keep a state slot the native four cannot name). */
+  stateText?: string
   /** The catalog row's mode; `unknown` claims neither and renders nothing. */
   mode?: SidebarSubagentCatalogEntry['mode']
   state: TasksNodeState
@@ -158,6 +160,8 @@ export interface TasksModelInput {
   teamMembers: readonly TeamMemberRow[]
   /** The team's shared tasks; each lands on its OWNER's node. */
   teamTasks?: readonly SidebarTeamTaskView[]
+  /** CLI-only display states applied before fold derivation; absent for native agents. */
+  cliStates?: ReadonlyMap<string, TasksNodeState>
   /** Global gate for automatic folding; manual foldedIds remain independent. */
   folded: boolean
   /** Automatically aggregate settled leaves (default true). */
@@ -398,9 +402,9 @@ export function buildTasksModel(input: TasksModelInput): TasksNode[] {
       // fallback for a deployment whose summaries do not carry it.
       const running = summary?.running ?? (view?.running === true)
       const activity: 'running' | 'inactive' = running ? 'running' : 'inactive'
-      const state: TasksNodeState = activity === 'running'
+      const state: TasksNodeState = input.cliStates?.get(entry.id) ?? (activity === 'running'
         ? 'running'
-        : team !== undefined ? teamState(team.status) : 'done'
+        : team !== undefined ? teamState(team.status) : 'done')
       agentChildren.push({
         kind: 'agent',
         id: entry.id,

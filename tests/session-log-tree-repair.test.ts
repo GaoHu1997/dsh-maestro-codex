@@ -41,6 +41,23 @@ const roots: string[] = []
 const servers = new Set<Server>()
 const script = fileURLToPath(new URL('../scripts/repair-maestro-session-tree.mjs', import.meta.url))
 const run = promisify(execFile)
+const TEST_HEADROOM_MS = 5_000
+const OFFLINE_VERDICT_MS = 10_000
+const CLI_PROCESS_TIMEOUT_MS = 15_000
+const CLI_TEST_TIMEOUT_MS = CLI_PROCESS_TIMEOUT_MS + TEST_HEADROOM_MS
+const CLI_REFUSAL_TEST_TIMEOUT_MS = process.platform === 'win32'
+  ? 4 * CLI_PROCESS_TIMEOUT_MS + TEST_HEADROOM_MS : 20_000
+// One preflight plus two checks per applied file; each round checks IPv4/IPv6.
+function offlineTestTimeout(rounds: number, nonWindowsTimeout = 25_000): number {
+  return process.platform === 'win32'
+    ? rounds * 2 * OFFLINE_VERDICT_MS + TEST_HEADROOM_MS : nonWindowsTimeout
+}
+function cliRunner(testTimeoutMs: number) {
+  const deadline = performance.now() + testTimeoutMs - TEST_HEADROOM_MS
+  return (args: string[]) => run(process.execPath, [script, ...args], {
+    timeout: Math.max(1, Math.min(CLI_PROCESS_TIMEOUT_MS, Math.floor(deadline - performance.now()))), windowsHide: true,
+  })
+}
 async function fixture(specs = defaults()) {
   const root = await mkdtemp(join(await realpath(tmpdir()), 'maestro-tree-repair-test-'))
   roots.push(root)
@@ -89,6 +106,12 @@ async function failure(promise: Promise<unknown>) {
   try { await promise } catch (error: any) { return error }
   throw new Error('expected synthetic operation to be refused')
 }
+async function cliFailure(promise: Promise<unknown>) {
+  const error = await failure(promise)
+  expect(typeof error.code).toBe('number')
+  expect(error).toMatchObject({ killed: false, signal: null })
+  return error
+}
 afterEach(async () => {
   for (const server of servers) await close(server)
   // Only canonical absolute roots returned by our own mkdtemp are removed.
@@ -107,7 +130,7 @@ describe('offline Maestro session-tree repair', () => {
     expect(await snapshot(root)).toEqual(before)
   })
 
-  it('repairs mixed multi-frame formats, preserves every original backup, and verifies changed:0', { timeout: 25_000 }, async () => {
+  it('repairs mixed multi-frame formats, preserves every original backup, and verifies changed:0', { timeout: offlineTestTimeout(1 + 2 * 3) }, async () => {
     const { root, logs } = await fixture()
     const report = await repairSessionLogTree(root, await offlineOptions())
     expect(report).toMatchObject({ status: 'applied', repaired: 3, markedEvents: 9, planned: 3, remaining: [] })
@@ -128,7 +151,7 @@ describe('offline Maestro session-tree repair', () => {
     expect(JSON.stringify(report)).not.toContain(SECRET)
   })
 
-  it('rescans a repaired tree as a byte-identical no-op with no additional backups', { timeout: 25_000 }, async () => {
+  it('rescans a repaired tree as a byte-identical no-op with no additional backups', { timeout: offlineTestTimeout(1 + 2 * 3 + 1) }, async () => {
     const { root } = await fixture()
     const options = await offlineOptions()
     await repairSessionLogTree(root, options)
@@ -170,7 +193,7 @@ describe('offline Maestro session-tree repair', () => {
     expect(await snapshot(outside.root)).toEqual(outsideBefore)
   })
 
-  it.each(['127.0.0.1', '::1'])('refuses a listening %s port before creating any backups', async (host, context) => {
+  it.each(['127.0.0.1', '::1'])('refuses a listening %s port before creating any backups', { timeout: offlineTestTimeout(1, 5_000) }, async (host, context) => {
     const { root } = await fixture()
     const before = await snapshot(root)
     let opened: Awaited<ReturnType<typeof listener>>
@@ -183,7 +206,7 @@ describe('offline Maestro session-tree repair', () => {
     expect(await snapshot(root)).toEqual(before)
   })
 
-  it('also checks the requested ports when there are no files to change', async () => {
+  it('also checks the requested ports when there are no files to change', { timeout: offlineTestTimeout(1, 5_000) }, async () => {
     const { root } = await fixture([])
     const { port } = await listener()
     const error = await failure(repairSessionLogTree(root, { apply: true, confirmDshFullyExited: true, ports: [port] }))
@@ -191,7 +214,7 @@ describe('offline Maestro session-tree repair', () => {
     expect(await readdir(root)).toEqual([])
   })
 
-  it('uses this invocation\'s new scan hash, never a previous dry-run report', { timeout: 25_000 }, async () => {
+  it('uses this invocation\'s new scan hash, never a previous dry-run report', { timeout: offlineTestTimeout(1 + 2 * 3) }, async () => {
     const { root, logs } = await fixture()
     const oldPlan = await repairSessionLogTree(root)
     const updated = Buffer.from(plain.toString().replace('"untouched":true', '"untouched":false'))
@@ -203,7 +226,7 @@ describe('offline Maestro session-tree repair', () => {
     expect((await readFile(report.applied[0].backupPath)).equals(updated)).toBe(true)
   })
 
-  it('stops at the first file failure, reports confirmed progress, and never rolls back or continues', { timeout: 25_000 }, async () => {
+  it('stops at the first file failure, reports confirmed progress, and never rolls back or continues', { timeout: offlineTestTimeout(1 + 2 + 1) }, async () => {
     const { root, logs } = await fixture()
     const collision = `${logs[1].path}.maestro-original-${sha256(logs[1].bytes)}.bak`
     await writeFile(collision, SECRET, { flag: 'wx', mode: 0o600 })
@@ -248,37 +271,39 @@ describe('tree-repair CLI', () => {
     expect(() => parseTreeRepairArgs(['--ports', '12345', root])).toThrow('INVALID_ARGUMENTS')
   })
 
-  it('executes a default CLI scan with no payload disclosure or artifacts', { timeout: 20_000 }, async () => {
+  it('executes a default CLI scan with no payload disclosure or artifacts', { timeout: CLI_TEST_TIMEOUT_MS }, async () => {
+    const runCli = cliRunner(CLI_TEST_TIMEOUT_MS)
     const { root } = await fixture()
     const before = await snapshot(root)
-    const result = await run(process.execPath, [script, root])
+    const result = await runCli([root])
     expect(JSON.parse(result.stdout)).toMatchObject({ status: 'dry-run', repaired: 0, planned: 3 })
     expect(result.stdout + result.stderr).not.toContain(SECRET)
     expect(await snapshot(root)).toEqual(before)
   })
 
   it('returns static, payload-free errors for unconfirmed apply and malformed logs', async () => {
+    const runCli = cliRunner(CLI_REFUSAL_TEST_TIMEOUT_MS)
     const { root } = await fixture()
     const before = await snapshot(root)
-    const unconfirmed = await failure(run(process.execPath, [script, '--apply', root]))
+    const unconfirmed = await cliFailure(runCli(['--apply', root]))
     expect(unconfirmed.code).toBe(1)
     expect(JSON.parse(unconfirmed.stderr).error.code).toBe('EXPLICIT_OFFLINE_CONFIRMATION_REQUIRED')
     expect(await snapshot(root)).toEqual(before)
     const broken = await fixture([{ name: 'workspace/session/session.v4.jsonl', bytes: Buffer.from(header + `{"${SECRET}": broken}\n`) }])
     const brokenBefore = await snapshot(broken.root)
-    const refused = await failure(run(process.execPath, [script, '--apply', '--confirm-dsh-fully-exited', broken.root]))
+    const refused = await cliFailure(runCli(['--apply', '--confirm-dsh-fully-exited', broken.root]))
     expect(refused.code).toBe(1)
     expect(JSON.parse(refused.stderr)).toMatchObject({ repaired: 0, error: { code: 'SCAN_REFUSALS_OR_LINKS' }, scan: { refused: [{ code: 'INVALID_JSON' }] } })
     expect(refused.stdout + refused.stderr).not.toContain(SECRET)
-    const dryRun = await failure(run(process.execPath, [script, broken.root]))
+    const dryRun = await cliFailure(runCli([broken.root]))
     expect(dryRun.code).toBe(2)
     expect(JSON.parse(dryRun.stdout).status).toBe('dry-run')
     expect(dryRun.stdout + dryRun.stderr).not.toContain(SECRET)
-    const invalid = await failure(run(process.execPath, [script, `--${SECRET}`]))
+    const invalid = await cliFailure(runCli([`--${SECRET}`]))
+    expect(invalid.code).toBe(1)
     expect(JSON.parse(invalid.stderr).code).toBe('INVALID_ARGUMENTS')
     expect(invalid.stdout + invalid.stderr).not.toContain(SECRET)
     expect(await snapshot(broken.root)).toEqual(brokenBefore)
-  // Four real Node startups can exceed Vitest's 5s default in the parallel
-  // Windows suite. This is process-startup budget, not a weaker assertion.
-  }, 20_000)
+  // Windows gets four finite startup budgets; other platforms share the existing case deadline.
+  }, CLI_REFUSAL_TEST_TIMEOUT_MS)
 })

@@ -275,7 +275,7 @@ export function TasksTree(props: TasksTreeProps): ReactNode {
             role="treeitem"
             tabIndex={0}
             aria-level={depth + 1}
-            aria-label={`${node.label} ${agentMeta(node)}`}
+            aria-label={`${node.label} ${node.stateText ?? agentMeta(node)}`}
             data-tree-node={node.id}
             data-tree-expandable={children.length > 0 ? 'true' : undefined}
             aria-expanded={children.length === 0 ? undefined : !collapsed}
@@ -310,7 +310,7 @@ export function TasksTree(props: TasksTreeProps): ReactNode {
               </span>
               {/* With the chip carrying the mode, the mono line holds what is
                   left: the node's own state (and, for the root, its identity). */}
-              <span className={css.treeMeta}>{chip === undefined ? agentMeta(node) : stateLabel(node.state)}</span>
+              <span className={css.treeMeta}>{node.stateText ?? (chip === undefined ? agentMeta(node) : stateLabel(node.state))}</span>
               {node.state === 'running' && <LiveLine live={node.live} />}
               <TaskLine tasks={node.tasks} onOpenTask={onOpenTask} />
             </span>

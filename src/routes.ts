@@ -648,8 +648,9 @@ export async function handleModels(deps: RouteDeps): Promise<RouteOutcome> {
       ...(bridge === undefined ? {} : { bridge }),
       ...(diagnostics === undefined ? {} : { mcpDiagnostics: diagnostics }),
     })
-  } catch (error) {
-    return fail(500, error instanceof Error ? error.message : String(error))
+  } catch {
+    // This catalog is public; arbitrary provider/MCP errors may contain credentials.
+    return fail(500, '模型目录暂不可用，请检查宿主模型与 MCP 服务配置')
   }
 }
 
@@ -663,7 +664,7 @@ function mcpDiscoveryDiagnostics(deps: RouteDeps): string[] | undefined {
       const keys = typeof value === 'object' && value !== null ? Object.keys(value as Record<string, unknown>).slice(0, 8).join(',') : typeof value
       return `${entry.ns}: ${keys}`
     })
-  } catch (error) {
-    return [`describe failed: ${error instanceof Error ? error.message : String(error)}`]
+  } catch {
+    return ['describe failed: 宿主设置描述不可用']
   }
 }

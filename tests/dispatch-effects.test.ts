@@ -150,6 +150,48 @@ describe('runDispatch + dedupe', () => {
   })
 })
 
+describe('runDispatch + Codex reconnect', () => {
+  it('records timeout without retrying and releases task resources', async () => {
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'Date'] })
+    const controller = new AbortController()
+    const spawn = scriptedSpawn(child => {
+      if (child.spawnArgs[0] === '--version') child.finish('codex 0.165.0')
+      else if (child.spawnArgs[0] === 'exec') child.onStdin = () => child.stdout.emit('data', Buffer.from(JSON.stringify({ type: 'thread.started', thread_id: 'reconnect-test-thread' }) + '\n'))
+      else child.finish('')
+    })
+    const { deps, registry, effects, limiter } = makeDeps(spawn.spawnFn, { readConfig: () => config({ failureRetries: 2 }) })
+    const settled = runDispatch(deps, { ...params, cli: 'codex', timeoutMinutes: 1 }, controller.signal).catch((error: unknown) => error)
+    try {
+      await vi.waitFor(() => {
+        expect(
+          spawn.launches.some(child => child.spawnArgs[0] === 'exec'),
+          JSON.stringify({ launches: spawn.launches.map(child => child.spawnArgs), tasks: registry.list() }),
+        ).toBe(true)
+      })
+      const child = spawn.launches.find(child => child.spawnArgs[0] === 'exec')!
+      const reconnect = () => child.stdout.emit('data', Buffer.from(JSON.stringify({ type: 'error', message: 'Reconnecting... waiting for network (Connection failed: error sending request)' }) + '\n'))
+      reconnect()
+      await vi.advanceTimersByTimeAsync(30_000)
+      reconnect()
+      await vi.advanceTimersByTimeAsync(30_000)
+      const error = await settled
+      expect(error).toBeInstanceOf(Error)
+      expect(error).toMatchObject({ value: { ok: false, phase: 'timeout', sessionRef: 'reconnect-test-thread' } })
+      const task = registry.get(registry.list()[0]!.id)
+      expect(task).toMatchObject({ phase: 'timeout', stats: { timedOut: true, reconnectTimedOut: true, sessionRef: 'reconnect-test-thread' } })
+      expect(controller.signal.aborted).toBe(false)
+      expect(spawn.launches.filter(launch => launch.spawnArgs[0] === 'exec')).toHaveLength(1)
+      expect(deps.controllers.size).toBe(0)
+      expect(effects.size()).toBe(0)
+      expect(limiter.activeCount()).toBe(0)
+    } finally {
+      controller.abort()
+      await settled
+      vi.useRealTimers()
+    }
+  })
+})
+
 describe('runDispatch + priority', () => {
   it('asks for the human lane only when the dispatch answers a person', async () => {
     const spawn = claudeSpawn('跑完了。')

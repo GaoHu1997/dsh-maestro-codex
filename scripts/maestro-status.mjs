@@ -63,8 +63,24 @@ export function renderStatus(body) {
   return lines.join('\n')
 }
 
-async function main() {
-  const options = parseArgs(process.argv.slice(2))
+const STATUS_COUNT_KEYS = ['working', 'working/queued', 'person/answer', 'person/review', 'person/blocked', 'person/failed', 'idle']
+const isRecord = value => typeof value === 'object' && value !== null && !Array.isArray(value)
+const isCount = value => Number.isSafeInteger(value) && value >= 0
+
+/** HTTP 200 is not health evidence unless the complete status shape is valid. */
+function isValidStatus(body) {
+  if (!isRecord(body) || typeof body.enabled !== 'boolean' || !isRecord(body.tasks)
+    || !STATUS_COUNT_KEYS.every(key => isCount(body.tasks[key]))
+    || !Object.values(body.tasks).every(isCount)
+    || !isCount(body.needsPerson) || !isCount(body.pendingEffects) || !Array.isArray(body.problems)) return false
+  return body.problems.every(problem => isRecord(problem)
+    && typeof problem.name === 'string' && problem.name.trim() !== ''
+    && (problem.level === 'degraded' || problem.level === 'error')
+    && (problem.message === undefined || typeof problem.message === 'string'))
+}
+
+export async function main(argv = process.argv.slice(2), fetch = globalThis.fetch) {
+  const options = parseArgs(argv)
   if (options.help) {
     process.stdout.write(HELP)
     return 0
@@ -87,6 +103,10 @@ async function main() {
     body = await response.json()
   } catch (error) {
     process.stderr.write(`${url} 返回的不是 JSON：${error instanceof Error ? error.message : String(error)}\n`)
+    return 1
+  }
+  if (!isValidStatus(body)) {
+    process.stderr.write(`${url} 状态响应结构无效，请检查宿主与插件版本。\n`)
     return 1
   }
   if (options.json) process.stdout.write(`${JSON.stringify(body, undefined, 2)}\n`)

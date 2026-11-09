@@ -190,9 +190,11 @@ export function usageTokenLabel(value: number | null, known: number | undefined)
 }
 
 const EMPTY_SNAPSHOT: BoardSessionList = { byId: {} }
+const ZERO_AVAILABLE_SUMMARY = { ...ZERO_SUMMARY, available: true }
+const UNAVAILABLE_SUMMARY = { ...ZERO_SUMMARY, available: false }
 
-/** 读会话 feed 并折叠出用量汇总（feed 缺席时是全零的稳定值）。 */
-export function useUsageSummary(ctx: { get(name: string): unknown }): UsageSummary {
+/** 读会话 feed 并折叠可见样本；feed 缺席不是零调用。 */
+export function useUsageSummary(ctx: { get(name: string): unknown }): UsageSummary & { readonly available: boolean } {
   const sessions: BoardSessionsFace | undefined = sessionsFaceOf(ctx)
   const subscribe = useCallback(
     (listener: () => void) => (sessions === undefined ? () => {} : sessions.list.subscribe(listener)),
@@ -205,5 +207,6 @@ export function useUsageSummary(ctx: { get(name: string): unknown }): UsageSumma
   const list = useSyncExternalStore(subscribe, read, read)
   const states = Object.values(list.projectionsBySession ?? {}).map(projection => projection?.values.maestroCliUsage)
   const summary = summarizeUsage(states, Date.now())
-  return summary.requests === 0 ? ZERO_SUMMARY : summary
+  if (sessions === undefined) return UNAVAILABLE_SUMMARY
+  return summary.requests === 0 ? ZERO_AVAILABLE_SUMMARY : { ...summary, available: true }
 }

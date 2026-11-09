@@ -267,6 +267,34 @@ describe('CLI and native navigation bridge', () => {
     expect(html).not.toContain('jumpMore')
   })
 
+  it('shows an interrupted CLI task as 已中断 instead of 运行中', () => {
+    const task: MaestroTaskSummary = {
+      id: 'task-i', cli: 'codex', title: '上线验收：Codex 调度与协议', phase: 'interrupted',
+      model: '', sessionId: 'root', startedAt: 10,
+    }
+    const input = boardRendererInput(attachRows(buildSessionTree({ rootId: 'root', sessions: list.byId }), { tasks: [task] }), 'root')
+    const nodes = renderBoardNodes(input, { folded: false })
+    const row = input.byNodeId.get('cli:task-i')
+    if (row === undefined) throw new Error('Missing CLI row')
+    const node = agent(nodes, row.id)
+    // 上游四态没有「中断」：占 idle 位（不转圈、不进已完成折叠组），词条走 stateText。
+    expect(node.state).toBe('idle')
+    expect(node.stateText).toBe('已中断')
+    const graph = renderToStaticMarkup(createElement(TasksGraph, rendererProps(nodes)))
+    const start = graph.indexOf('data-graph-node="cli:task-i"')
+    expect(start).toBeGreaterThan(-1)
+    const next = graph.indexOf('data-graph-node="', start + 1)
+    const card = graph.slice(start, next === -1 ? undefined : next)
+    expect(card).toContain('已中断')
+    expect(card).not.toContain('运行中')
+    expect(card).not.toContain('待命')
+    // 详情浮层与卡片同一枚词。
+    const popover = renderToStaticMarkup(createElement(CliNodePopover, {
+      node: row, now: 100, onOpenSession: () => {}, onCancel: async () => undefined,
+    }))
+    expect(popover).toContain('已中断')
+  })
+
   it('names nodes after the task and renders the truncated input as the card description', () => {
     const task: MaestroTaskSummary = {
       id: 'task-b', cli: 'claude', title: '修复登录页', inputPreview: '修复登录页 在 iOS Safari 上点击登录按钮没有反应，需要排查…',

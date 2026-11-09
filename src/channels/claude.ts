@@ -9,8 +9,13 @@ import { unlink, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { runProcess } from '../spawn.js'
+import { createRecoveryBudget } from '../recovery-budget.js'
+import { awaitWithin } from '../deadline.js'
 import { CLAUDE_THINKING_BUDGETS, type MaestroChannelEvent } from '../wire.js'
 import type { ClaudePermissionMode } from '../config.js'
+
+/** Local tmp cleanup is normally instant; never let a hung unlink hide a finished run. */
+const CLAUDE_SETTINGS_CLEANUP_MS = 5_000
 
 /** Parsed outcome of one claude run. */
 export interface ClaudeRunResult {
@@ -284,6 +289,11 @@ export async function runClaudeTask(options: {
   // session transcripts/resume remain enabled and user settings are untouched.
   const env = { ...claudeEnv(options.baseUrl, options.authToken, options.thinking ?? ''), CLAUDE_CODE_DISABLE_AUTO_MEMORY: '1' }
   const settingsPath = await writeClaudeSettingsFile(env)
+  // Reconnect diagnostics are output but not progress; bound the recovery so a
+  // dead upstream cannot refresh the idle watchdog forever.
+  const recovery = createRecoveryBudget(options.signal, options.timeoutMs, () => {
+    options.onEvent('note', `CLI 持续重连/重试 ${String(Math.round(options.timeoutMs / 1000))} 秒仍未恢复，已请求终止进程（重连诊断不会延长等待）`)
+  })
   try {
   const args = claudeArgs(options.model, options.permissionMode, options.mcpConfigPath, options.mcpServerNames, options.resume, settingsPath, options.addDir)
   // The level came from the model's configured reasoningEfforts; a key with no
@@ -312,9 +322,12 @@ export async function runClaudeTask(options: {
     } catch {
       // Non-JSON chatter (update banners, warnings) — keep it visible but harmless.
       if (line.trim().startsWith('{')) return
+      recovery.observeDiagnostic(line)
       options.onEvent('note', line.slice(0, 300))
       return
     }
+    // A parsed protocol frame means the CLI is doing real work again.
+    recovery.markProgress()
     if (frame.session_id !== undefined && sessionId === '') sessionId = frame.session_id
     for (const event of claudeFrameEvents(frame)) options.onEvent(event.kind, event.text, event.detail)
     for (const block of claudeBlocks(frame)) {
@@ -351,18 +364,22 @@ export async function runClaudeTask(options: {
     onTimeoutWarning: remainingMs => {
       options.onEvent('note', `CLI 已连续无 stdout/stderr 输出；若仍无输出，将在约 ${String(Math.round(remainingMs / 1000))} 秒后超时终止（无输出保护，不代表任务语义进展）`)
     },
-    signal: options.signal,
+    signal: recovery.signal,
     onStdoutLine: handleLine,
     // stderr is diagnostics, not protocol — surface it as notes so a hung or
     // failing run is visible while it runs, not only in the final error string.
-    onStderrLine: (line: string) => { options.onEvent('note', `stderr: ${line.slice(0, 300)}`) },
+    onStderrLine: (line: string) => {
+      recovery.observeDiagnostic(line)
+      options.onEvent('note', `stderr: ${line.slice(0, 300)}`)
+    },
   })
   const ended = await outcome
 
   const stats = { ...resultStats }
   if (sessionId !== '') stats['sessionId'] = sessionId
   if (ended.timedOut) stats['timedOut'] = true
-  const ok = !ended.timedOut && !options.signal.aborted && ended.code === 0 && finalText.trim() !== '' && resultError === undefined
+  if (recovery.timedOut) stats['reconnectTimedOut'] = true
+  const ok = !ended.timedOut && !recovery.timedOut && !options.signal.aborted && ended.code === 0 && finalText.trim() !== '' && resultError === undefined
   return {
     ok,
     finalText,
@@ -371,6 +388,7 @@ export async function runClaudeTask(options: {
     stderrTail: ended.stderrTail,
     stats,
     error: (options.signal.aborted ? '任务已取消，进程已被终止' : undefined)
+      ?? (recovery.timedOut ? `CLI 持续重连/重试 ${String(Math.round(options.timeoutMs / 1000))} 秒仍未恢复，进程已被终止（重连诊断不会延长等待）` : undefined)
       ?? resultError
       ?? (ended.timedOut ? `连续无 stdout/stderr 输出 ${String(Math.round(options.timeoutMs / 1000))} 秒超时，进程已被终止（无输出保护，不代表任务语义进展）` : undefined)
       ?? (ended.code === 0 ? undefined : `进程退出码 ${ended.code ?? 'null'}${ended.stderrTail.trim() === '' ? '' : `：${lastLines(ended.stderrTail)}`}`)
@@ -379,7 +397,10 @@ export async function runClaudeTask(options: {
       ?? (finalText.trim() === '' ? 'Claude CLI 未返回文本结果（result 帧缺失或为空）' : undefined),
   }
   } finally {
-    if (settingsPath !== undefined) await unlink(settingsPath).catch(() => {})
+    recovery.dispose()
+    if (settingsPath !== undefined) {
+      await awaitWithin(() => unlink(settingsPath), { timeoutMs: CLAUDE_SETTINGS_CLEANUP_MS, label: 'Claude 设置文件清理' }).catch(() => {})
+    }
   }
 }
 
