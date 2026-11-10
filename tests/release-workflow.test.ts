@@ -82,7 +82,7 @@ function runBash(source: string, cwd: string, env: NodeJS.ProcessEnv = {}) {
   })
 }
 
-function release(createExit: number, uploadExit = 0, secondAsset = false) {
+function release(viewExit: number, createExit: number, uploadExit = 0, secondAsset = false, editExit = 0) {
   const directory = fixture()
   mkdirSync(join(directory, 'dist'))
   const asset = `dist/dsh-maestro-codex-${pkg.version}.tgz`
@@ -95,15 +95,17 @@ function release(createExit: number, uploadExit = 0, secondAsset = false) {
     printf '%s\\0' "$@" >> "$GH_CALLS"
     printf '\\0' >> "$GH_CALLS"
     case "$2" in
+      view) return "$FAKE_VIEW_EXIT" ;;
       create) return "$FAKE_CREATE_EXIT" ;;
       upload) return "$FAKE_UPLOAD_EXIT" ;;
+      edit) return "$FAKE_EDIT_EXIT" ;;
       *) return 127 ;;
     esac
   }
 `
   const result = runBash(fake + step('Create GitHub Release').run, directory, {
     GH_CALLS: calls.replaceAll('\\', '/'), GITHUB_REF_NAME: `v${pkg.version}`,
-    FAKE_CREATE_EXIT: String(createExit), FAKE_UPLOAD_EXIT: String(uploadExit), GH_TOKEN: '',
+    FAKE_VIEW_EXIT: String(viewExit), FAKE_CREATE_EXIT: String(createExit), FAKE_UPLOAD_EXIT: String(uploadExit), FAKE_EDIT_EXIT: String(editExit), GH_TOKEN: '',
   })
   const invocations = existsSync(calls)
     ? readFileSync(calls, 'utf8').split('\0\0').filter(Boolean).map(call => call.split('\0'))
@@ -153,34 +155,47 @@ describe.skipIf(!bash)('actual release Bash commands with isolated fixtures', ()
   }, BASH_TEST_TIMEOUT_MS)
 
   it('passes the complete create command and does not upload after success', () => {
-    const { result, invocations, asset } = release(0)
+    const { result, invocations, asset } = release(127, 0)
     expect(result.error).toBeUndefined()
     expect(result.status, result.stderr).toBe(0)
-    expect(invocations).toEqual([[
-      'release', 'create', `v${pkg.version}`, '--verify-tag', '--title', `v${pkg.version}`,
-      '--generate-notes', asset,
-    ]])
+    expect(invocations).toEqual([
+      ['release', 'view', `v${pkg.version}`],
+      [
+        'release', 'create', `v${pkg.version}`, '--verify-tag', '--title', `v${pkg.version}`,
+        '--notes-file', `.github/releases/v${pkg.version}.md`, asset,
+      ],
+    ])
   }, BASH_TEST_TIMEOUT_MS)
 
-  it('uploads the same tarball with clobber when the release already exists', () => {
-    const { result, invocations, asset } = release(1)
+  it('uploads the same tarball with clobber and rewrites the notes when the release already exists', () => {
+    const { result, invocations, asset } = release(0, 0)
     expect(result.error).toBeUndefined()
     expect(result.status, result.stderr).toBe(0)
-    expect(invocations).toHaveLength(2)
+    expect(invocations).toHaveLength(3)
     expect(invocations[1]).toEqual(['release', 'upload', `v${pkg.version}`, asset, '--clobber'])
+    expect(invocations[2]).toEqual(['release', 'edit', `v${pkg.version}`, '--notes-file', `.github/releases/v${pkg.version}.md`])
   }, BASH_TEST_TIMEOUT_MS)
 
-  it('propagates failure when both create and fallback upload fail', () => {
-    const { result, invocations } = release(1, 7)
+  it('propagates failure when the existing release upload fails', () => {
+    const { result, invocations } = release(0, 0, 7)
     expect(result.error).toBeUndefined()
     expect(result.status, result.stderr).toBe(7)
     expect(invocations).toHaveLength(2)
   }, BASH_TEST_TIMEOUT_MS)
 
+  it('propagates failure when rewriting the notes of an existing release fails', () => {
+    const { result, invocations } = release(0, 0, 0, false, 9)
+    expect(result.error).toBeUndefined()
+    expect(result.status, result.stderr).toBe(9)
+    expect(invocations).toHaveLength(3)
+    expect(invocations[2]?.[1]).toBe('edit')
+  }, BASH_TEST_TIMEOUT_MS)
+
   it('expands every tarball without a stray backslash argument', () => {
-    const { result, invocations, asset } = release(0, 0, true)
+    const { result, invocations, asset } = release(127, 0, 0, true)
     expect(result.error).toBeUndefined()
     expect(result.status, result.stderr).toBe(0)
-    expect(invocations[0]?.slice(-2)).toEqual([asset, 'dist/second.tgz'])
+    const create = invocations.find(call => call[1] === 'create')
+    expect(create?.slice(-2)).toEqual([asset, 'dist/second.tgz'])
   }, BASH_TEST_TIMEOUT_MS)
 })
