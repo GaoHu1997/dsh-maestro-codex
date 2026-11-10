@@ -7,7 +7,7 @@
 
 import type { ToolExec } from './tool.js'
 import { randomUUID } from 'node:crypto'
-import { existsSync } from 'node:fs'
+import { existsSync, statSync } from 'node:fs'
 import { isAbsolute } from 'node:path'
 import { modelTokenError, type EffectiveConfig, type TaskDifficulty } from './config.js'
 import { runClaudeTask } from './channels/claude.js'
@@ -182,6 +182,12 @@ export interface DispatchParams {
   /** The calling agent's session id — the task board scopes by it. Not a model
    * parameter: the tool injects it from `exec.agent`. */
   sessionId?: string | undefined
+  /**
+   * The calling session's workspace (its immutable `SessionHeader.cwd`). Not a
+   * model parameter: the tool injects it from the live host session. Falls back
+   * to the host process directory only for headless callers with no session.
+   */
+  sessionCwd?: string | undefined
   /**
    * The calling agent's own model route. The dispatch prefers it over the
    * configuration card's dsh model (see the resolution order in
@@ -361,6 +367,20 @@ export function parseDispatchParams(raw: unknown): DispatchParams | string {
 }
 
 /**
+ * A session workspace is only usable when it is an absolute path to a
+ * directory that still exists. Anything else falls back to the host process
+ * directory, which is always present.
+ */
+function usableWorkspaceCwd(candidate: string | undefined): string | undefined {
+  if (candidate === undefined || candidate === '' || !isAbsolute(candidate)) return undefined
+  try {
+    return statSync(candidate).isDirectory() ? candidate : undefined
+  } catch {
+    return undefined
+  }
+}
+
+/**
  * Run one dispatch to settlement. Throws `DispatchError` (or the abort reason)
  * on failure; resolves with the structured value on success. The registry
  * record carries the full event trail either way. `hooks.onTaskId` fires as
@@ -427,8 +447,21 @@ export async function runDispatch(deps: DispatchDeps, params: DispatchParams, si
   // directory the host process happened to be in. Resolve it once, say which
   // directory the run really used, and hand that same path to the child.
   const requestedCwd = params.cwd
-  const cwd = requestedCwd ?? process.cwd()
-  if (requestedCwd === undefined) notes.push(`未指定 cwd，沿用宿主进程目录：${cwd}`)
+  // The session header is host data, not a guarantee: a project directory can
+  // be renamed or removed while its session is still open. Only an existing
+  // absolute directory may stand in for the host process directory, otherwise
+  // spawn/prepare would fail with ENOENT instead of running somewhere usable.
+  const usableSessionCwd = usableWorkspaceCwd(params.sessionCwd)
+  const cwd = requestedCwd ?? usableSessionCwd ?? process.cwd()
+  if (requestedCwd === undefined) {
+    if (params.sessionCwd !== undefined && usableSessionCwd === undefined) {
+      notes.push(`会话工作区不可用（${params.sessionCwd}），已回退宿主进程目录：${cwd}`)
+    } else {
+      notes.push(usableSessionCwd === undefined
+        ? `未指定 cwd，沿用宿主进程目录：${cwd}`
+        : `未指定 cwd，沿用本会话工作区：${cwd}`)
+    }
+  }
   const io = {
     startupMs: deps.ioTimeouts?.startupMs ?? DISPATCH_STARTUP_TIMEOUT_MS,
     settleMs: deps.ioTimeouts?.settleMs ?? DISPATCH_SETTLE_TIMEOUT_MS,
@@ -846,7 +879,19 @@ export async function runDispatch(deps: DispatchDeps, params: DispatchParams, si
                 mcpServers = [...baseMcpServers, bridgeRun.entry]
                 if (!bridgeNoted) {
                   bridgeNoted = true
-                  onEvent('note', '已挂载 dsh_bridge MCP 服务器（dsh 技能/工具桥）')
+                  // Report what the child will actually see: an empty tool
+                  // roster is the difference between "bridge attached" and
+                  // "the child can edit files", and a silent 0 is the bug
+                  // that made a dispatched task give up on host tools.
+                  let toolCount = 0
+                  try {
+                    const catalog = await deps.bridge.catalog(bridgeToken, cwd)
+                    if (!('error' in catalog)) toolCount = catalog.tools.length
+                  } catch { toolCount = 0 }
+                  abort.signal.throwIfAborted()
+                  onEvent('note', toolCount > 0
+                    ? `已挂载 dsh_bridge MCP 服务器（${String(toolCount)} 个宿主工具 + dsh 技能桥）`
+                    : '已挂载 dsh_bridge MCP 服务器（宿主工具 0 个，仅技能桥；检查配置页「桥接宿主工具」模式）')
                 }
                 if (nativeSkills === undefined && config.bridgeSkills === true) {
                   abort.signal.throwIfAborted()

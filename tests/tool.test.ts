@@ -25,6 +25,7 @@ import {
   primaryRouteOf,
   registerDispatchTool,
   renderSummary,
+  sessionCwdOf,
   usageSessionOf,
   type MaestroToolDeps,
   type ToolExec,
@@ -362,6 +363,22 @@ describe('parseToolArgs', () => {
 })
 
 describe('primaryRouteOf / ownerSessionOf', () => {
+  it('reads the immutable session workspace from the live session header', () => {
+    const exec: ToolExec = {
+      signal: new AbortController().signal,
+      agent: { id: 'sess-workspace', session: { header: { cwd: 'D:\\projects\\demo' } } },
+    }
+    expect(sessionCwdOf(exec)).toBe('D:\\projects\\demo')
+    expect(sessionCwdOf({ signal: new AbortController().signal })).toBeUndefined()
+  })
+
+  it('tolerates a session header that throws', () => {
+    const exec = {
+      signal: new AbortController().signal,
+      agent: { session: { get header() { throw new Error('header fold missing') } } },
+    } as unknown as ToolExec
+    expect(sessionCwdOf(exec)).toBeUndefined()
+  })
   const signal = new AbortController().signal
 
   it('prefers the routed request header over the configured options', () => {

@@ -83,6 +83,8 @@ export interface ToolExec {
     readonly id?: string
     readonly options?: { readonly provider?: string; readonly model?: string }
     readonly session?: {
+      /** Immutable storage header of the live session; carries the workspace cwd. */
+      readonly header?: { readonly cwd?: string | undefined } | undefined
       requestHeader?: () => { readonly config?: { readonly provider?: string; readonly model?: string } } | undefined
       readonly append?: (type: string, data: unknown) => unknown
     }
@@ -126,6 +128,17 @@ export function usageSessionOf(exec: ToolExec): CliUsageSession | undefined {
   return session !== undefined && typeof session.append === 'function' ? session as CliUsageSession : undefined
 }
 
+/** The calling session's workspace, from the host's immutable session header. */
+export function sessionCwdOf(exec: ToolExec): string | undefined {
+  try {
+    const cwd = exec.agent?.session?.header?.cwd
+    return typeof cwd === 'string' && cwd !== '' ? cwd : undefined
+  } catch {
+    // A host without a readable session header must not break the dispatch.
+    return undefined
+  }
+}
+
 /**
  * Register the dispatch tool (and return its disposer). Name collisions fall
  * back to `maestro_dispatch_task`; any other registration failure (a schema
@@ -140,11 +153,13 @@ export function registerDispatchTool(ctx: Context, deps: MaestroToolDeps): { rea
     if (typeof parsed === 'string') throw new Error(parsed)
     const primaryModel = primaryRouteOf(exec)
     const sessionId = ownerSessionOf(exec)
+    const sessionCwd = sessionCwdOf(exec)
     const usageSession = usageSessionOf(exec)
     const params: DispatchParams = {
       ...parsed,
       ...(primaryModel === undefined ? {} : { primaryModel }),
       ...(sessionId === undefined ? {} : { sessionId }),
+      ...(sessionCwd === undefined ? {} : { sessionCwd }),
       ...(usageSession === undefined ? {} : { usageSession }),
       ...(exec.agent === undefined ? {} : { executionAgent: exec.agent }),
       executionContext: { agent: exec.agent, token: exec.token, callId: exec.callId, rootCallId: exec.rootCallId },

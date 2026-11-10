@@ -1,4 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
+import { tmpdir } from 'node:os'
+import { mkdtempSync } from 'node:fs'
+import { join } from 'node:path'
 import { TASK_DIFFICULTIES, effectiveOf, type EffectiveConfig } from '../src/config.js'
 import { CliPathCache, parseDispatchParams, runDispatch, taskNameOf, type DispatchParams } from '../src/dispatch.js'
 import { renderSummary } from '../src/tool.js'
@@ -177,6 +180,39 @@ describe('taskNameOf', () => {
 })
 
 describe('runDispatch', () => {
+  it('uses the calling session workspace when cwd is omitted', async () => {
+    const cli = fakeCliSpawn(true)
+    const { deps, registry } = makeDeps(fixture(), cli.spawnFn)
+    const workspace = mkdtempSync(join(tmpdir(), 'maestro-session-workspace-'))
+    const value = await runDispatch(deps, {
+      ...assessment,
+      cli: 'claude',
+      task: '做个分析',
+      sessionId: 'parent-session',
+      sessionCwd: workspace,
+    }, new AbortController().signal)
+    expect(value.cwd).toBe(workspace)
+    expect(registry.get(value.taskId)?.cwd).toBe(workspace)
+    expect(value.notes.some(note => note.includes('本会话工作区'))).toBe(true)
+  })
+
+  it('reports the host process directory only when neither cwd nor session workspace exists', async () => {
+    const cli = fakeCliSpawn(true)
+    const { deps } = makeDeps(fixture(), cli.spawnFn)
+    const value = await runDispatch(deps, { ...assessment, cli: 'claude', task: '做个分析' }, new AbortController().signal)
+    expect(value.cwd).toBe(process.cwd())
+    expect(value.notes.some(note => note.includes('宿主进程目录'))).toBe(true)
+  })
+
+  it('falls back to the host process directory when the session workspace is gone', async () => {
+    const cli = fakeCliSpawn(true)
+    const { deps } = makeDeps(fixture(), cli.spawnFn)
+    const missing = join(tmpdir(), `maestro-missing-session-workspace-${Date.now()}`)
+    const value = await runDispatch(deps, { ...assessment, cli: 'claude', task: '做个分析', sessionCwd: missing }, new AbortController().signal)
+    expect(value.cwd).toBe(process.cwd())
+    expect(value.notes.some(note => note.includes('会话工作区不可用') && note.includes(missing))).toBe(true)
+  })
+
   it('runs a claude task end to end and records the trail', async () => {
     const cli = fakeCliSpawn(true)
     const { deps, registry } = makeDeps(fixture(), cli.spawnFn)
