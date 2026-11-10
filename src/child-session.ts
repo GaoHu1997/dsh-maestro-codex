@@ -190,10 +190,13 @@ export function createChildSessionRecorder(parts: ChildSessionRecorderParts): Ch
             nativeInputSemantics: 'uncached',
             ...(input.cli === undefined ? {} : { cli: input.cli }),
           } },
-          // Standard log-only title: readers of the child need not load its
-          // parent's catalog. Its declaration belongs to the optional host
-          // title plugin, so bridge the SDK type without adding a runtime dep.
-          { seq: SessionSeq(2), time: now, type: 'session/title', data: {
+          // Log-only title. The persisted writer keeps ignorable records (that
+          // is why the record marker above survives) but drops ordinary seed
+          // events, and it is not known to accept a fresh `session/title`
+          // append from a child that the title service never opened. Declaring
+          // the title as an ignorable record is what keeps it in the log while
+          // leaving the surface untouched.
+          { seq: SessionSeq(2), time: now, type: 'session/title', ignorable: true, data: {
             title, messageSeqs: [], source: { kind: 'user' },
           } } as unknown as SessionEvent,
         ]

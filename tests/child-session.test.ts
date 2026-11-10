@@ -3,7 +3,7 @@ import { Session } from '@deepseek-ai/dsh-session'
 import { CLI_CHILD_RECORD_EVENT, createChildSessionRecorder, type ChildSessionAppend, type ChildSessionStoreFace } from '../src/child-session.js'
 
 interface RecordedEvent { readonly type: string; readonly data: Record<string, unknown>; readonly opts: { surfaceOp?: 'append' } | undefined; readonly ignorable?: true }
-interface FakeSession { readonly id: string; readonly meta: { cwd?: string; parentSession?: string; origin?: string } | undefined; readonly events: RecordedEvent[] }
+interface FakeSession { readonly id: string; readonly meta: { cwd?: string; parentSession?: string; origin?: string } | undefined; readonly events: RecordedEvent[]; readonly appended: RecordedEvent[] }
 function fakeStore(beforeAppend: (type: string, data: unknown) => void = () => {}): { store: ChildSessionStoreFace; sessions: Map<string, FakeSession>; parent: ChildSessionAppend & { events: RecordedEvent[] }; setParentOnline(value: boolean): void } {
   const sessions = new Map<string, FakeSession>()
   const parentEvents: RecordedEvent[] = []
@@ -17,9 +17,14 @@ function fakeStore(beforeAppend: (type: string, data: unknown) => void = () => {
         type: event.type, data: event.data as unknown as Record<string, unknown>,
         opts: event.surfaceOp === 'append' ? { surfaceOp: 'append' as const } : undefined,
         ...(event.ignorable === true ? { ignorable: true as const } : {}),
-      })) as RecordedEvent[] }
+      })) as RecordedEvent[], appended: [] as RecordedEvent[] }
       sessions.set(id, record)
-      return { header: { createdAt: 1234 }, append(type, data, opts) { beforeAppend(type, data); record.events.push({ type, data: data as Record<string, unknown>, opts }) } }
+      return { header: { createdAt: 1234 }, append(type, data, opts) {
+        beforeAppend(type, data)
+        const event = { type, data: data as Record<string, unknown>, opts }
+        record.events.push(event)
+        record.appended.push(event)
+      } }
     },
   }
   return { store, sessions, parent, setParentOnline(value) { parentOnline = value } }
@@ -49,7 +54,7 @@ describe('CLI record session start', () => {
     expect(row?.data).toEqual({ version: 0, childId: 'cli-task-1', childCreatedAt: 1234, mode: 'one-shot', label: 'cli · 数据任务' })
     expect(session?.events[1]?.data).toMatchObject({ kind: 'cli-record', executor: 'external-cli', parentSessionId: 'session-parent',
       childSessionId: 'cli-task-1', usageId: '["cli:claude","task-1",1000]', source: 'cli:claude', accounting: 'native-mirror-of-parent-cli-ledger' })
-    expect(session?.events[2]).toEqual({ type: 'session/title',
+    expect(session?.events[2]).toEqual({ type: 'session/title', ignorable: true,
       data: { title: START.label, messageSeqs: [], source: { kind: 'user' } }, opts: undefined })
   })
   it.each([['  真实任务名  ', '真实任务名'], [' \n\t ', 'cli-task-1']])('publishes a standalone title for label=%j', (label, title) => {
@@ -58,6 +63,14 @@ describe('CLI record session start', () => {
     expect(fake.sessions.get('cli-task-1')?.events.filter(e => e.type === 'session/title').map(e => e.data)).toEqual([
       { title, messageSeqs: [], source: { kind: 'user' } },
     ])
+  })
+  it('keeps the standalone title as an ignorable record so the persisted log retains it', () => {
+    const fake = fakeStore()
+    recorder(fake.store).start({ ...START })
+    const titles = fake.sessions.get('cli-task-1')?.events.filter(event => event.type === 'session/title') ?? []
+    expect(titles).toHaveLength(1)
+    expect(titles[0]?.ignorable).toBe(true)
+    expect(titles[0]?.data).toEqual({ title: START.label, messageSeqs: [], source: { kind: 'user' } })
   })
   it('does nothing without a parent identity, a store, or when switched off', () => {
     const fake = fakeStore()

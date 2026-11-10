@@ -219,7 +219,7 @@ describe('handleTaskReply validation', () => {
     expect(created[0]?.seed).toEqual([
       expect.objectContaining({ type: 'user/message', data: expect.objectContaining({ content: [{ type: 'text', text: '继续刚才的任务' }] }) }),
       expect.objectContaining({ type: 'maestro/cli-child', ignorable: true, data: expect.objectContaining({ taskId: id, parentSessionId: owner.id, childSessionId: `cli-${id}` }) }),
-      expect.objectContaining({ type: 'session/title', data: expect.objectContaining({ title: '继续刚才的任务', messageSeqs: [], source: { kind: 'user' } }) }),
+      expect.objectContaining({ type: 'session/title', ignorable: true, data: expect.objectContaining({ title: '继续刚才的任务', messageSeqs: [], source: { kind: 'user' } }) }),
     ])
     expect(created[0]?.events.map(event => event.type)).toEqual(['user/message', 'maestro/cli-child', 'session/title', 'turn/start', 'request/context', 'step/start', 'assistant/message', 'step/end', 'turn/end'])
     expect(created[0]?.appended.map(event => event.type)).toEqual(['turn/start', 'request/context', 'step/start', 'assistant/message', 'step/end', 'turn/end'])
