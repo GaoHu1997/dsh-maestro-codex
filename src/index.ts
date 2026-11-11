@@ -287,7 +287,7 @@ export function apply(ctx: Context, config: Config = {}): void {
     statusStore,
     toolName: () => toolName,
     listDshModels: () => listDshModels(ctx, settingsFace),
-    resolveDshModel: (selection: string) => resolveDshModelEndpoint(ctx, settingsFace, selection),
+    resolveDshModel: (selection: string, cli: 'claude' | 'codex' | 'grok') => resolveDshModelEndpoint(ctx, settingsFace, selection, cli),
     // Second half of the pre-spawn check: the protocol is already known to fit,
     // so confirm this endpoint actually serves the selected model name.
     preflightDshModel: async (endpoint: DshModelEndpoint, cli, signal) => {

@@ -29,9 +29,12 @@ function fixture(mode: 'scoped' | 'auto' | 'custom' = 'scoped', allowlist: strin
   bridge: ReturnType<typeof createBridgeHandle>
   executeSpy: ReturnType<typeof vi.fn>
 } {
-  const executeSpy = vi.fn(async (exec: { name: string }) => ({
-    content: [{ type: 'text', text: `工具 ${exec.name} 的输出` }],
-    isError: false,
+  // Registry-shaped: the host settles batches, never a lone call.
+  const executeSpy = vi.fn(async (batch: Parameters<ToolsFace['execute']>[0]) => ({
+    results: batch.calls.map(call => ({
+      callId: call.id,
+      result: { content: [{ type: 'text', text: `工具 ${call.name} 的输出` }], isError: false },
+    })),
   }))
   const face: ToolsFace = { schemas: () => SCHEMAS, execute: executeSpy }
   const bridge = createBridgeHandle({

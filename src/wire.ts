@@ -87,13 +87,19 @@ export const ROUTE_CONFIG_HISTORY = `${ROUTE_PREFIX}/config-history`
 /** GET ROUTE_PREFIX/status — 给 `maestro status` 用的一屏摘要（P1-4）。 */
 export const ROUTE_STATUS = `${ROUTE_PREFIX}/status`
 
-/** One dsh provider as the card's model picker renders it. */
+/** One dsh provider endpoint as the card's model picker renders it. */
 export interface DshProviderModels {
   readonly id: string
   readonly displayName: string
   readonly api: string
   readonly mappable: boolean
   readonly models: readonly DshModelChoice[]
+  /**
+   * `think-level` when the endpoint comes from the dsh-model-think-level
+   * plugin's extra address families rather than the official provider profile;
+   * a route that serves both families therefore contributes two entries.
+   */
+  readonly origin?: 'host' | 'think-level'
 }
 
 /** One model in a provider's catalog, with its configured reasoning efforts. */

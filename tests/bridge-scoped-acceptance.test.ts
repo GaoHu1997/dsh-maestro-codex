@@ -37,22 +37,25 @@ describe('scoped bridge independent acceptance', () => {
   function fixture() {
     let mode: 'scoped' | 'custom' = 'scoped'
     // Mirror the published ops contract: relative paths/defaults use the owning host Session cwd.
-    const execute = vi.fn(async (exec: Parameters<ToolsFace['execute']>[0]) => {
+    const runOne = async (name: string, args: Record<string, unknown>): Promise<unknown> => {
       let text = ''
-      if (exec.name === 'ops_read_files') {
-        const files = exec.arguments['files'] as { path: string }[]
+      if (name === 'ops_read_files') {
+        const files = args['files'] as { path: string }[]
         text = await readFile(resolve(hostCwd, files[0]!.path), 'utf8')
-      } else if (exec.name === 'ops_glob') {
-        text = JSON.stringify(await readdir(resolve(hostCwd, (exec.arguments['path'] as string | undefined) ?? '.')))
-      } else if (exec.name === 'ops_copy') {
-        const source = resolve(hostCwd, exec.arguments['path'] as string)
+      } else if (name === 'ops_glob') {
+        text = JSON.stringify(await readdir(resolve(hostCwd, (args['path'] as string | undefined) ?? '.')))
+      } else if (name === 'ops_copy') {
+        const source = resolve(hostCwd, args['path'] as string)
         const revision = createHash('sha256').update(await readFile(source)).digest('hex')
-        if (revision !== exec.arguments['expectedRevision']) return { content: [{ type: 'text', text: 'revision mismatch' }], isError: true }
-        await copyFile(source, resolve(hostCwd, exec.arguments['to'] as string), constants.COPYFILE_EXCL)
+        if (revision !== args['expectedRevision']) return { content: [{ type: 'text', text: 'revision mismatch' }], isError: true }
+        await copyFile(source, resolve(hostCwd, args['to'] as string), constants.COPYFILE_EXCL)
         text = 'copied'
       }
       return { content: [{ type: 'text', text }], isError: false }
-    })
+    }
+    const execute = vi.fn(async (batch: Parameters<ToolsFace['execute']>[0]) => ({
+      results: await Promise.all(batch.calls.map(async call => ({ callId: call.id, result: await runOne(call.name, call.arguments) }))),
+    }))
     const bridge = createBridgeHandle({
       state: new BridgeState(), portOf: () => 8765, skills: () => undefined,
       tools: () => ({ schemas: () => schemas, execute }),

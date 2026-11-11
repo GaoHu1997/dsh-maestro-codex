@@ -8,6 +8,14 @@
  * A provider is *mappable* when it has a baseURL, a resolvable key reference
  * and a wire protocol a CLI can speak: codex maps over both OpenAI dialects,
  * claude only over `anthropic-messages`.
+ *
+ * One route can serve more than one endpoint. `dsh-model-think-level` keeps the
+ * extra addresses (one OpenAI family, one Anthropic family) and the per-key
+ * protocol pins in its own `key-index.json`, beside the harness home; the
+ * catalog below folds that metadata over the official profile so a route that
+ * carries both `/v1` and `/anthropic` yields one entry per family instead of
+ * only the profile's own `api`. Deployments without the plugin have no index
+ * file and keep the single-endpoint behaviour unchanged.
  */
 
 import { readFileSync } from 'node:fs'
@@ -20,7 +28,35 @@ import { publicEndpointUrl } from './public-diagnostics.js'
 /** Wire protocols a CLI subprocess can speak directly. */
 export type MappableApi = 'anthropic-messages' | 'openai-completions' | 'openai-responses'
 
-/** One dsh provider as the CLI mapping needs it. */
+/** The address family a wire protocol draws its base URL from. */
+export type DshEndpointFamily = 'openai' | 'anthropic'
+
+/** Which family a protocol belongs to (anything not Anthropic is OpenAI-family). */
+export function endpointFamilyOf(api: string): DshEndpointFamily {
+  return api === 'anthropic-messages' ? 'anthropic' : 'openai'
+}
+
+/**
+ * One key the think-level plugin lists for a route. Metadata only — the value
+ * lives in the harness credential store under `ref`.
+ */
+export interface ThinkLevelKey {
+  readonly ref: string
+  /** Model scope; absent means catch-all, an empty list means nothing. */
+  readonly models?: readonly string[]
+  /** Pinned wire protocol; absent means "automatic" (per-model family). */
+  readonly protocol?: MappableApi
+  /** Switched out of the routing pool. */
+  readonly disabled?: boolean
+}
+
+/** The slice of `dsh-model-think-level/key-index.json` this module consumes. */
+export interface ThinkLevelIndex {
+  readonly keys: Readonly<Record<string, readonly ThinkLevelKey[]>>
+  readonly endpoints: Readonly<Record<string, { readonly openai?: string; readonly anthropic?: string }>>
+}
+
+/** One dsh provider endpoint as the CLI mapping needs it. */
 export interface DshProviderInfo {
   /** Provider route id (the `provider` selection half). */
   readonly id: string
@@ -32,6 +68,12 @@ export interface DshProviderInfo {
   /** Whether the protocol + key allow handing this provider to a CLI. */
   readonly mappable: boolean
   readonly models: readonly DshModelInfo[]
+  /** Credential refs that may sign this endpoint, in preference order. */
+  readonly keyRefs: readonly string[]
+  /** The think-level keys behind those refs (empty for an official-only route). */
+  readonly keys: readonly ThinkLevelKey[]
+  /** Where this entry came from: the official profile or the extra address. */
+  readonly origin: 'host' | 'think-level'
 }
 
 /** One model in a provider's catalog, with its configured reasoning efforts. */
@@ -127,39 +169,205 @@ export function declaredModels(profile: Record<string, unknown>): DshModelInfo[]
   return parsed.filter((model): model is DshModelInfo => model !== undefined)
 }
 
-/** List the dsh model catalog joined with CLI-mappability facts. */
-export async function listDshModels(_ctx: Context, settings: SettingsDescribeFace | undefined): Promise<DshModelCatalog> {
-  const profiles = providerProfiles(settings)
-  const providers: DshProviderInfo[] = []
+/** Default location of the think-level plugin's metadata index. */
+export function thinkLevelIndexPath(home: string = homedir(), dshHome: string | undefined = process.env['DSH_HOME']): string {
+  return join(dshHome ?? join(home, '.dsh'), 'dsh-model-think-level', 'key-index.json')
+}
+
+/**
+ * Read the think-level index, or an empty one when the plugin is absent or the
+ * file is unreadable. Every entry is validated independently: a hand-edited or
+ * truncated file costs at most the lines it got wrong, never the official
+ * catalog, and a deployment without the plugin behaves exactly as before.
+ */
+export function readThinkLevelIndex(file: string = thinkLevelIndexPath()): ThinkLevelIndex {
+  let raw: unknown
+  try {
+    raw = JSON.parse(readFileSync(file, 'utf8')) as unknown
+  } catch {
+    return { keys: {}, endpoints: {} }
+  }
+  if (typeof raw !== 'object' || raw === null || Array.isArray(raw)) return { keys: {}, endpoints: {} }
+  const document = raw as Record<string, unknown>
+  const keys: Record<string, ThinkLevelKey[]> = {}
+  const rawProviders = document['providers']
+  if (typeof rawProviders === 'object' && rawProviders !== null && !Array.isArray(rawProviders)) {
+    for (const [route, list] of Object.entries(rawProviders as Record<string, unknown>)) {
+      if (!Array.isArray(list)) continue
+      const entries: ThinkLevelKey[] = []
+      for (const item of list) {
+        if (typeof item !== 'object' || item === null) continue
+        const entry = item as Record<string, unknown>
+        const ref = typeof entry['ref'] === 'string' ? entry['ref'].trim() : ''
+        if (ref === '') continue
+        const models = Array.isArray(entry['models'])
+          ? entry['models'].filter((model): model is string => typeof model === 'string' && model.trim() !== '').map(model => model.trim())
+          : undefined
+        const protocol = entry['protocol'] === 'anthropic-messages' || entry['protocol'] === 'openai-completions' || entry['protocol'] === 'openai-responses'
+          ? entry['protocol']
+          : undefined
+        entries.push({
+          ref,
+          ...(models === undefined ? {} : { models }),
+          ...(protocol === undefined ? {} : { protocol }),
+          ...(entry['disabled'] === true ? { disabled: true } : {}),
+        })
+      }
+      if (entries.length > 0) keys[route] = entries
+    }
+  }
+  const endpoints: Record<string, { openai?: string; anthropic?: string }> = {}
+  const rawEndpoints = document['endpoints']
+  if (typeof rawEndpoints === 'object' && rawEndpoints !== null && !Array.isArray(rawEndpoints)) {
+    for (const [route, value] of Object.entries(rawEndpoints as Record<string, unknown>)) {
+      if (typeof value !== 'object' || value === null) continue
+      const entry = value as Record<string, unknown>
+      const openai = usableEndpointUrl(entry['openai'])
+      const anthropic = usableEndpointUrl(entry['anthropic'])
+      if (openai === undefined && anthropic === undefined) continue
+      endpoints[route] = { ...(openai === undefined ? {} : { openai }), ...(anthropic === undefined ? {} : { anthropic }) }
+    }
+  }
+  return { keys, endpoints }
+}
+
+/** A configured endpoint URL, trimmed and http(s)-only; anything else is absent. */
+function usableEndpointUrl(value: unknown): string | undefined {
+  if (typeof value !== 'string') return undefined
+  const trimmed = value.trim()
+  if (trimmed === '') return undefined
+  try {
+    const url = new URL(trimmed)
+    return url.protocol === 'http:' || url.protocol === 'https:' ? trimmed : undefined
+  } catch {
+    return undefined
+  }
+}
+
+/** One route endpoint before the catalog decodes it for display. */
+interface RawEndpoint {
+  readonly id: string
+  readonly displayName: string
+  readonly api: string
+  readonly baseURL: string
+  readonly apiKeyEnv: string
+  readonly models: readonly DshModelInfo[]
+  readonly keys: readonly ThinkLevelKey[]
+  readonly origin: 'host' | 'think-level'
+}
+
+/**
+ * Every endpoint the composed profile plus the think-level index describes: the
+ * official route itself, then each extra address family that route stores.
+ * Duplicates (same protocol + same URL) collapse, so an address equal to the
+ * route's own `baseURL` adds nothing.
+ */
+function rawEndpoints(profiles: Record<string, Record<string, unknown>>, index: ThinkLevelIndex): RawEndpoint[] {
+  const out: RawEndpoint[] = []
   for (const [route, profile] of Object.entries(profiles)) {
     if (typeof profile !== 'object' || profile === null) continue
-    const api = typeof profile['api'] === 'string' ? profile['api'] : ''
+    const api = typeof profile['api'] === 'string' ? profile['api'].trim() : ''
     const baseURL = typeof profile['baseURL'] === 'string' ? profile['baseURL'].trim() : ''
     const apiKeyEnv = typeof profile['apiKeyEnv'] === 'string' ? profile['apiKeyEnv'].trim() : ''
     const displayName = typeof profile['displayName'] === 'string' && profile['displayName'].trim() !== ''
       ? profile['displayName'].trim()
       : route
-    const mappable = (MappableApis as readonly string[]).includes(api) && baseURL !== '' && apiKeyEnv !== ''
-    providers.push({
-      id: route,
-      displayName,
-      api,
-      baseURL: publicEndpointUrl(baseURL),
-      hasKeyRef: apiKeyEnv !== '',
-      mappable,
-      models: declaredModels(profile),
-    })
+    const models = declaredModels(profile)
+    const keys = index.keys[route] ?? []
+    const seen = new Set<string>()
+    const push = (entryApi: string, entryBaseURL: string, origin: 'host' | 'think-level'): void => {
+      if (entryBaseURL === '' && origin === 'think-level') return
+      const fingerprint = `${entryApi}\n${entryBaseURL}`
+      if (seen.has(fingerprint)) return
+      seen.add(fingerprint)
+      out.push({ id: route, displayName, api: entryApi, baseURL: entryBaseURL, apiKeyEnv, models, keys, origin })
+    }
+    push(api, baseURL, 'host')
+    const extra = index.endpoints[route]
+    if (extra !== undefined) {
+      push('anthropic-messages', extra.anthropic ?? '', 'think-level')
+      // The OpenAI family address serves both dialects; keep the route's own
+      // dialect when it already is one (codex drives either over responses).
+      push(endpointFamilyOf(api) === 'openai' && api !== '' ? api : 'openai-completions', extra.openai ?? '', 'think-level')
+    }
   }
-  providers.sort((a, b) => a.displayName.localeCompare(b.displayName))
+  return out
+}
+
+/**
+ * Credential refs that may sign one endpoint for one model, in preference
+ * order: scope + protocol-family matches first, then any key in scope, then
+ * catch-all keys, and finally the route's own `apiKeyEnv`. A key the
+ * think-level plugin switched off — or one whose explicit scope is empty or
+ * names other models — is never used; its scope is the user's intent, not a
+ * hint. An official-only route yields exactly its `apiKeyEnv`, which is the
+ * pre-plugin behaviour.
+ */
+function keyRefsFor(entry: RawEndpoint, model: string): string[] {
+  const refs: string[] = []
+  const push = (ref: string): void => {
+    if (ref !== '' && !refs.includes(ref)) refs.push(ref)
+  }
+  const family = endpointFamilyOf(entry.api)
+  const enabled = entry.keys.filter(key => key.disabled !== true)
+  const catchAll = (key: ThinkLevelKey): boolean => key.models === undefined
+  const inScope = (key: ThinkLevelKey): boolean => key.models === undefined || key.models.includes(model)
+  for (const key of enabled) {
+    if (inScope(key) && (key.protocol === undefined || endpointFamilyOf(key.protocol) === family)) push(key.ref)
+  }
+  for (const key of enabled) if (inScope(key)) push(key.ref)
+  for (const key of enabled) if (catchAll(key)) push(key.ref)
+  push(entry.apiKeyEnv)
+  return refs
+}
+
+/** List the dsh model catalog joined with CLI-mappability facts. */
+export async function listDshModels(_ctx: Context, settings: SettingsDescribeFace | undefined, index: ThinkLevelIndex = readThinkLevelIndex()): Promise<DshModelCatalog> {
+  const providers = rawEndpoints(providerProfiles(settings), index).map((entry): DshProviderInfo => {
+    // Any model may be signed by these: enabled keys with a non-empty scope
+    // (catch-all or a named set) plus the route's own reference. Whether a
+    // particular model is covered is decided per dispatch by `keyRefsFor`.
+    const keyRefs = [...new Set([
+      ...entry.keys.filter(key => key.disabled !== true && (key.models === undefined || key.models.length > 0)).map(key => key.ref),
+      entry.apiKeyEnv,
+    ].filter(ref => ref !== ''))]
+    const mappable = (MappableApis as readonly string[]).includes(entry.api) && entry.baseURL !== '' && keyRefs.length > 0
+    return {
+      id: entry.id,
+      displayName: entry.displayName,
+      api: entry.api,
+      baseURL: publicEndpointUrl(entry.baseURL),
+      hasKeyRef: keyRefs.length > 0,
+      mappable,
+      models: entry.models,
+      keyRefs,
+      keys: entry.keys,
+      origin: entry.origin,
+    }
+  })
+  providers.sort((a, b) => a.displayName.localeCompare(b.displayName)
+    || a.id.localeCompare(b.id)
+    || (a.origin === b.origin ? 0 : a.origin === 'host' ? -1 : 1)
+    || a.api.localeCompare(b.api))
   return { providers }
 }
 
 /**
  * Resolve one `provider::model` selection into a concrete endpoint + key for a
- * CLI child. Throws a user-facing message when the provider vanished, is not
- * mappable, or its key cannot be resolved.
+ * CLI child. When the CLI is known its protocol family decides which of the
+ * route's endpoints is used — claude picks the Anthropic address, codex and
+ * grok the OpenAI one — so a route that carries both families stays a single
+ * `<provider>::<model>` choice in the picker. Throws a user-facing message when
+ * the provider vanished, no endpoint matches the CLI, or the key cannot be
+ * resolved.
  */
-export async function resolveDshModelEndpoint(ctx: Context, settings: SettingsDescribeFace | undefined, selection: string): Promise<DshModelEndpoint> {
+export async function resolveDshModelEndpoint(
+  ctx: Context,
+  settings: SettingsDescribeFace | undefined,
+  selection: string,
+  cli?: 'claude' | 'codex' | 'grok',
+  index: ThinkLevelIndex = readThinkLevelIndex(),
+): Promise<DshModelEndpoint> {
   const parsed = parseDshModelSelection(selection)
   if (parsed === undefined) throw new Error(`dsh 模型选择无效：${selection}`)
   const profiles = providerProfiles(settings)
@@ -167,18 +375,35 @@ export async function resolveDshModelEndpoint(ctx: Context, settings: SettingsDe
   if (typeof profile !== 'object' || profile === null) {
     throw new Error(`dsh 供应商 "${parsed.provider}" 不存在（可能已被移除），请重新在配置页选择`)
   }
-  const api = typeof profile['api'] === 'string' ? profile['api'] : ''
-  const baseURL = typeof profile['baseURL'] === 'string' ? profile['baseURL'].trim() : ''
-  const apiKeyEnv = typeof profile['apiKeyEnv'] === 'string' ? profile['apiKeyEnv'].trim() : ''
-  if (!(MappableApis as readonly string[]).includes(api)) {
-    throw new Error(`dsh 供应商 "${parsed.provider}" 的协议（${api || '未知'}）无法直接映射给 CLI 子代理，请在配置页换一个 OpenAI/Anthropic 兼容的供应商`)
+  const entries = rawEndpoints(profiles, index).filter(entry => entry.id === parsed.provider)
+  const family = cli === undefined ? undefined : endpointFamilyOf(cli === 'claude' ? 'anthropic-messages' : 'openai-completions')
+  const candidates = family === undefined ? entries : entries.filter(entry => endpointFamilyOf(entry.api) === family)
+  if (candidates.length === 0) {
+    const apis = [...new Set(entries.map(entry => entry.api).filter(api => api !== ''))]
+    const describe = apis.length === 0 ? '未知' : apis.join(' / ')
+    throw new Error(`dsh 供应商 "${parsed.provider}" 只提供 ${describe} 协议端点，${cli ?? 'CLI'} 子代理无法使用；请在配置页改用兼容该协议的供应商，或给该供应商补上对应地址族的端点`)
   }
-  if (baseURL === '') throw new Error(`dsh 供应商 "${parsed.provider}" 未配置 baseURL`)
-  if (apiKeyEnv === '') throw new Error(`dsh 供应商 "${parsed.provider}" 未配置密钥引用（apiKeyEnv）`)
-
-  const apiKey = await resolveKey(ctx, apiKeyEnv)
-  if (apiKey === '') throw new Error(`无法解析 dsh 供应商 "${parsed.provider}" 的密钥（${apiKeyEnv}）`)
-  return { provider: parsed.provider, model: parsed.model, api: api as MappableApi, baseURL, apiKey }
+  // Host endpoint first: it is what dsh itself uses. A route whose host
+  // protocol cannot be mapped still has its extra family to fall back to.
+  const ordered = [...candidates].sort((a, b) => (a.origin === b.origin ? 0 : a.origin === 'host' ? -1 : 1))
+  const endpoint = ordered.find(entry => (MappableApis as readonly string[]).includes(entry.api) && entry.baseURL !== '')
+  if (endpoint === undefined) {
+    const first = ordered[0]
+    if (first === undefined) throw new Error(`dsh 供应商 "${parsed.provider}" 没有可用端点`)
+    if (!(MappableApis as readonly string[]).includes(first.api)) {
+      throw new Error(`dsh 供应商 "${parsed.provider}" 的协议（${first.api || '未知'}）无法直接映射给 CLI 子代理，请在配置页换一个 OpenAI/Anthropic 兼容的供应商`)
+    }
+    throw new Error(`dsh 供应商 "${parsed.provider}" 未配置 baseURL`)
+  }
+  const keyRefs = keyRefsFor(endpoint, parsed.model)
+  if (keyRefs.length === 0) throw new Error(`dsh 供应商 "${parsed.provider}" 未配置密钥引用（apiKeyEnv）`)
+  for (const ref of keyRefs) {
+    const apiKey = await resolveKey(ctx, ref)
+    if (apiKey !== '') {
+      return { provider: parsed.provider, model: parsed.model, api: endpoint.api as MappableApi, baseURL: endpoint.baseURL, apiKey }
+    }
+  }
+  throw new Error(`无法解析 dsh 供应商 "${parsed.provider}" 的密钥（${keyRefs.join(', ')}）`)
 }
 
 async function resolveKey(ctx: Context, apiKeyEnv: string): Promise<string> {

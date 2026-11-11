@@ -10,9 +10,9 @@ import { randomUUID } from 'node:crypto'
 import { existsSync, statSync } from 'node:fs'
 import { isAbsolute } from 'node:path'
 import { modelTokenError, type EffectiveConfig, type TaskDifficulty } from './config.js'
-import { runClaudeTask } from './channels/claude.js'
+import { claudePermissionWarning, runClaudeTask } from './channels/claude.js'
 import { runCodexTask } from './channels/codex.js'
-import { runGrokTask } from './channels/grok.js'
+import { grokPermissionWarning, runGrokTask } from './channels/grok.js'
 import { detectCli, type CliDetection } from './cli-manager.js'
 import { RoutingError, assertTaskDifficulty, pickCli, taskDifficultyError } from './routing.js'
 import { isTerminalPhase, Limiter, TaskRegistry, type MaestroTask as TaskRegistryTask } from './task-registry.js'
@@ -94,8 +94,9 @@ export interface DispatchDeps {
   /** Abort controllers by task id — the cancel route kills through these. */
   controllers: Map<string, AbortController>
   pathCache: CliPathCache
-  /** Resolve a `<provider>::<model>` dsh-catalog selection into a CLI endpoint. */
-  resolveDshModel?: ((selection: string) => Promise<DshModelEndpoint>) | undefined
+  /** Resolve a `<provider>::<model>` dsh-catalog selection into a CLI endpoint.
+   * The CLI id picks the endpoint family when the route serves several. */
+  resolveDshModel?: ((selection: string, cli: MaestroCliId) => Promise<DshModelEndpoint>) | undefined
   /**
    * Confirm the resolved endpoint actually serves that model before a child is
    * spawned (declared-model check + one-token probe). Absent = no check.
@@ -679,7 +680,7 @@ export async function runDispatch(deps: DispatchDeps, params: DispatchParams, si
           let endpoint: DshModelEndpoint
           try {
             abort.signal.throwIfAborted()
-            endpoint = await deps.resolveDshModel(explicitSelection)
+            endpoint = await deps.resolveDshModel(explicitSelection, decision.cli)
             abort.signal.throwIfAborted()
             requireEndpoint(endpoint)
           } catch (error) {
@@ -727,7 +728,7 @@ export async function runDispatch(deps: DispatchDeps, params: DispatchParams, si
             if (deps.resolveDshModel === undefined) break
             let endpoint: DshModelEndpoint
             try {
-              endpoint = await deps.resolveDshModel(attempt.selection)
+              endpoint = await deps.resolveDshModel(attempt.selection, decision.cli)
               abort.signal.throwIfAborted()
               requireEndpoint(endpoint)
             } catch (error) {
@@ -842,6 +843,16 @@ export async function runDispatch(deps: DispatchDeps, params: DispatchParams, si
           onEvent('note', `续接 ${decision.cli} 会话 ${params.resume}：原会话对话不会自动带入，需要的结论请写在任务里`)
         }
 
+        // 权限模式是派发期的确定事实：headless claude/grok 都没有审批人，沿用
+        // CLI 自身 default 会让 Bash / 写文件 / Web 调用逐条被拒，任务不失败但空转。
+        if (decision.cli === 'claude') {
+          const permissionWarning = claudePermissionWarning(config.claude.permissionMode)
+          if (permissionWarning !== undefined) onEvent('note', permissionWarning)
+        } else if (decision.cli === 'grok') {
+          const permissionWarning = grokPermissionWarning(config.grok.permissionMode)
+          if (permissionWarning !== undefined) onEvent('note', permissionWarning)
+        }
+
         // The thinking level: an explicit override (the session page's picker)
         // wins over the configured per-CLI default.
         const thinking = params.thinking ?? config[decision.cli].thinking
@@ -928,11 +939,21 @@ export async function runDispatch(deps: DispatchDeps, params: DispatchParams, si
 
             // Live counters: the board polls the task list, so writing the
             // running snapshot here is what puts tokens on a card before the
-            // task ends. Settled `stats` still wins once the run resolves. No
-            // session log is touched: private session appends are unloadable on
-            // hosts whose append has no ignorable channel.
+            // task ends. Settled `stats` still wins once the run resolves.
+            // 同一份快照也落进子会话：宿主 tokenUsage 与所有按会话日志统计的
+            // 插件都以 (turn, step) 覆盖同一条消费，重复快照只纠正、不累加，
+            // 所以运行中的 CLI 花费不再只有插件自己的投影看得见。
             const onUsage = (stats: Record<string, string | number | boolean>): void => {
               deps.registry.setLiveStats(task, stats)
+              if (deps.childSessions?.progress === undefined) return
+              try {
+                deps.childSessions.progress({
+                  taskId: id,
+                  // 重试轮次：已结算的 attempts 叠上当前这轮流式帧。
+                  stats: attempt === 1 ? stats : accumulateAttemptStats(task.stats, stats),
+                  ...(resolvedRoute === undefined ? {} : { route: resolvedRoute }),
+                })
+              } catch { /* 进度写入尽力而为，不能影响 CLI 执行 */ }
             }
 
             abort.signal.throwIfAborted()

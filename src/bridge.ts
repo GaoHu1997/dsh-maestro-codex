@@ -61,14 +61,93 @@ export interface BridgeToolSchema {
  * purpose: the registry types live in `@deepseek-ai/dsh-tools`, which this
  * plugin does not depend on.
  */
+/** One call inside a host batch; `arguments` is the parsed tool input. */
+export interface HostToolCall {
+  readonly id: string
+  readonly name: string
+  readonly arguments: Record<string, unknown>
+}
+
+/**
+ * The registry's ONLY settlement input. `ctx.tools.execute` forwards to
+ * `executeToolBatch`, which destructures `input.calls` and answers
+ * `{ results: [{ callId, result }] }`; a single call rides as a one-element
+ * batch — that is the host's own documented form ("Use executeToolBatch for
+ * complete calls, including a single-call batch"). Passing a lone call object
+ * instead makes `calls` undefined and the registry throws before any tool body
+ * runs, which surfaced as an opaque 500 on every bridged call.
+ */
+export interface HostToolBatch {
+  readonly calls: readonly HostToolCall[]
+  readonly signal: AbortSignal
+  readonly agent: NonNullable<ToolExec['agent']>
+  readonly rootCallId?: string | undefined
+  readonly parent?: symbol | undefined
+}
+
+/** Settlement shapes the registry has been observed to answer with. */
+export type HostToolContract = 'batch' | 'single' | 'unknown'
+
+/** The slice of dsh's `ctx.tools` registry the bridge reads. */
 export interface ToolsFace {
   /** The viewing scope is the actual calling agent; omitted means global view. */
   schemas(scope?: ToolExec['agent']): Array<{ name: string; description?: string; parameters?: unknown }>
   /** Full host pipeline. cwd is deliberately absent: tools resolve the real agent's Session. */
-  execute(exec: {
-    callId: string; rootCallId?: string; name: string; arguments: Record<string, unknown>
-    signal: AbortSignal; agent: NonNullable<ToolExec['agent']>; parent?: symbol
-  }): Promise<unknown>
+  execute(batch: HostToolBatch): Promise<unknown>
+}
+
+/**
+ * Project one settlement back onto our call id.
+ *
+ * `batch` is the live registry shape. `single` is accepted because hosts and
+ * in-process fakes have answered with one bare `{ content, isError }` result;
+ * accepting it keeps a host upgrade from breaking the bridge, while the
+ * recorded contract tells diagnostics which shape the live host really used.
+ * Anything else is `unknown` — never silently treated as an empty success.
+ */
+export function hostToolOutcomeOf(raw: unknown, callId: string): { contract: HostToolContract; result: unknown } {
+  if (typeof raw !== 'object' || raw === null) return { contract: 'unknown', result: undefined }
+  const record = raw as Record<string, unknown>
+  const entries = Array.isArray(record['results']) ? record['results'] : undefined
+  if (entries !== undefined) {
+    for (const entry of entries) {
+      if (typeof entry !== 'object' || entry === null) continue
+      const slot = entry as Record<string, unknown>
+      if (slot['callId'] === callId) return { contract: 'batch', result: slot['result'] }
+    }
+    return { contract: 'batch', result: undefined }
+  }
+  if (Array.isArray(record['content']) || record['isError'] === true) return { contract: 'single', result: raw }
+  return { contract: 'unknown', result: undefined }
+}
+
+/** Generic built-ins carry no tool semantics; their message is untrusted text. */
+const GENERIC_ERROR_NAMES: ReadonlySet<string> = new Set(['Error', 'TypeError', 'RangeError', 'SyntaxError', 'ReferenceError', 'URIError', 'EvalError'])
+
+/**
+ * Split one thrown host exception into what the child may see and what only the
+ * log may see.
+ *
+ * A classified tool error (a named class such as the web provider's `WebError`)
+ * is the host tool's own public contract, so its message goes back to the child
+ * — that is what lets a subagent recover instead of retrying blind. A generic
+ * `Error`/`TypeError` may embed anything (the security boundary test feeds it a
+ * credential), so the child gets the type only while the log keeps the full
+ * text. Withholding everything, as the bridge used to, turned one deterministic
+ * contract bug into dozens of indistinguishable failures.
+ */
+export function describeHostToolError(error: unknown): { summary: string; detail: string } {
+  const name = error instanceof Error && error.name !== '' ? error.name : typeof error
+  const raw = error instanceof Error ? error.message : String(error)
+  const detail = `${name}: ${clip(raw)}`
+  if (GENERIC_ERROR_NAMES.has(name)) return { summary: `${name}（完整异常已写入宿主日志）`, detail }
+  return { summary: detail, detail }
+}
+
+/** One line, no control characters, bounded so it cannot flood a transcript. */
+function clip(text: string): string {
+  const flat = text.replace(/[\u0000-\u001f\u007f]/g, ' ').replace(/\s+/g, ' ').trim()
+  return flat.length > 400 ? `${flat.slice(0, 400)}…` : flat
 }
 
 /**
@@ -229,6 +308,17 @@ interface BridgeRun {
 /** Token registry: revocation also cancels every in-flight host operation. */
 export class BridgeState {
   private readonly runs = new Map<string, BridgeRun>()
+  /**
+   * The settlement shape the live host answered with on the last bridged call.
+   * 'unseen' = no call yet. `/models` diagnostics show it so a host upgrade that
+   * changes the contract is visible instead of arriving as opaque tool failures.
+   */
+  lastHostToolContract: HostToolContract | 'unseen' = 'unseen'
+
+  /** Record one observed settlement shape (last write wins). */
+  observeHostToolContract(contract: HostToolContract): void {
+    this.lastHostToolContract = contract
+  }
 
   issue(includeSkills = true, includeTools = false, context: BridgeRunContext = {}, policy?: BridgeToolPolicy): string {
     const token = `mb-${randomUUID()}`
@@ -293,6 +383,8 @@ export interface BridgeHandle {
     skills: number
     tools: number
     httpReady: boolean
+    /** Settlement shape the live host answered with last ('unseen' before any call). */
+    hostToolContract: HostToolContract | 'unseen'
   }>
 }
 
@@ -545,19 +637,37 @@ export function createBridgeHandle(parts: BridgeHandleParts): BridgeHandle {
             if (!pickTools(run.context).some(tool => tool.name === name)) throw new BridgeToolAdmissionError(403, `工具 ${name} 不在本次桥接名单中`)
             const executionFace = parts.tools()
             if (executionFace === undefined || typeof executionFace.execute !== 'function') throw new BridgeToolAdmissionError(403, '宿主工具注册表不可用')
-            return await executionFace.execute({ callId, name, arguments: boundArguments, signal: run.controller.signal, agent,
+            // One call still rides as a one-element batch: `ctx.tools.execute`
+            // hands the input straight to `executeToolBatch`, which reads
+            // `input.calls`. A lone `{ callId, name, ... }` made `calls`
+            // undefined and the registry threw before any tool body ran.
+            return await executionFace.execute({
+              calls: [{ id: callId, name, arguments: boundArguments }],
+              signal: run.controller.signal,
+              agent,
               ...(rootCallId === undefined ? {} : { rootCallId }),
-              ...(run.context.parent === undefined ? {} : { parent: run.context.parent }) })
+              ...(run.context.parent === undefined ? {} : { parent: run.context.parent }),
+            })
           },
           run.controller.signal)
       } catch (error) {
         if (run.controller.signal.aborted) return { ok: false, status: 401, error: 'bridge token 无效或已过期' }
         if (error instanceof BridgeToolAdmissionError) return { ok: false, status: error.status, error: error.message }
         if (error instanceof DeadlineError) return { ok: false, status: 504, error: `工具 ${name} 在 ${String(Math.round(limits.toolMs / 60_000))} 分钟内没有返回，已停止等待（底层执行可能仍在运行）` }
-        return { ok: false, status: 500, error: `工具 ${name} 执行异常（详细错误未向子代理公开）` }
+        // The child must be able to act on this, but an unclassified exception
+        // message can embed anything — see describeHostToolError.
+        const described = describeHostToolError(error)
+        parts.logger?.warn(`dsh-maestro-codex: bridged tool "${name}" threw: ${described.detail}`)
+        return { ok: false, status: 500, error: `工具 ${name} 执行异常：${described.summary}` }
       }
       if (state.resolve(token) !== run) return { ok: false, status: 401, error: 'bridge token 无效或已过期' }
-      const projected = toolOutcomeOf(outcome)
+      const settled = hostToolOutcomeOf(outcome, callId)
+      state.observeHostToolContract(settled.contract)
+      if (settled.contract === 'unknown' || settled.result === undefined) {
+        parts.logger?.warn(`dsh-maestro-codex: bridged tool "${name}" answered with an unrecognised settlement (${settled.contract}); expected { results: [{ callId, result }] }`)
+        return { ok: false, status: 502, error: `工具 ${name} 的宿主结算结果无法识别（契约 ${settled.contract}）：期望 { results: [{ callId, result }] }。请附带 dsh 版本反馈，桥接层按实际形状适配。` }
+      }
+      const projected = toolOutcomeOf(settled.result)
       // Intentional tool outcomes retain their body (e.g. image-generation
       // failures); unlike thrown exceptions, they are the host tool's public contract.
       if (projected.isError) return { ok: false, status: 502, error: projected.error ?? (projected.text.trim() !== '' ? projected.text : `工具 ${name} 执行失败`) }
@@ -618,7 +728,7 @@ export function createBridgeHandle(parts: BridgeHandleParts): BridgeHandle {
       const skillsEnabled = config.bridgeSkills !== false && parts.skills() !== undefined
       const skills = httpReady && skillsEnabled ? (await this.skillsFor(cwd)).length : 0
       const tools = config.bridgeTools !== 'off' ? (await pickTools()).length : 0
-      return { skillsEnabled, toolsMode: config.bridgeTools, skills, tools, httpReady }
+      return { skillsEnabled, toolsMode: config.bridgeTools, skills, tools, httpReady, hostToolContract: state.lastHostToolContract }
     },
   }
 }

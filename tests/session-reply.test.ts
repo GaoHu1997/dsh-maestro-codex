@@ -221,8 +221,10 @@ describe('handleTaskReply validation', () => {
       expect.objectContaining({ type: 'maestro/cli-child', ignorable: true, data: expect.objectContaining({ taskId: id, parentSessionId: owner.id, childSessionId: `cli-${id}` }) }),
       expect.objectContaining({ type: 'session/title', ignorable: true, data: expect.objectContaining({ title: '继续刚才的任务', messageSeqs: [], source: { kind: 'user' } }) }),
     ])
-    expect(created[0]?.events.map(event => event.type)).toEqual(['user/message', 'maestro/cli-child', 'session/title', 'turn/start', 'request/context', 'step/start', 'assistant/message', 'step/end', 'turn/end'])
-    expect(created[0]?.appended.map(event => event.type)).toEqual(['turn/start', 'request/context', 'step/start', 'assistant/message', 'step/end', 'turn/end'])
+    // 运行期进度先落一条 (turn 1, step 1) 的 assistant/attempt，结算只补
+    // assistant/message 与关闭事件——同一个 step 不会有两个开启边界。
+    expect(created[0]?.events.map(event => event.type)).toEqual(['user/message', 'maestro/cli-child', 'session/title', 'turn/start', 'request/context', 'step/start', 'assistant/attempt', 'assistant/message', 'step/end', 'turn/end'])
+    expect(created[0]?.appended.map(event => event.type)).toEqual(['turn/start', 'request/context', 'step/start', 'assistant/attempt', 'assistant/message', 'step/end', 'turn/end'])
     expect(created[0]?.events.find(event => event.type === 'request/context')?.data).toEqual({ provider: 'wb', model: 'gpt-6.1' })
     expect(created[0]?.events.find(event => event.type === 'assistant/message')?.data).toMatchObject({
       message: { source: { kind: 'model', provider: 'wb', model: 'gpt-6.1' }, content: [{ type: 'text', text: 'claude 收到，继续完成' }] },
@@ -304,7 +306,7 @@ describe('handleTaskReply runs the continuation', () => {
     expect(outcome.status).toBe(200)
     const { id } = outcome.body as { id: string }
     const reply = await untilSettled(registry, id)
-    expect(resolveDshModel).toHaveBeenCalledWith('wb::gpt-6.1')
+    expect(resolveDshModel).toHaveBeenCalledWith('wb::gpt-6.1', 'claude')
     expect(reply?.model).toBe('gpt-6.1')
     expect(reply?.phase).toBe('done')
   })
@@ -355,7 +357,7 @@ describe('handleTaskReply runs the continuation', () => {
     expect(outcome.status).toBe(200)
     const { id } = outcome.body as { id: string }
     const reply = await untilSettled(registry, id)
-    expect(resolveDshModel).toHaveBeenCalledWith('wb::gpt-6.1')
+    expect(resolveDshModel).toHaveBeenCalledWith('wb::gpt-6.1', 'claude')
     // 显式选择不算「沿用」：措辞是会话页选择。
     expect(reply?.events.some(event => event.text.includes('使用会话页选择的 dsh 模型'))).toBe(true)
   })

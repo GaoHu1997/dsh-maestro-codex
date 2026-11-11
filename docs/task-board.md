@@ -86,7 +86,8 @@ Codex 的 `input_tokens` 是包含缓存读/写的输入。归一化为不相交
 每次派发在宿主里建一条**真实 dsh 子会话**（`src/child-session.ts`，`origin: 'subagent'`、`parentSession` 指向派发会话、id `cli-<taskId>`），让 CLI 子代理的数据进入统计类插件已经在读的标准通道：
 
 - **开始**：以任务全文写入一条 `user/message`，在父会话追加宿主原生 `subagent/catalog` 行（`version: 0`、`mode: 'one-shot'`、label 为任务名）。CLI 记录只用于查看和标准统计；续接必须回到 Maestro 的原 CLI 入口，不能交给普通 DSH 执行器。
-- **结算**：一条 `step/start`（统计插件的请求计数标记）+ 成功写 `assistant/message`（终文本 + usage 样本，`message.source = {kind: 'model', provider, model}` 供模型归因）/ 失败写 `assistant/attempt`（宿主对未提交调用的分区边界，同样携带已消耗用量）。usage 样本四桶为 `inputTokens / outputTokens / cacheReadTokens / cacheWriteTokens`（插件的 `cachedInputTokens` 在此映射为 `cacheReadTokens`）。
+- **运行中进度**：CLI 每上报一帧累计计数，`ChildSessionRecorder.progress` 就以 (turn 1, step 1) 的 `assistant/attempt` 覆盖式写入同一份样本（间隔 ≥30s、单任务上限 240 条；样本必须四桶完整且带 route 才写）。首次写入时补 `turn/start` / `request/context` / `step/start`。宿主 `tokenUsage` 与按会话日志折账的统计插件都以 (turn, step) 做 last-wins，重复快照只纠正同一条消费、不会累加。没有它时，运行中的 CLI 花费只有本插件的 `maestroCliUsage` 投影看得到，其他统计侧一直读到 0 请求 0 token，直到任务结算。
+- **结算**：只补终局样本与关闭事件——运行期已经写过开启边界时不再重复 `turn/start` / `step/start`；成功写 `assistant/message`（终文本 + usage 样本，`message.source = {kind: 'model', provider, model}` 供模型归因）/ 失败写 `assistant/attempt`（宿主对未提交调用的分区边界，同样携带已消耗用量）。usage 样本四桶为 `inputTokens / outputTokens / cacheReadTokens / cacheWriteTokens`（插件的 `cachedInputTokens` 在此映射为 `cacheReadTokens`）。
 - **为什么必须换成真会话**：旧版 A2 写的是 `{version: 2, mode: 'external'}` 行，宿主 `subagentCatalog` 投影的严格 schema 只认 `one-shot / continuable / unknown` 且指向真实会话——事件先落盘后驱动投影，fold 在该 seq 上抛出且无 containment，父会话目录从此卡死（重启后 `restore` 路径更是直接抛错）。新行已按宿主同一 schema 验证通过（见 `tests/child-session.test.ts` 的键集断言）。
 - **可见性验证**：记录使用公开宿主标准事件和 provider/model 归因；是否能被目标统计插件的 live 与历史回放正确读取，必须按真实版本逐层对账，不能承诺所有消费者无条件兼容。
 - **降级与开关**：`recordChildSessions` 控制新任务的即时镜像；缺少所需宿主服务时显示降级，canonical 账务不丢弃。历史镜像恢复与该开关的组合需单独验证，不能把关闭即时记录等同于删除既有记录。看板与顶部入口将镜像行和 CLI 任务行去重。

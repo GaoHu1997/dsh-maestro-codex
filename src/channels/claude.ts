@@ -56,11 +56,36 @@ export interface ClaudeFrame {
 /** One streamed usage snapshot, as both frame kinds report it. */
 export type ClaudeUsage = NonNullable<ClaudeFrame['usage']>
 
-/** `--permission-mode` value for the configured mode; `inherit` sends none. */
+/**
+ * `--permission-mode` value for the configured mode; `inherit` and `default`
+ * send none and keep the CLI's own headless default.
+ *
+ * That default is `default` — and `claude -p` has nobody to ask, so every Bash,
+ * Write, Edit, WebSearch and WebFetch call is denied outright. The two modes
+ * stay available on purpose (a caller may really want a read-only run), but the
+ * dispatch surfaces `claudePermissionWarning` before such a run starts instead
+ * of letting the child burn turns on permission denials.
+ */
 export function claudePermissionArgs(permissionMode: ClaudePermissionMode): string[] {
   if (permissionMode === 'inherit' || permissionMode === 'default') return []
   if (permissionMode === 'bypassPermissions') return ['--dangerously-skip-permissions']
   return ['--permission-mode', permissionMode]
+}
+
+/**
+ * The one-line warning a headless claude run needs when its permission mode
+ * cannot approve anything. undefined = the mode can actually run unattended.
+ *
+ * `default`/`inherit` keep claude's headless default, which requires approval
+ * for shell, file writes and web access; without a prompt those calls fail one
+ * by one rather than failing the run, so the child looks "busy but blocked".
+ */
+export function claudePermissionWarning(permissionMode: ClaudePermissionMode): string | undefined {
+  if (permissionMode !== 'inherit' && permissionMode !== 'default') return undefined
+  return [
+    `claude 权限模式为 ${permissionMode}：headless 运行没有审批人，Bash / 写文件 / WebSearch / WebFetch 会被逐条拒绝（任务不会失败，但会空转）。`,
+    '要让它真正干活，请把后端的 claude 权限模式设为 bypassPermissions；只读任务可保持现状。',
+  ].join('')
 }
 
 /** MCP bridge argv: ONLY the bridged dsh servers, claude's own global config ignored. */

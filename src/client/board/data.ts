@@ -296,11 +296,15 @@ function sessionIdsKey(sessionIds: readonly string[] | undefined): string {
   return sessionIds === undefined || sessionIds.length === 0 ? '' : [...sessionIds].sort().join(',')
 }
 
-/** 每秒走一次的“现在”，让耗时读数自己往前跑。 */
+/** 每秒走一次的“现在”，让耗时读数自己往前跑。
+ * `active` 为假时停表——调用方常在常驻的页头/看板里用它，空转的每秒 setState
+ * 会和打字抢同一个 renderer 主线程。重新开始时立刻对齐，不显示冻结前的旧值。
+ */
 export function useNow(active: boolean): number {
   const [now, setNow] = useState(() => Date.now())
   useEffect(() => {
     if (!active) return
+    setNow(Date.now())
     const timer = window.setInterval(() => { setNow(Date.now()) }, 1000)
     return () => { window.clearInterval(timer) }
   }, [active])

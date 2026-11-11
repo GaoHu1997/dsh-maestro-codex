@@ -636,7 +636,7 @@ describe('model resolution order', () => {
     const { deps } = makeDeps(fixture(), cli.spawnFn, resolveDshModel)
     const value = await runDispatch({ ...deps, preflightDshModel }, { ...assessment, cli: 'claude', task: 'x', model: 'explicit' }, new AbortController().signal)
     expect(value.model).toBe('explicit')
-    expect(resolveDshModel).toHaveBeenCalledWith('test-claude::explicit')
+    expect(resolveDshModel).toHaveBeenCalledWith('test-claude::explicit', 'claude')
     expect(preflightDshModel).toHaveBeenCalledWith(expect.objectContaining({ provider: 'test-claude', model: 'explicit' }), 'claude', expect.any(AbortSignal))
   })
 

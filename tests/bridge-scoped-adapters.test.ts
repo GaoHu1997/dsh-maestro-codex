@@ -200,7 +200,9 @@ describe('Native scoped path adapters and token authority', () => {
     const next = await bridge.catalog(second.token, cwd)
     expect('tools' in next ? next.tools.map(x => x.name) : []).toEqual(['ops_edit_file', 'ops_read_files'])
     expect(await bridge.callTool(second.token, 'ops_edit_file', { path: 'inside.txt' })).toMatchObject({ ok: true })
-    expect(execute).toHaveBeenCalledWith(expect.objectContaining({ arguments: { path: join(cwd, 'inside.txt') } }))
+    expect(execute).toHaveBeenCalledWith(expect.objectContaining({
+      calls: [expect.objectContaining({ arguments: { path: join(cwd, 'inside.txt') } })],
+    }))
   })
 
   it('accepts a normal zero-prefixed path component', async () => {
@@ -212,6 +214,8 @@ describe('Native scoped path adapters and token authority', () => {
     const f = fixture('custom')
     f.onSchemas(() => f.mode('scoped'))
     expect(await f.bridge.callTool(f.token, 'ops_stat', { path: 'inside.txt' })).toMatchObject({ ok: true })
-    expect(f.execute).toHaveBeenCalledWith(expect.objectContaining({ arguments: { path: join(cwd, 'inside.txt') } }))
+    expect(f.execute).toHaveBeenCalledWith(expect.objectContaining({
+      calls: [expect.objectContaining({ arguments: { path: join(cwd, 'inside.txt') } })],
+    }))
   })
 })

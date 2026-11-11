@@ -34,11 +34,23 @@ function fakeSkillsFace(skills: unknown[], definitions: Record<string, unknown> 
   }
 }
 
+/**
+ * A registry-shaped executor: one-element batches in, `{ results: [...] }` out.
+ * This is the live host contract — a fake that answers a bare result hides the
+ * `input.calls` requirement and lets a broken bridge pass its own tests.
+ */
 function fakeToolsFace(schemas: Array<{ name: string; description?: string; parameters?: unknown }>, outcomes: Record<string, unknown> = {}): ToolsFace & { executeSpy: ReturnType<typeof vi.fn> } {
-  const executeSpy = vi.fn(async (exec: { name: string }) => outcomes[exec.name] ?? {
-    content: [{ type: 'text', text: `工具 ${exec.name} 的输出` }],
-    isError: false,
-  })
+  const executeSpy = vi.fn(async (batch: Parameters<ToolsFace['execute']>[0]) => ({
+    results: batch.calls.map(call => ({
+      callId: call.id,
+      result: outcomes[call.name] ?? {
+        content: [{ type: 'text', text: `工具 ${call.name} 的输出` }],
+        isError: false,
+      },
+    })),
+    additionalContexts: [],
+    concluded: false,
+  }))
   return {
     schemas: vi.fn(() => schemas),
     execute: executeSpy,
@@ -383,7 +395,9 @@ describe('bridge tools', () => {
     if (run === undefined) throw new Error('bridge should be active')
     const result = await bridge.callTool(run.token, 'web_search', { query: 'dsh' })
     expect(result).toMatchObject({ ok: true, text: '结果 A\n结果 B' })
-    expect(toolsFace.executeSpy).toHaveBeenCalledWith(expect.objectContaining({ name: 'web_search', arguments: { query: 'dsh' } }))
+    expect(toolsFace.executeSpy).toHaveBeenCalledWith(expect.objectContaining({
+      calls: [expect.objectContaining({ name: 'web_search', arguments: { query: 'dsh' } })],
+    }))
     bridge.revoke(run.token)
   })
 

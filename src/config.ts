@@ -72,7 +72,14 @@ export const CONFIG_DEFAULTS = {
   codexMinTaskDifficulty: 'medium',
   claudeEnabled: true,
   claudeTaskTypes: ['仓库探索', '影响分析', '模块重构', '方案设计', '文档整理'],
-  claudePermissionMode: 'inherit',
+  /**
+   * `inherit`/`default` look harmless and are not: `claude -p` has no approval
+   * channel, so its default mode rejects every Bash/Write/Edit/Web call and the
+   * child spins through dozens of permission denials before giving up. The
+   * default must be a mode that can actually run unattended; `claudePermissionArgs`
+   * still honours an explicit `inherit`/`default`, and the dispatch then warns.
+   */
+  claudePermissionMode: 'bypassPermissions',
   claudeBaseUrl: '',
   claudeAuthToken: '',
   claudeCliPath: '',

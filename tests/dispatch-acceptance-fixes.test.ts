@@ -167,7 +167,7 @@ describe('QA07 all explicit model forms use trusted DSH routing', () => {
     const f = fixture(cli)
     const result = await f.execute({ model: 'group/requested-model' })
     expect(result.model).toBe('group/requested-model')
-    expect(f.deps.resolveDshModel).toHaveBeenCalledExactlyOnceWith(`test-${cli}::group/requested-model`)
+    expect(f.deps.resolveDshModel).toHaveBeenCalledExactlyOnceWith(`test-${cli}::group/requested-model`, cli)
     expect(f.deps.preflightDshModel).toHaveBeenCalledWith(expect.objectContaining({ provider: `test-${cli}`, model: result.model }), cli, expect.any(AbortSignal))
     expect(f.spawn.launches[0]!.spawnArgs).toContain(cli === 'codex' ? `model=${JSON.stringify(result.model)}` : result.model)
     if (cli === 'codex') {
@@ -180,7 +180,7 @@ describe('QA07 all explicit model forms use trusted DSH routing', () => {
     const f = fixture()
     const result = await f.execute({ model: 'test-codex::requested' })
     expect(result).toMatchObject({ ok: true, model: 'requested' })
-    expect(f.deps.resolveDshModel).toHaveBeenCalledExactlyOnceWith('test-codex::requested')
+    expect(f.deps.resolveDshModel).toHaveBeenCalledExactlyOnceWith('test-codex::requested', 'codex')
   })
   it('falls back only the automatic provider while preserving the requested bare model', async () => {
     const f = fixture()
@@ -192,13 +192,13 @@ describe('QA07 all explicit model forms use trusted DSH routing', () => {
   it('uses the compatible primary provider, not the configured provider, for a bare name', async () => {
     const f = fixture()
     await runDispatch(f.deps, { ...f.params, model: 'requested', primaryModel: { provider: 'test-codex', model: 'main' } }, f.controller.signal)
-    expect(f.deps.resolveDshModel).toHaveBeenCalledExactlyOnceWith('test-codex::requested')
+    expect(f.deps.resolveDshModel).toHaveBeenCalledExactlyOnceWith('test-codex::requested', 'codex')
   })
   it('does not fall back from an explicitly pinned incompatible provider', async () => {
     const f = fixture()
     const result = await f.execute({ model: 'test-claude::requested' })
     expect(result).toMatchObject({ ok: false, phase: 'failed', sessionRef: '' })
-    expect(f.deps.resolveDshModel).toHaveBeenCalledExactlyOnceWith('test-claude::requested')
+    expect(f.deps.resolveDshModel).toHaveBeenCalledExactlyOnceWith('test-claude::requested', 'codex')
     expect(f.deps.preflightDshModel).not.toHaveBeenCalled()
     expect(f.spawn.launches).toHaveLength(0)
   })

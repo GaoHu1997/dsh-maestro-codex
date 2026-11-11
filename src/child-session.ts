@@ -5,6 +5,14 @@
  * SessionStore.create publishes an in-memory session, not a durable writer:
  * persistence and rejection of ordinary DSH execution need host lifecycle APIs.
  * No fake offline load/storeappend or unsupported header keys are used here.
+ *
+ * Running counters reach this record through {@link ChildSessionRecorder.progress}:
+ * CLI spend only existed in the plugin's own projection before, so every plugin
+ * that folds the session log (the native `tokenUsage` projection and any
+ * third-party usage view) read zero until the task settled. A progress sample
+ * is an ordinary `assistant/attempt` for (turn 1, step 1) — both the host fold
+ * and those consumers replace by (turn, step) instead of adding, so repeated
+ * snapshots correct the same spend rather than double counting it.
  */
 import { MessageId } from '@deepseek-ai/dsh-llm'
 import { SessionSeq, SessionLogOffset, type SessionEvent, type TurnEndReason } from '@deepseek-ai/dsh-session'
@@ -13,6 +21,10 @@ import type { MaestroCliId } from './wire.js'
 
 export const CLI_CHILD_RECORD_EVENT = 'maestro/cli-child'
 export const CLI_CHILD_PENDING_CAP = 256
+/** Minimum spacing between two running snapshots of the same task. */
+export const CLI_CHILD_PROGRESS_INTERVAL_MS = 30_000
+/** Upper bound on progress events per task (240 × 30s ≈ two hours). */
+export const CLI_CHILD_PROGRESS_CAP = 240
 /**
  * This module NEVER appends a private `maestro/*` event to a session. The
  * installed host's `Session.append` accepts only surfaceOp/sourceEventSeqs and
@@ -53,6 +65,12 @@ export interface ChildSessionSettleInput {
   readonly route?: { readonly provider: string; readonly model: string } | undefined
   readonly finalText?: string | undefined
 }
+/** One running snapshot: the same counters the board card already shows. */
+export interface ChildSessionProgressInput {
+  readonly taskId: string
+  readonly stats: ChildSessionUsageStats
+  readonly route?: { readonly provider: string; readonly model: string } | undefined
+}
 /** Preserve the actual terminal outcome without inventing a cancellation cause. */
 export function cliChildTurnEndReason(ok: boolean, phase?: string): TurnEndReason {
   if (phase === 'cancelled') return { kind: 'aborted', reason: { kind: 'legacy' } }
@@ -63,6 +81,8 @@ export function cliChildTurnEndReason(ok: boolean, phase?: string): TurnEndReaso
 }
 export interface ChildSessionRecorder {
   start(input: ChildSessionStartInput): void
+  /** Publish the running cumulative snapshot to the child log (best effort). */
+  progress?(input: ChildSessionProgressInput): void
   settle(input: ChildSessionSettleInput): void
   /** Retry pending terminal appends and parent publication; NOT a disk replay. */
   flushPending?(): number
@@ -84,6 +104,12 @@ interface LiveRecord {
   pending?: readonly PendingAppend[]
   nextAppend: number
   appending: boolean
+  /** Whether the running snapshot already opened turn/start, route and step. */
+  progressOpened: boolean
+  progressCount: number
+  progressAt: number
+  /** Serialized last snapshot: an unchanged total is not written again. */
+  progressKey: string
 }
 interface PendingAppend {
   readonly type: string
@@ -208,6 +234,7 @@ export function createChildSessionRecorder(parts: ChildSessionRecorderParts): Ch
           session, taskId: input.taskId, parentSessionId, childSessionId: id, source, usageId,
           label: input.label, startedAt: input.startedAt ?? now,
           nextAppend: 0, appending: false,
+          progressOpened: false, progressCount: 0, progressAt: 0, progressKey: '',
         })
         const data = { version: 0, childId: id, childCreatedAt: createdAt, mode: 'one-shot', label: input.label }
         const parent = input.parentSession ?? store.get?.(parentSessionId)
@@ -226,6 +253,40 @@ export function createChildSessionRecorder(parts: ChildSessionRecorderParts): Ch
         }
       } catch (error) { warn('recording', error) }
     },
+    progress(input) {
+      const record = live.get(input.taskId)
+      // 终态方案已冻结（settle 已排队或已写完）：运行期快照到此为止。
+      if (record === undefined || record.pending !== undefined) return
+      if (record.progressCount >= CLI_CHILD_PROGRESS_CAP) return
+      const route = usableRoute(input.route)
+      // 没有 route 就没有模型归属；留给结算，别写一条记不到模型的消费。
+      if (route === undefined) return
+      const usage = usageSampleOf(input.stats)
+      // 不完整的样本不落盘：半桶计数写成整桶比没有更糟。
+      if (usage === undefined) return
+      const key = JSON.stringify(usage)
+      const now = Date.now()
+      // 两次快照之间至少隔一个间隔；总量没变就不重复写。
+      if (record.progressOpened && (key === record.progressKey || now - record.progressAt < CLI_CHILD_PROGRESS_INTERVAL_MS)) return
+      try {
+        if (!record.progressOpened) {
+          record.session.append('turn/start', { turn: 1 })
+          record.session.append('request/context', route)
+          record.session.append('step/start', { turn: 1, step: 1 })
+          record.progressOpened = true
+        }
+        record.session.append('assistant/attempt', { turn: 1, step: 1,
+          stream: [{ type: 'chunk', time: now, chunk: { type: 'usage', usage } }],
+        })
+        record.progressCount += 1
+        record.progressAt = now
+        record.progressKey = key
+      } catch (error) {
+        // 进度是锦上添花：写失败就停掉这条任务的进度，别每帧再试。
+        record.progressCount = CLI_CHILD_PROGRESS_CAP
+        warn('progress', error)
+      }
+    },
     settle(input) {
       const record = live.get(input.taskId)
       if (record === undefined) return
@@ -239,9 +300,13 @@ export function createChildSessionRecorder(parts: ChildSessionRecorderParts): Ch
         // No route means no native attribution. Preserve those counters only in
         // the canonical ledger, rather than publishing an unowned native charge.
         const usage = identityMatches && route !== undefined ? usageSampleOf(input.stats) : undefined
-        const events: PendingAppend[] = [{ type: 'turn/start', data: { turn: 1 } }]
-        if (route !== undefined) events.push({ type: 'request/context', data: route })
-        events.push({ type: 'step/start', data: { turn: 1, step: 1 } })
+        const events: PendingAppend[] = record.progressOpened
+          ? []
+          : [{ type: 'turn/start', data: { turn: 1 } }]
+        // 运行期进度已经写过开启边界：同一个 (turn, step) 只留一个 turn/start
+        // 和 step/start，结算只补终局样本与关闭事件。
+        if (!record.progressOpened && route !== undefined) events.push({ type: 'request/context', data: route })
+        if (!record.progressOpened) events.push({ type: 'step/start', data: { turn: 1, step: 1 } })
         const finalText = input.finalText?.trim() ?? ''
         if (input.ok && route !== undefined && finalText !== '') {
           events.push({ type: 'assistant/message', data: {

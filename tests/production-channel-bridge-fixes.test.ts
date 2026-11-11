@@ -56,11 +56,15 @@ describe('production fixes: bridge authorization and resources', () => {
     expect(await f.bridge.loadSkill(bound.token, 'test', temp())).toMatchObject({ ok: false, status: 403 })
     expect(await f.bridge.callTool(bound.token, 'web_search', { cwd: '/attacker', agent: { id: 'attacker' }, parent: 'not-a-symbol' })).toMatchObject({ ok: true })
     expect(schemas).toHaveBeenCalledWith(context.agent)
-    const input = execute.mock.calls[0]![0] as unknown as Record<string, unknown>
-    expect(input).toMatchObject({ agent: context.agent, callId: expect.stringContaining('maestro:bridge:') })
+    const input = execute.mock.calls[0]![0] as unknown as { agent: unknown; calls: Array<Record<string, unknown>> }
+    expect(input).toMatchObject({ agent: context.agent })
+    // The registry settles batches; a one-element `calls` array is the contract.
+    expect(input.calls).toHaveLength(1)
+    expect(input.calls[0]!['id']).toEqual(expect.stringContaining('maestro:bridge:'))
+    expect(input.calls[0]!['name']).toBe('web_search')
     expect(input).not.toHaveProperty('cwd')
     expect(input).not.toHaveProperty('parent')
-    expect(input['arguments']).toMatchObject({ cwd: '/attacker', agent: { id: 'attacker' }, parent: 'not-a-symbol' })
+    expect(input.calls[0]!['arguments']).toMatchObject({ cwd: '/attacker', agent: { id: 'attacker' }, parent: 'not-a-symbol' })
     f.bridge.revoke(run.token); f.bridge.revoke(bound.token)
   })
 

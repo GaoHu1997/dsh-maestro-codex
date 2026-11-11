@@ -511,6 +511,17 @@ function DshModelSelect(props: {
     : ['openai-responses', 'openai-completions']
   const providers = props.providers ?? []
   const mappable = providers.filter(provider => provider.mappable && usableApis.includes(provider.api))
+  // One route may carry several endpoints of the same address family (the
+  // official profile address plus a think-level one). A CLI only ever speaks
+  // one family per run, so fold them: the host entry sorts first and wins.
+  const seenFamilies = new Set<string>()
+  const offered = mappable.filter(provider => {
+    const family = provider.api === 'anthropic-messages' ? 'anthropic' : 'openai'
+    const key = `${provider.id}::${family}`
+    if (seenFamilies.has(key)) return false
+    seenFamilies.add(key)
+    return true
+  })
   // No `hint` and no `wide`: the label alone, and the thinking level sits to
   // the right of this picker on the same row (see the 模型 group), so each
   // takes half the row.
@@ -518,8 +529,8 @@ function DshModelSelect(props: {
     <Field label="dsh 模型">
       <select className="dmc-select" value={props.value} onChange={event => { props.onChange(event.target.value) }}>
         <option value="">沿用主代理模型（主代理协议不兼容时任务直接报错）</option>
-        {mappable.map(provider => (
-          <optgroup key={provider.id} label={`${provider.displayName}（${provider.api}${provider.models.length === 0 ? '' : ` · ${String(provider.models.length)} 个模型`}）`}>
+        {offered.map(provider => (
+          <optgroup key={`${provider.id}::${provider.api}::${provider.origin ?? 'host'}`} label={`${provider.displayName}（${provider.api}${provider.models.length === 0 ? '' : ` · ${String(provider.models.length)} 个模型`}${provider.origin === 'think-level' ? ' · 多端点' : ''}）`}>
             {provider.models.map(model => (
               <option key={`${provider.id}::${model.id}`} value={`${provider.id}::${model.id}`}>{model.id}</option>
             ))}

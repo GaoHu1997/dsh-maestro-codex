@@ -1,6 +1,6 @@
-import { describe, expect, it, vi } from 'vitest'
+import { describe, expect, it, vi, afterEach } from 'vitest'
 import { Session } from '@deepseek-ai/dsh-session'
-import { CLI_CHILD_RECORD_EVENT, createChildSessionRecorder, type ChildSessionAppend, type ChildSessionStoreFace } from '../src/child-session.js'
+import { CLI_CHILD_PROGRESS_CAP, CLI_CHILD_RECORD_EVENT, createChildSessionRecorder, type ChildSessionAppend, type ChildSessionStoreFace } from '../src/child-session.js'
 
 interface RecordedEvent { readonly type: string; readonly data: Record<string, unknown>; readonly opts: { surfaceOp?: 'append' } | undefined; readonly ignorable?: true }
 interface FakeSession { readonly id: string; readonly meta: { cwd?: string; parentSession?: string; origin?: string } | undefined; readonly events: RecordedEvent[] }
@@ -272,6 +272,136 @@ describe('real installed Session append contract (not cross-plugin R acceptance)
     expect(markers[0]?.ignorable).toBe(true)
     expect(parent.seq).toBe(1)
     expect(() => Session.create('cli-task-1', committed as Parameters<typeof Session.create>[1])).not.toThrow()
+  })
+  it('accepts running snapshots and a settlement that only closes the opened step', () => {
+    const sessions = new Map<string, Session>()
+    const committed: unknown[] = []
+    const parent = Session.create('real-parent')
+    const wrap = (session: Session): ChildSessionAppend => ({ header: session.header,
+      append(type, data, opts) {
+        const append = session.append.bind(session) as unknown as ChildSessionAppend['append']
+        const result = opts === undefined ? append(type, data) : append(type, data, opts)
+        if (session.id !== 'real-parent') committed.push(result)
+        return result
+      },
+    })
+    const store: ChildSessionStoreFace = { create(id, options) {
+      const session = Session.create(id, options?.seed, undefined, options?.inheritedEventCount)
+      committed.push(...session.snapshotEvents())
+      sessions.set(id, session); return wrap(session)
+    }, get(id) { return id === 'real-parent' ? wrap(parent) : undefined } }
+    const warn = vi.fn()
+    const child = createChildSessionRecorder({ store: () => store, readConfig: () => ({ recordChildSessions: true }), logger: { warn } })
+    child.start({ ...START, parentSessionId: 'real-parent', parentSession: wrap(parent) })
+    vi.useFakeTimers()
+    vi.setSystemTime(new Date('2026-11-11T00:00:00Z'))
+    child.progress?.({ taskId: 'task-1', stats: USAGE, route: ROUTE })
+    vi.setSystemTime(new Date('2026-11-11T00:00:31Z'))
+    child.progress?.({ taskId: 'task-1', stats: { ...USAGE, outputTokens: 400 }, route: ROUTE })
+    child.settle({ taskId: 'task-1', ok: true, stats: USAGE, route: ROUTE, finalText: 'ok' })
+    vi.useRealTimers()
+    expect(warn).not.toHaveBeenCalled()
+    const events = sessions.get('cli-task-1')?.snapshotEvents() ?? []
+    expect(events.filter(event => event.type === 'turn/start')).toHaveLength(1)
+    expect(events.filter(event => event.type === 'step/start')).toHaveLength(1)
+    expect(events.filter(event => event.type === 'assistant/attempt')).toHaveLength(2)
+    expect(events.filter(event => event.type === 'assistant/message')).toHaveLength(1)
+    expect(() => Session.create('cli-task-1', committed as Parameters<typeof Session.create>[1])).not.toThrow()
+  })
+})
+
+describe('CLI running progress', () => {
+  const at = (time: string): void => { vi.setSystemTime(new Date(time)) }
+  afterEach(() => { vi.useRealTimers() })
+
+  it('opens the step once and replaces the same running snapshot instead of repeating it', () => {
+    vi.useFakeTimers()
+    at('2026-11-11T00:00:00Z')
+    const fake = fakeStore()
+    const child = recorder(fake.store)
+    child.start({ ...START, parentSession: fake.parent })
+    child.progress?.({ taskId: 'task-1', stats: USAGE, route: ROUTE })
+    child.progress?.({ taskId: 'task-1', stats: USAGE, route: ROUTE })
+    const all = fake.sessions.get('cli-task-1')?.events ?? []
+    expect(all.filter(e => e.type === 'turn/start')).toHaveLength(1)
+    expect(all.filter(e => e.type === 'request/context')).toHaveLength(1)
+    expect(all.filter(e => e.type === 'step/start')).toHaveLength(1)
+    expect(all.filter(e => e.type === 'assistant/attempt')).toHaveLength(1)
+    expect(all.find(e => e.type === 'assistant/attempt')?.data).toEqual({ turn: 1, step: 1,
+      stream: [{ type: 'chunk', time: Date.now(), chunk: { type: 'usage', usage: { inputTokens: 1200, outputTokens: 340, cacheReadTokens: 56, cacheWriteTokens: 7 } } }] })
+  })
+  it('appends a newer sample after the interval without reopening the step', () => {
+    vi.useFakeTimers()
+    at('2026-11-11T00:00:00Z')
+    const fake = fakeStore()
+    const child = recorder(fake.store)
+    child.start({ ...START, parentSession: fake.parent })
+    child.progress?.({ taskId: 'task-1', stats: USAGE, route: ROUTE })
+    at('2026-11-11T00:00:31Z')
+    child.progress?.({ taskId: 'task-1', stats: { ...USAGE, outputTokens: 410 }, route: ROUTE })
+    const all = fake.sessions.get('cli-task-1')?.events ?? []
+    expect(all.filter(e => e.type === 'assistant/attempt')).toHaveLength(2)
+    expect(all.filter(e => e.type === 'turn/start')).toHaveLength(1)
+    expect(all.filter(e => e.type === 'step/start')).toHaveLength(1)
+    expect(all.at(-1)?.data).toMatchObject({ stream: [{ chunk: { usage: { outputTokens: 410 } } }] })
+  })
+  it('does not grow the log when the total did not move', () => {
+    vi.useFakeTimers()
+    at('2026-11-11T00:00:00Z')
+    const fake = fakeStore()
+    const child = recorder(fake.store)
+    child.start({ ...START, parentSession: fake.parent })
+    child.progress?.({ taskId: 'task-1', stats: USAGE, route: ROUTE })
+    at('2026-11-11T00:01:00Z')
+    child.progress?.({ taskId: 'task-1', stats: USAGE, route: ROUTE })
+    expect((fake.sessions.get('cli-task-1')?.events ?? []).filter(e => e.type === 'assistant/attempt')).toHaveLength(1)
+  })
+  it.each([
+    ['no route', { stats: USAGE }],
+    ['incomplete sample', { stats: { outputTokens: 5 }, route: ROUTE }],
+    ['inclusive input semantics', { stats: { inputTokens: 5, outputTokens: 5, usageInputSemantics: 'includes-cache' }, route: ROUTE }],
+  ])('writes nothing it cannot attribute: %s', (_name, input) => {
+    const fake = fakeStore()
+    const child = recorder(fake.store)
+    child.start({ ...START, parentSession: fake.parent })
+    child.progress?.({ taskId: 'task-1', ...input } as Parameters<NonNullable<typeof child.progress>>[0])
+    const all = fake.sessions.get('cli-task-1')?.events ?? []
+    expect(all.filter(e => e.type === 'assistant/attempt')).toHaveLength(0)
+    expect(all.filter(e => e.type === 'turn/start')).toHaveLength(0)
+  })
+  it('settles on top of an opened step without a second turn/start', () => {
+    vi.useFakeTimers()
+    at('2026-11-11T00:00:00Z')
+    const fake = fakeStore()
+    const child = recorder(fake.store)
+    child.start({ ...START, parentSession: fake.parent })
+    child.progress?.({ taskId: 'task-1', stats: USAGE, route: ROUTE })
+    child.settle({ taskId: 'task-1', ok: true, stats: USAGE, route: ROUTE, finalText: '完成了' })
+    const all = fake.sessions.get('cli-task-1')?.events ?? []
+    expect(all.map(e => e.type)).toEqual(['user/message', CLI_CHILD_RECORD_EVENT, 'session/title',
+      'turn/start', 'request/context', 'step/start', 'assistant/attempt', 'assistant/message', 'step/end', 'turn/end'])
+  })
+  it('stops after the per-task cap', () => {
+    vi.useFakeTimers()
+    at('2026-11-11T00:00:00Z')
+    const fake = fakeStore()
+    const child = recorder(fake.store)
+    child.start({ ...START, parentSession: fake.parent })
+    for (let index = 0; index < CLI_CHILD_PROGRESS_CAP + 5; index++) {
+      at(new Date(Date.UTC(2026, 10, 11, 0, 0, 0) + index * 31_000).toISOString())
+      child.progress?.({ taskId: 'task-1', stats: { ...USAGE, outputTokens: 340 + index }, route: ROUTE })
+    }
+    expect((fake.sessions.get('cli-task-1')?.events ?? []).filter(e => e.type === 'assistant/attempt')).toHaveLength(CLI_CHILD_PROGRESS_CAP)
+  })
+  it('ignores progress for a task that is not live or already settling', () => {
+    const fake = fakeStore()
+    const child = recorder(fake.store)
+    child.progress?.({ taskId: 'task-1', stats: USAGE, route: ROUTE })
+    child.start({ ...START, parentSession: fake.parent })
+    child.settle({ taskId: 'task-1', ok: false, stats: USAGE, route: ROUTE })
+    const before = (fake.sessions.get('cli-task-1')?.events ?? []).length
+    child.progress?.({ taskId: 'task-1', stats: { ...USAGE, outputTokens: 999 }, route: ROUTE })
+    expect((fake.sessions.get('cli-task-1')?.events ?? []).length).toBe(before)
   })
 })
 

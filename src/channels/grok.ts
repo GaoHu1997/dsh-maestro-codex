@@ -140,6 +140,22 @@ export function grokPermissionArgs(permissionMode: GrokPermissionMode): string[]
   return ['--permission-mode', permissionMode]
 }
 
+/**
+ * The warning a headless grok run needs when it keeps the CLI's own default.
+ *
+ * `grok -p` reports `permissionMode: "default"` in its init frame (measured
+ * against grok 1.0.77), and a headless run has no approver: shell, file writes
+ * and MCP calls that need approval fail one by one. `inherit` is exactly that
+ * situation, so the dispatch says so instead of letting the child spin.
+ */
+export function grokPermissionWarning(permissionMode: GrokPermissionMode): string | undefined {
+  if (permissionMode !== 'inherit' && permissionMode !== 'default') return undefined
+  return [
+    `grok 权限模式为 ${permissionMode}：headless 运行沿用 grok 自身的 default，没有审批人，需要批准的命令与写文件会被逐条拒绝。`,
+    '需要它真正动手时，请把 grok 权限模式显式设为 dontAsk 或 bypassPermissions（只读任务可保持现状）。',
+  ].join('')
+}
+
 /** The argv for one headless run (before the resolved path is prepended). */
 export function grokArgs(model: string, permissionMode: GrokPermissionMode, thinking?: string, resume?: string, allowRules?: readonly string[]): string[] {
   // `-p -` reads the prompt from stdin — no quoting surface for task text.

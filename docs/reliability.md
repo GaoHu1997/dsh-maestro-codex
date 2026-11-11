@@ -100,11 +100,34 @@ Claude 与 Grok 通道复用同一条恢复期限（`src/recovery-budget.ts`）�
 
 CLI 之外的宿主调用同样不能无限等待——它们没有进程可杀，旧实现遇到不响应 `AbortSignal` 的实现或卡住的文件系统会永远挂起，工具调用一样不返回。`src/deadline.ts` 的 `awaitWithin` 只保证「等到期限就返回」，并把同一个 signal 继续往下传；底层晚到的结算只被消费，不会变成未处理拒绝，也不表示底层副作用已被物理终止。
 
-- 桥接（`src/bridge.ts`）：技能目录发现 20 秒、技能读取 20 秒、宿主工具执行 10 分钟、原生技能清理 30 秒。发现超时按空目录继续；读取/执行超时返回 504 并说明底层可能仍在运行；鉴权（401）与脱敏（500）语义不变。
+- 桥接（`src/bridge.ts`）：技能目录发现 20 秒、技能读取 20 秒、宿主工具执行 10 分钟、原生技能清理 30 秒。发现超时按空目录继续；读取/执行超时返回 504 并说明底层可能仍在运行；鉴权（401）语义不变。宿主工具**抛异常**时，异常摘要（类型 + message，截断 400 字）同时进 `warn` 日志和子代理的报错正文——旧文案「详细错误未向子代理公开」只会让子代理换工具重试，在会话里堆出几十条同义报错。
 - 派发收尾（`src/dispatch.ts`）：启动记账 30 秒、结算/清理 30 秒、取消后结算冲洗 5 秒。开始用量记账超时会按失败关闭本次派发；结算用量超时仍保留已完成的结果，只把记账标为未确认并给出告警，不重试、不伪造 `0`。
 - `dsh_bridge` 垫片（`src/bridge-shim.ts`）：单次请求的 fetch 与响应体共用一个期限（目录 20 秒、工具调用 15 分钟），响应头到达不等于响应体到达；stdin 关闭时中止所有在途请求，并在最多 2 秒的冲洗窗口后退出，不再等待绝不返回的 HTTP 调用。
 - Grok 运行前的文件系统步骤（`src/channels/grok.ts`）：会话目录准备、`config.toml` 写入、跨进程 `.maestro-run.lock` 租约获取与清理各 30 秒。超时按失败处理（不会带着未确认的租约硬跑），finally 仍会释放进程内 home 门锁，避免同目录队列被永久占住。Claude 的一次性 settings 文件清理有 5 秒上限，清理超时不会掩盖已完成的运行结果。
 - MCP 环境垫片（`src/mcp-env-shim.ts`）：收到 SIGINT/SIGTERM 后转发给 MCP 子进程，5 秒内仍未退出则升级 SIGKILL；子进程退出即以它的退出码结束垫片，避免继承的 stdio 让垫片在取消后继续存活。
+
+## 13. 宿主工具结算契约（`src/bridge.ts`）
+
+`dsh_bridge` 的 `callTool` 走的是宿主 `ctx.tools.execute`，而它是**批量**执行器：入参是 `{ calls: [{ id, name, arguments }], agent, signal }`，经 `executeToolBatch` 逐条派发，返回 `{ results: [{ callId, result }] }`。单次调用也要包成单元素批量——这是宿主自己文档写明的形式。
+
+旧实现传的是单个 `{ callId, name, arguments }`，`executeToolBatch` 解构出的 `calls` 是 `undefined`，`calls.map` 直接抛 `TypeError`，于是**每一次**桥接工具调用都在工具体执行之前就失败，对外只剩一句脱敏的 500。技能走的是另一条通道（`bridge.loadSkill`），所以「技能能用、工具全挂」曾是这个 bug 的典型症状；`skill_*` 全绿、`web_search`/`web_fetch`/`list_mcp_resources` 全红，就是它。
+
+现在的约束：
+
+- `ToolsFace.execute` 的类型只接受 `HostToolBatch`；传单调用对象在编译期就不成立。
+- `hostToolOutcomeOf` 把结算投影回本次 `callId`：`batch` 按 id 匹配，`single`（`{ content, isError }`）继续兼容，其他一律 `unknown`——不会把不认识的返回当成空成功。
+- 每次调用把观察到的形状记进 `BridgeState.lastHostToolContract`，`/models` 诊断里的 `bridge.hostToolContract` 直接显示；宿主换契约时它是第一现场的证据。
+- `tests/bridge-host-contract.test.ts` 断言**出参形状**（`calls` 数组），不只断言投影后的文本；测试 fixture 也统一成批量形状，避免"假 execute 掩盖真契约"。
+
+## 14. headless 权限模式
+
+`claude -p` 与 `grok -p` 在没有任何权限参数时，init 帧报的都是 `permissionMode: "default"`（实测 claude 2.1.318、grok 1.0.77）。headless 运行没有审批人，default 模式下 Bash、写文件、WebSearch/WebFetch 会被**逐条拒绝**：任务不失败，子代理只是空转，在会话里留下一长串 `This command requires approval` / `requested permissions to use ...`。
+
+因此：
+
+- `claudePermissionMode` 的默认值是 `bypassPermissions`（`src/config.ts`），对应 `--dangerously-skip-permissions`。`inherit` / `default` 仍然可用——只读任务确实可能想要它们——但它们不再被当成"安全默认"。
+- 派发期兜底：`claudePermissionWarning` / `grokPermissionWarning` 在 spawn 之前把「这轮会因权限空转」作为 note 推进事件流（`src/dispatch.ts`），配错的人第一眼就看见，而不是从 40 条工具失败里反推。
+- 权限模式的选择器逻辑本身不变（`claudePermissionArgs` / `grokPermissionArgs` 在 `inherit`/`default` 下依旧不发参数）：默认值改的是"没人选的时候用哪个"，不是替用户覆盖显式选择。
 
 ## 兼容性
 
@@ -165,4 +188,5 @@ test "$actual" = "$published"
 | `tests/claude-reconnect.test.ts` | Claude 重连期限：持续诊断终止、真实帧后保留 idle 保护 |
 | `tests/process-close.test.ts` | 进程收尾：超时/取消无 close 有界、尾行刷新、prepare 镜像 |
 | `tests/bridge-shim-bounds.test.ts` | 垫片请求/响应体期限、EOF 中止、notifications/cancelled |
+| `tests/bridge-host-contract.test.ts` | 宿主工具结算契约：`calls` 出参形状、batch/single/unknown 投影、异常摘要透传、`hostToolContract` 诊断 |
 | `tests/dispatch-io-bounds.test.ts` | 启动/结算宿主 IO 永不返回时的有界返回与资源释放 |

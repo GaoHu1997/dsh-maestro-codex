@@ -29,7 +29,9 @@ describe('effectiveOf', () => {
     const effective = effectiveOf({})
     expect(effective.enabled).toBe(true)
     expect(effective.defaultCli).toBe('claude')
-    expect(effective.claude.permissionMode).toBe('inherit')
+    // A headless claude run has no approver: the default must be a mode that can
+    // actually execute, or every Bash/Write/Web call is denied one by one.
+    expect(effective.claude.permissionMode).toBe('bypassPermissions')
     expect(effective.codex.sandbox).toBe('workspace-write')
     expect(effective.maxConcurrentTasks).toBe(2)
   })

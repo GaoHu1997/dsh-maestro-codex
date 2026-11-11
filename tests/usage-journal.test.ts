@@ -1,4 +1,4 @@
-import { mkdtemp, readdir, readFile, rm } from 'node:fs/promises'
+import { mkdtemp, readdir, readFile, rm, mkdir, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
@@ -62,5 +62,32 @@ describe('canonical journal and restart-safe display mirrors', () => {
     expect(definition.wire.view(definition.apply(state, { type: CLI_USAGE_EVENT, data: cliUsageRecordOf(task('parent-B')) })).totals.requests).toBe(1)
     await expect(journal.publish(Session.create('parent-B'), 'parent-A')).rejects.toThrow('不属于')
     expect(journal.status().records).toBe(2)
+  })
+
+  it('sees another process settlement on an incremental refresh', async () => {
+    const writer = new UsageJournal(home)
+    await writer.begin(task())
+    const reader = new UsageJournal(home)
+    await reader.load()
+    // 读者只见到未完成的标记：这一轮没有结算记录可读。
+    expect(reader.status()).toMatchObject({ records: 0, incomplete: 1, corrupt: 0 })
+    await writer.settle(task())
+    // 增量刷新必须读到新文件名，并在标记被 unlink 后清掉 incomplete。
+    await reader.refresh()
+    expect(reader.status()).toMatchObject({ records: 1, incomplete: 0, corrupt: 0 })
+    expect(reader.snapshot('parent-A').totals.requests).toBe(1)
+  })
+
+  it('keeps a corrupt name classified and still picks up later settlements', async () => {
+    const directory = new UsageJournal(home).directory
+    await mkdir(directory, { recursive: true })
+    await writeFile(join(directory, `${'a'.repeat(64)}.json`), '{"version":1,"record":{}}', 'utf8')
+    const journal = new UsageJournal(home)
+    await journal.load()
+    expect(journal.status().corrupt).toBe(1)
+    await journal.settle(task())
+    await journal.refresh()
+    // 坏名字只判定一次，但不影响新结算入库。
+    expect(journal.status()).toMatchObject({ records: 1, incomplete: 0, corrupt: 1 })
   })
 })

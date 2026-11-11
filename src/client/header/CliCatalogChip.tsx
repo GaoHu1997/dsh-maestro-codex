@@ -29,7 +29,7 @@ import { SessionPage } from '../board/Session.js'
 import { hasBoardTranscriptAside, jumpBoardAddress, jumpBoardCliSession } from '../board/bridge.js'
 import type { SidebarSubagentAddress } from '../board/upstream/context-types.js'
 
-import { type MaestroTaskSummary } from '../../wire.js'
+import { TERMINAL_PHASES, type MaestroTaskSummary } from '../../wire.js'
 import {
   formatDuration, formatTokens, taskDuration, timingSummary,
   type BoardCatalogEntry, type BoardTokenUsage,
@@ -206,12 +206,25 @@ export function CliCatalogChip(props: { readonly sessionId?: string; readonly ho
   const access = useCliAccess(list, sessionId)
   const [sessionTask, setSessionTask] = useState<HeaderRow | undefined>(undefined)
   useEffect(() => { setSessionTask(undefined); setOpen(false); setOpenError(undefined) }, [sessionId, access?.token])
-  const now = useNow(true)
-  const tasks = useCliTasks(true, sessionId === undefined ? undefined : [sessionId], access)
+  const tasks = useCliTasks(sessionId !== undefined, sessionId === undefined ? undefined : [sessionId], access)
   const nativeAside = hasBoardTranscriptAside(host ?? EMPTY_HOST)
 
   const session = sessionId === undefined ? undefined : list.byId[sessionId]
   const isChild = session?.origin === 'subagent'
+
+  // 只有真的在跑的任务/子会话才需要每秒推进耗时。空闲时完全停表：页头 chip
+  // 常驻会话页，每秒 setState 一次会让整块 header 跟着重渲染，而打字也发生在
+  // 同一个 renderer 主线程上。已结算的耗时是静态值，不依赖“现在”。
+  const ticking = useMemo<boolean>(() => {
+    if (tasks.tasks.some(task => !(TERMINAL_PHASES as readonly string[]).includes(task.phase))) return true
+    if (sessionId === undefined) return false
+    const projections = list.projectionsBySession ?? {}
+    const catalog = projections[sessionId]?.values.subagentCatalog ?? []
+    return catalog.some(entry => entry.mode !== 'external'
+      && (list.byId[entry.id]?.running === true
+        || projections[entry.id]?.values.subagentTiming?.active !== undefined))
+  }, [tasks.tasks, list, sessionId])
+  const now = useNow(ticking)
 
   const rows = useMemo<HeaderRow[]>(() => {
     if (sessionId === undefined || list.byId[sessionId] === undefined) return []

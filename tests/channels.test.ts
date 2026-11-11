@@ -3,9 +3,9 @@ import { mkdirSync, readFileSync, rmSync, statSync, unlinkSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { describe, expect, it } from 'vitest'
-import { claudeArgs, claudeEnv, claudeFrameEvents, claudeMcpArgs, claudePermissionArgs, claudeResultOf, lastLines, mergeLiveUsage, runClaudeTask, writeClaudeSettingsFile } from '../src/channels/claude.js'
+import { claudeArgs, claudeEnv, claudeFrameEvents, claudeMcpArgs, claudePermissionArgs, claudePermissionWarning, claudeResultOf, lastLines, mergeLiveUsage, runClaudeTask, writeClaudeSettingsFile } from '../src/channels/claude.js'
 import { codexArgs, codexDshModelArgs, codexEnv, codexFrameEvents, codexSandboxArgs, codexWindowsSandboxArgs, codexUsageStats, runCodexTask, tomlString } from '../src/channels/codex.js'
-import { grokArgs, grokEnv, grokFrameEvents, grokHomeConfig, grokHomeOf, grokMcpEnv, runGrokTask } from '../src/channels/grok.js'
+import { grokArgs, grokEnv, grokFrameEvents, grokHomeConfig, grokHomeOf, grokMcpEnv, grokPermissionWarning, runGrokTask } from '../src/channels/grok.js'
 import { scriptedSpawn } from './fake-child.js'
 
 describe('channel usage normalization', () => {
@@ -87,6 +87,16 @@ describe('claude argv/env', () => {
     expect(claudePermissionArgs('acceptEdits')).toEqual(['--permission-mode', 'acceptEdits'])
     expect(claudePermissionArgs('plan')).toEqual(['--permission-mode', 'plan'])
     expect(claudePermissionArgs('bypassPermissions')).toEqual(['--dangerously-skip-permissions'])
+  })
+
+  it('warns only for the modes that cannot approve anything headless', () => {
+    // `claude -p` reports permissionMode "default" and has no approver; those two
+    // modes deny every shell/write/web call. Every other mode can act.
+    expect(claudePermissionWarning('inherit')).toContain('bypassPermissions')
+    expect(claudePermissionWarning('default')).toContain('headless')
+    for (const mode of ['acceptEdits', 'plan', 'bypassPermissions'] as const) {
+      expect(claudePermissionWarning(mode)).toBeUndefined()
+    }
   })
 
   it('only sets provider env when configured', () => {
@@ -743,6 +753,16 @@ describe('grok argv/env', () => {
     const bypass = grokArgs('', 'bypassPermissions')
     expect(bypass).toContain('--permission-mode')
     expect(bypass).toContain('bypassPermissions')
+  })
+
+  it('warns when grok would keep its own headless default', () => {
+    // grok 1.0.77 reports permissionMode "default" in its init frame; inherit
+    // means exactly that, and a headless run cannot answer an approval prompt.
+    expect(grokPermissionWarning('inherit')).toContain('dontAsk')
+    expect(grokPermissionWarning('default')).toContain('headless')
+    for (const mode of ['acceptEdits', 'dontAsk', 'bypassPermissions', 'auto', 'plan'] as const) {
+      expect(grokPermissionWarning(mode)).toBeUndefined()
+    }
   })
 
   it('points grok at the dsh provider through env and isolates the run into GROK_HOME', () => {
