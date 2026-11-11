@@ -1493,11 +1493,14 @@ function MaestroCardContent(props: MaestroCardProps): ReactNode {
                     value={String(values.bridgeTools ?? 'auto')}
                     options={[
                       { value: 'auto', label: '自动（排除 shell/文件/会话类）' },
+                      { value: 'scoped', label: '文件工具（限定任务目录）' },
                       { value: 'custom', label: '自定义白名单' },
                       { value: 'off', label: '关闭' },
                     ]}
                     onChange={value => { actions.setImmediate('bridgeTools', value) }}
-                    hint="子代理经 dsh_bridge 调用宿主工具（走审批）；MCP 工具不重复桥接。"
+                    hint={String(values.bridgeTools ?? 'auto') === 'scoped'
+                      ? '最多桥接 12 个已对父代理公开的 ops_ 文件工具；相对路径与省略的搜索根绑定任务 cwd，越界返回 403。缺失工具需在宿主先选择，再重新派发。'
+                      : '子代理经 dsh_bridge 调用宿主工具（走审批）；自动模式不含 ops_、shell 与文件类工具，需要改文件时选「文件工具」或自定义白名单。'}
                   />
                   <SelectField
                     label="claude 技能加载方式"

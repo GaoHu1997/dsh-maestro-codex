@@ -18,7 +18,7 @@ import { RoutingError, assertTaskDifficulty, pickCli, taskDifficultyError } from
 import { isTerminalPhase, Limiter, TaskRegistry, type MaestroTask as TaskRegistryTask } from './task-registry.js'
 import type { SpawnFn } from './spawn.js'
 import { writeClaudeMcpConfig, unlinkQuiet, type DshMcpServer } from './mcp.js'
-import { skillCatalogText, type BridgeHandle, type NativeSkillsStaging } from './bridge.js'
+import { SCOPED_FS_TOOLS, skillCatalogText, type BridgeHandle, type NativeSkillsStaging } from './bridge.js'
 import { gitContextFor } from './git-context.js'
 import type { DshPreflight } from './preflight.js'
 import { parseDshModelSelection, type DshModelEndpoint } from './dsh-models.js'
@@ -874,6 +874,10 @@ export async function runDispatch(deps: DispatchDeps, params: DispatchParams, si
                 callId: params.executionContext?.callId, rootCallId: params.executionContext?.rootCallId,
                 sessionId: params.sessionId, cwd, signal: abort.signal,
               })
+              if (bridgeRun === undefined && config.bridgeTools === 'scoped' && !bridgeNoted) {
+                bridgeNoted = true
+                onEvent('note', 'scoped 文件工具桥未挂载：没有可桥接的当前可见工具或缺少可信宿主执行上下文；请先确认宿主 Native 工具选择与桥接能力，再重新派发，不能承诺文件读写可用。')
+              }
               if (bridgeRun !== undefined) {
                 bridgeToken = bridgeRun.token
                 mcpServers = [...baseMcpServers, bridgeRun.entry]
@@ -884,14 +888,26 @@ export async function runDispatch(deps: DispatchDeps, params: DispatchParams, si
                   // "the child can edit files", and a silent 0 is the bug
                   // that made a dispatched task give up on host tools.
                   let toolCount = 0
+                  let toolNames: string[] = []
+                  let catalogError: string | undefined
                   try {
                     const catalog = await deps.bridge.catalog(bridgeToken, cwd)
-                    if (!('error' in catalog)) toolCount = catalog.tools.length
-                  } catch { toolCount = 0 }
+                    if ('error' in catalog) catalogError = catalog.error
+                    else { toolNames = catalog.tools.map(tool => tool.name); toolCount = toolNames.length }
+                  } catch { catalogError = '工具目录读取失败' }
                   abort.signal.throwIfAborted()
                   onEvent('note', toolCount > 0
                     ? `已挂载 dsh_bridge MCP 服务器（${String(toolCount)} 个宿主工具 + dsh 技能桥）`
                     : '已挂载 dsh_bridge MCP 服务器（宿主工具 0 个，仅技能桥；检查配置页「桥接宿主工具」模式）')
+                  if (config.bridgeTools === 'scoped') {
+                    const missing = SCOPED_FS_TOOLS.filter(name => !toolNames.includes(name))
+                    onEvent('note', catalogError !== undefined
+                      ? `scoped 文件工具目录不可用：${catalogError}；不能据此承诺 Native 文件读写能力`
+                      : `scoped 实际可见文件工具（${String(toolNames.length)}/${String(SCOPED_FS_TOOLS.length)}）：${toolNames.join(', ') || '无'}`)
+                    if (missing.length > 0) {
+                      onEvent('note', `scoped 未公开工具：${missing.join(', ')}。需要其中工具时，主代理须先在宿主按需选择并确认可见，再重新派发；当前令牌的目录不会扩张，不要改用 shell 绕过。`)
+                    }
+                  }
                 }
                 if (nativeSkills === undefined && config.bridgeSkills === true) {
                   abort.signal.throwIfAborted()

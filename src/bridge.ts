@@ -14,6 +14,8 @@
 import { createHash, randomUUID } from 'node:crypto'
 import { cp, mkdir, rm, writeFile } from 'node:fs/promises'
 import { basename, dirname, join, resolve, win32 } from 'node:path'
+import { prepareScopedToolArguments, SCOPED_FS_TOOLS } from './bridge-scoped.js'
+export { SCOPED_FS_TOOLS, scopedPathViolation } from './bridge-scoped.js'
 import type { ToolExec } from './tool.js'
 import { tmpdir } from 'node:os'
 import { fileURLToPath } from 'node:url'
@@ -90,14 +92,24 @@ const BRIDGE_TOOL_DENYLIST: readonly string[] = [
 /**
  * Whether a host tool may ride the bridge. `auto` mode: denylist + never MCP
  * tools (stdio ones ride the raw passthrough; http ones can be allowlisted in
- * custom mode, which is the only way they reach a child). `run_code` is the
- * registry's reserved PTC transport and never bridges.
+ * custom mode, which is the only way they reach a child). `scoped` mode: the
+ * fixed file-tool allowlist above, every call confined to the run cwd.
+ * `run_code` is the registry's reserved PTC transport and never bridges.
  */
-export function toolBridgable(name: string, mode: 'auto' | 'custom'): boolean {
+export function toolBridgable(name: string, mode: 'auto' | 'custom' | 'scoped'): boolean {
   if (name === '' || name === 'run_code') return false
   if (mode === 'custom') return true
+  if (mode === 'scoped') return SCOPED_FS_TOOLS.includes(name)
   if (name.startsWith('mcp__') || /^(?:ops_|job_|schedule_)/.test(name)) return false
   return !BRIDGE_TOOL_DENYLIST.includes(name)
+}
+
+/** The one place catalog and call-time checks agree on what a mode exposes. */
+export function toolBridgableIn(name: string, mode: string, allowlist: readonly string[]): boolean {
+  if (mode === 'off') return false
+  if (mode === 'scoped') return toolBridgable(name, 'scoped')
+  if (mode === 'custom') return toolBridgable(name, 'custom') && allowlist.includes(name)
+  return toolBridgable(name, 'auto')
 }
 
 /** Context budget guard: the child's context must not drown in tool schemas. */
@@ -194,10 +206,19 @@ export interface BridgeRunContext {
   readonly signal?: AbortSignal | undefined
 }
 
+type BridgeToolPolicy = Pick<EffectiveConfig, 'bridgeTools' | 'bridgeToolAllowlist'>
+class BridgeToolAdmissionError extends Error {
+  constructor(readonly status: number, message: string) { super(message) }
+}
+
 /** Per-run bridge state one token stands for. */
 interface BridgeRun {
   readonly includeSkills: boolean
   readonly includeTools: boolean
+  /** Issuance is the maximum authority; live configuration may only narrow it. */
+  readonly toolPolicy: BridgeToolPolicy | undefined
+  /** Once scoped, this token cannot later lose its task-directory boundary. */
+  scoped: boolean
   readonly context: BridgeRunContext
   readonly controller: AbortController
   readonly detach: () => void
@@ -209,12 +230,13 @@ interface BridgeRun {
 export class BridgeState {
   private readonly runs = new Map<string, BridgeRun>()
 
-  issue(includeSkills = true, includeTools = false, context: BridgeRunContext = {}): string {
+  issue(includeSkills = true, includeTools = false, context: BridgeRunContext = {}, policy?: BridgeToolPolicy): string {
     const token = `mb-${randomUUID()}`
     const controller = new AbortController()
     const abort = (): void => this.revoke(token)
     const detach = (): void => context.signal?.removeEventListener('abort', abort)
-    this.runs.set(token, { includeSkills, includeTools, context: { ...context }, controller, detach })
+    const toolPolicy = policy === undefined ? undefined : { bridgeTools: policy.bridgeTools, bridgeToolAllowlist: [...policy.bridgeToolAllowlist] }
+    this.runs.set(token, { includeSkills, includeTools, toolPolicy, scoped: policy?.bridgeTools === 'scoped', context: { ...context }, controller, detach })
     if (context.signal?.aborted === true) this.revoke(token)
     else context.signal?.addEventListener('abort', abort, { once: true })
     return token
@@ -267,7 +289,7 @@ export interface BridgeHandle {
   /** /models diagnostics: what the bridge would serve right now. */
   diagnose(cwd?: string): Promise<{
     skillsEnabled: boolean
-    toolsMode: 'off' | 'auto' | 'custom'
+    toolsMode: 'off' | 'auto' | 'scoped' | 'custom'
     skills: number
     tools: number
     httpReady: boolean
@@ -338,7 +360,7 @@ export function createBridgeHandle(parts: BridgeHandleParts): BridgeHandle {
   // can substitute for it; a supplied owner id must also agree with that object.
   const agentMatches = (context: BridgeRunContext): boolean => context.agent !== undefined
     && (context.sessionId === undefined || context.agent.id === context.sessionId)
-  const pickTools = async (context: BridgeRunContext = {}): Promise<BridgeToolSchema[]> => {
+  const pickTools = (context: BridgeRunContext = {}): BridgeToolSchema[] => {
     const config = parts.readConfig()
     const face = parts.tools()
     if (!toolsActive() || face === undefined || !agentMatches(context)) return []
@@ -347,9 +369,8 @@ export function createBridgeHandle(parts: BridgeHandleParts): BridgeHandle {
       parts.logger?.warn('dsh-maestro-codex: tool schema discovery failed (exception details omitted)')
       return []
     }
-    const picked = schemas.filter(tool => typeof tool?.name === 'string' && (config.bridgeTools === 'custom'
-      ? toolBridgable(tool.name, 'custom') && config.bridgeToolAllowlist.includes(tool.name)
-      : toolBridgable(tool.name, 'auto')))
+    const picked = schemas.filter(tool => typeof tool?.name === 'string'
+      && toolBridgableIn(tool.name, config.bridgeTools, config.bridgeToolAllowlist))
       .sort((left, right) => left.name.localeCompare(right.name))
     if (picked.length > MAX_BRIDGE_TOOLS) parts.logger?.warn(`dsh-maestro-codex: 工具目录上限 ${MAX_BRIDGE_TOOLS}，已省略 ${picked.length - MAX_BRIDGE_TOOLS} 项；请缩小桥接名单`)
     return [...new Map(picked.map(tool => [tool.name, tool])).values()].slice(0, MAX_BRIDGE_TOOLS).map(tool => ({
@@ -380,7 +401,9 @@ export function createBridgeHandle(parts: BridgeHandleParts): BridgeHandle {
     if (run === undefined) return { error: 'bridge token 无效或已过期', status: 401 }
     if (!run.includeTools) return []
     if (!agentMatches(run.context)) return { error: '宿主工具桥接缺少可信执行 agent 或归属不一致，不能绕过宿主 guard', status: 403 }
-    const tools = await pickTools(run.context)
+    if (parts.readConfig().bridgeTools === 'scoped') run.scoped = true
+    const tools = pickTools(run.context).filter(tool => run.toolPolicy === undefined
+      || toolBridgableIn(tool.name, run.toolPolicy.bridgeTools, run.toolPolicy.bridgeToolAllowlist))
     return state.resolve(token) === run ? tools : { error: 'bridge token 无效或已过期', status: 401 }
   }
   const boundCwd = (run: BridgeRun, supplied: string | undefined): string | undefined => run.context.cwd ?? supplied
@@ -404,8 +427,8 @@ export function createBridgeHandle(parts: BridgeHandleParts): BridgeHandle {
       if (toolsActive() && agentMatches(context)) {
         try {
           const config = parts.readConfig()
-          includeTools = (parts.tools()?.schemas(context.agent) ?? []).some(tool => typeof tool?.name === 'string' && toolBridgable(tool.name, config.bridgeTools === 'custom' ? 'custom' : 'auto')
-            && (config.bridgeTools !== 'custom' || config.bridgeToolAllowlist.includes(tool.name)))
+          includeTools = (parts.tools()?.schemas(context.agent) ?? []).some(tool => typeof tool?.name === 'string'
+            && toolBridgableIn(tool.name, config.bridgeTools, config.bridgeToolAllowlist))
         } catch (error) { parts.logger?.warn('dsh-maestro-codex: tool schema discovery failed (exception details omitted)') }
       }
       if (!includeSkills && !includeTools) return undefined
@@ -413,7 +436,7 @@ export function createBridgeHandle(parts: BridgeHandleParts): BridgeHandle {
       const port = parts.portOf()
       const shimPath = parts.shimPath?.() ?? bridgeShimPath()
       if (shimPath === undefined) return undefined
-      const token = state.issue(includeSkills, includeTools, context)
+      const token = state.issue(includeSkills, includeTools, context, parts.readConfig())
       try { return { token, entry: bridgeServerEntry({ port, token, shimPath }) } } catch (error) {
         state.revoke(token)
         throw error
@@ -493,6 +516,14 @@ export function createBridgeHandle(parts: BridgeHandleParts): BridgeHandle {
       if ('error' in allowed) return { ok: false, status: allowed.status, error: allowed.error }
       if ((run.catalog !== undefined && !run.catalog.tools.some(tool => tool.name === name)) || !allowed.some(tool => tool.name === name)) return { ok: false, status: 403, error: `工具 ${name} 不在本次桥接名单中` }
       if (state.resolve(token) !== run) return { ok: false, status: 401, error: 'bridge token 无效或已过期' }
+      if (parts.readConfig().bridgeTools === 'scoped') run.scoped = true
+      const scoped = run.scoped
+      let boundArguments = args ?? {}
+      if (scoped) {
+        const prepared = await prepareScopedToolArguments(name, boundArguments, run.context.cwd)
+        if (!prepared.ok) return prepared
+        boundArguments = prepared.arguments
+      }
       const face = parts.tools()
       const agent = run.context.agent
       if (face === undefined || typeof face.execute !== 'function') return { ok: false, status: 500, error: '宿主工具注册表不可用' }
@@ -505,12 +536,23 @@ export function createBridgeHandle(parts: BridgeHandleParts): BridgeHandle {
       let outcome: unknown
       try {
         outcome = await within(`工具 ${name} 执行`, limits.toolMs,
-          async () => await face.execute({ callId, name, arguments: args ?? {}, signal: run.controller.signal, agent,
-            ...(rootCallId === undefined ? {} : { rootCallId }),
-            ...(run.context.parent === undefined ? {} : { parent: run.context.parent }) }),
+          async () => {
+            // Recheck *inside* the execution callback, after asynchronous path binding
+            // and deadline scheduling. Revocation or policy shrink must win that race.
+            if (state.resolve(token) !== run || run.controller.signal.aborted) throw new BridgeToolAdmissionError(401, 'bridge token 无效或已过期')
+            if (parts.readConfig().bridgeTools === 'scoped') run.scoped = true
+            if (run.scoped && !scoped) throw new BridgeToolAdmissionError(403, '桥接策略已收紧为 scoped，请重试以绑定任务路径')
+            if (!pickTools(run.context).some(tool => tool.name === name)) throw new BridgeToolAdmissionError(403, `工具 ${name} 不在本次桥接名单中`)
+            const executionFace = parts.tools()
+            if (executionFace === undefined || typeof executionFace.execute !== 'function') throw new BridgeToolAdmissionError(403, '宿主工具注册表不可用')
+            return await executionFace.execute({ callId, name, arguments: boundArguments, signal: run.controller.signal, agent,
+              ...(rootCallId === undefined ? {} : { rootCallId }),
+              ...(run.context.parent === undefined ? {} : { parent: run.context.parent }) })
+          },
           run.controller.signal)
       } catch (error) {
         if (run.controller.signal.aborted) return { ok: false, status: 401, error: 'bridge token 无效或已过期' }
+        if (error instanceof BridgeToolAdmissionError) return { ok: false, status: error.status, error: error.message }
         if (error instanceof DeadlineError) return { ok: false, status: 504, error: `工具 ${name} 在 ${String(Math.round(limits.toolMs / 60_000))} 分钟内没有返回，已停止等待（底层执行可能仍在运行）` }
         return { ok: false, status: 500, error: `工具 ${name} 执行异常（详细错误未向子代理公开）` }
       }

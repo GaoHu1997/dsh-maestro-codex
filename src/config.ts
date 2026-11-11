@@ -24,8 +24,12 @@ export function readVolatile<T>(value: Volatile<T> | T | undefined): T | undefin
 export const CLAUDE_PERMISSION_MODES = ['inherit', 'default', 'acceptEdits', 'plan', 'bypassPermissions'] as const
 export type ClaudePermissionMode = (typeof CLAUDE_PERMISSION_MODES)[number]
 
-/** How host tools ride the bridge: never, filtered, or an explicit allowlist. */
-export const BRIDGE_TOOLS_MODES = ['off', 'auto', 'custom'] as const
+/**
+ * How host tools ride the bridge: never, auto (denylist filter), scoped (the
+ * fixed dsh file-tool allowlist, confined to the task cwd) or an explicit
+ * allowlist. `auto` never bridges `ops_*`/`job_*`/`schedule_*` names.
+ */
+export const BRIDGE_TOOLS_MODES = ['off', 'auto', 'scoped', 'custom'] as const
 export type BridgeToolsMode = (typeof BRIDGE_TOOLS_MODES)[number]
 
 /** How claude children receive dsh skills: through the bridge, or natively staged. */
@@ -155,7 +159,7 @@ export interface Config {
   bridgeMcp?: Volatile<boolean> | boolean
   /** Hand dsh's skills to the dispatched CLI runs (catalog + on-demand load). */
   bridgeSkills?: Volatile<boolean> | boolean
-  /** Host-tool bridging: off, auto (denylist filter), or custom (allowlist). */
+  /** Host-tool bridging: off, auto (denylist filter), scoped (fs tools inside cwd), or custom (allowlist). */
   bridgeTools?: Volatile<string> | string
   /** Exact tool names for `bridgeTools: 'custom'`. */
   bridgeToolAllowlist?: Volatile<string[]> | string[]
@@ -427,7 +431,7 @@ export interface EffectiveConfig {
   bridgeMcp: boolean
   /** Hand dsh's skills to the dispatched CLI runs (catalog + on-demand load). */
   bridgeSkills: boolean
-  /** Host-tool bridging mode: `off`, `auto` (denylist filter) or `custom` (allowlist). */
+  /** Host-tool bridging mode: `off`, `auto` (denylist filter), `scoped` (fs tools inside the task cwd) or `custom` (allowlist). */
   bridgeTools: BridgeToolsMode
   /** Exact tool names bridged when mode is `custom`. */
   bridgeToolAllowlist: string[]

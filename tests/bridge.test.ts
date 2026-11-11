@@ -13,8 +13,8 @@ import { join } from 'node:path'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { effectiveOf, validateConfig, type EffectiveConfig } from '../src/config.js'
 import {
-  BRIDGE_SERVER_NAME, BRIDGE_URL_ENV, BRIDGE_TOKEN_ENV, BridgeState,
-  bridgeNodeCommand, createBridgeHandle, renderSkillBody, skillCatalogText, skillToolName, toolBridgable,
+  BRIDGE_SERVER_NAME, BRIDGE_URL_ENV, BRIDGE_TOKEN_ENV, BridgeState, SCOPED_FS_TOOLS,
+  bridgeNodeCommand, createBridgeHandle, renderSkillBody, skillCatalogText, skillToolName, toolBridgable, toolBridgableIn,
   type BridgeHandle, type SkillsFace, type ToolsFace,
 } from '../src/bridge.js'
 import { handleShimMessage, shimStateFromEnv, toolsOfCatalog, type ShimCatalog, type ShimRequest } from '../src/bridge-shim.js'
@@ -52,7 +52,7 @@ function bridgeFixture(parts: {
   tools?: Array<{ name: string; description?: string; parameters?: unknown }>
   toolOutcomes?: Record<string, unknown>
   bridgeSkills?: boolean
-  bridgeTools?: 'off' | 'auto' | 'custom'
+  bridgeTools?: 'off' | 'auto' | 'scoped' | 'custom'
   bridgeToolAllowlist?: string[]
   port?: number
   state?: BridgeState
@@ -308,6 +308,23 @@ describe('toolBridgable', () => {
     expect(toolBridgable('bash', 'custom')).toBe(true)
     expect(toolBridgable('mcp__http_server__tool', 'custom')).toBe(true)
     expect(toolBridgable('run_code', 'custom')).toBe(false)
+  })
+
+  it('scoped mode bridges only the fs allowlist and never shell', () => {
+    for (const allowed of ['ops_read_files', 'ops_inspect_local_file', 'ops_glob', 'ops_grep', 'ops_stat', 'ops_diff', 'ops_edit_file', 'ops_write_file', 'ops_replace', 'ops_copy', 'ops_move', 'ops_remove']) {
+      expect(toolBridgable(allowed, 'scoped')).toBe(true)
+    }
+    for (const denied of ['ops_bash', 'ops_discover_tools', 'ops_result', 'bash', 'read', 'write', 'web_search', 'mcp__remote__tool', 'run_code', '']) {
+      expect(toolBridgable(denied, 'scoped')).toBe(false)
+    }
+  })
+
+  it('toolBridgableIn is the shared catalog/call-time judge', () => {
+    expect(toolBridgableIn('ops_edit_file', 'scoped', [])).toBe(true)
+    expect(toolBridgableIn('web_search', 'scoped', ['web_search'])).toBe(false)
+    expect(toolBridgableIn('web_search', 'custom', ['web_search'])).toBe(true)
+    expect(toolBridgableIn('web_search', 'custom', [])).toBe(false)
+    expect(toolBridgableIn('ops_read_files', 'auto', [])).toBe(false)
   })
 })
 
@@ -713,6 +730,30 @@ describe('runDispatch bridge integration', () => {
     // The token is retired: nothing resolves afterwards.
     const issued = state.resolve(revokeSpy.mock.calls[0]?.[0] ?? '')
     expect(issued).toBeUndefined()
+  })
+
+  it.each([0, 1, 12])('reports actual scoped visibility and missing tools with %s tools', async count => {
+    const spawn = claudeSpawn()
+    const { bridge } = bridgeFixture({ bridgeTools: 'scoped', tools: SCOPED_FS_TOOLS.slice(0, count).map(name => ({ name })) })
+    const { deps, registry } = makeDeps(fixtureConfig({ bridgeTools: 'scoped' }), spawn.spawnFn, bridge)
+    expect((await runDispatch(deps, { ...assessment, cli: 'claude', task: '检查 Native 文件工具' }, new AbortController().signal)).ok).toBe(true)
+    const notes = registry.eventsSince(registry.list()[0]?.id ?? '', 0)?.events.map(event => event.text).join('\n') ?? ''
+    expect(notes).toContain(`scoped 实际可见文件工具（${count}/12）`)
+    if (count < 12) {
+      expect(notes).toContain('scoped 未公开工具：')
+      expect(notes).toContain('ops_edit_file')
+      expect(notes).toContain('再重新派发')
+    } else expect(notes).not.toContain('scoped 未公开工具：')
+  })
+
+  it('reports a scoped bridge that cannot mount instead of claiming file access', async () => {
+    const spawn = claudeSpawn()
+    const { bridge } = bridgeFixture({ bridgeTools: 'scoped', bridgeSkills: false, tools: [] })
+    const { deps, registry } = makeDeps(fixtureConfig({ bridgeTools: 'scoped', bridgeSkills: false }), spawn.spawnFn, bridge)
+    expect((await runDispatch(deps, { ...assessment, cli: 'claude', task: '检查 Native 文件工具' }, new AbortController().signal)).ok).toBe(true)
+    const notes = registry.eventsSince(registry.list()[0]?.id ?? '', 0)?.events.map(event => event.text).join('\n') ?? ''
+    expect(notes).toContain('scoped 文件工具桥未挂载')
+    expect(notes).not.toContain('已挂载 dsh_bridge')
   })
 
   it('skips the bridge entirely when the config switch is off', async () => {

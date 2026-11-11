@@ -50,7 +50,7 @@ export interface SectionValue {
   bridgeMcp?: boolean
   /** Hand dsh's skills to the dispatched CLI runs (catalog + on-demand load). */
   bridgeSkills?: boolean
-  /** Host-tool bridging mode: off / auto / custom. */
+  /** Host-tool bridging mode: off / auto / scoped / custom. */
   bridgeTools?: string
   /** Exact tool names bridged when mode is custom (one per line staged). */
   bridgeToolAllowlist?: string[]
