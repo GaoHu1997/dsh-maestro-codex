@@ -6,8 +6,9 @@
  *
  * 旧实现超限时先 `req.destroy()` 再 reject，catch 里再往已经销毁的 socket 写响应——
  * 客户端看到的是 `Recv failure: Connection was reset`，既没有状态码也没有文案。
- * 现在的契约：**超限一定回 413 + 可读文案 + `connection: close`**，把剩余上传丢弃
- * 由连接关闭完成，不再冒充 400 参数错误。
+ * 现在的契约：**首次越过上限就回 413 + 可读文案 + `connection: close`**，不等剩余
+ * 上传结束（一个声明 1MB、实际只发 300KB 的请求在 150ms 内就能拿到响应）；剩余上传
+ * 由关闭连接丢弃，不冒充 400 参数错误。
  */
 
 import type { IncomingMessage, ServerResponse } from 'node:http'
@@ -26,43 +27,47 @@ export class BodyTooLargeError extends Error {
 /**
  * 读一份 JSON 请求体。空体读作 `{}`（GET/HEAD 与无体 POST 都合法）。
  *
- * 超限时**不销毁请求流**：已经读到的分片丢弃，随后 `req.resume()` 排空剩余上传，
- * 由调用方回 413 并在响应结束后关闭连接。这样超限与「参数非法」是两条不同的路径。
+ * 超限时**立刻**以 `BodyTooLargeError` 失败，不销毁请求流也不等 `end`：调用方回
+ * 413 后由 `connection: close` 关闭连接，未读完的上传随关闭丢弃。若在超限之后仍
+ * 有数据到达，只丢弃不累积（`on('data')` 保留，避免 socket 背压把进程挂住）。
  */
 export function readJsonBody(req: IncomingMessage, limit: number = BODY_LIMIT): Promise<unknown> {
   return new Promise((resolvePromise, rejectPromise) => {
     const chunks: Buffer[] = []
     let size = 0
-    let overflow = false
+    let settled = false
+    const settle = (finish: () => void): void => {
+      if (settled) return
+      settled = true
+      finish()
+    }
     req.on('data', (chunk: Buffer) => {
       size += chunk.length
-      if (overflow || size > limit) {
-        // 超限之后不再保留数据，只排空：响应还要写到这个 socket 上。
-        overflow = true
+      if (settled) return
+      if (size > limit) {
         chunks.length = 0
+        settle(() => rejectPromise(new BodyTooLargeError(limit)))
         return
       }
       chunks.push(chunk)
     })
     req.on('end', () => {
-      if (overflow) {
-        rejectPromise(new BodyTooLargeError(limit))
-        return
-      }
-      if (chunks.length === 0) {
-        resolvePromise({})
-        return
-      }
-      try {
-        resolvePromise(JSON.parse(Buffer.concat(chunks).toString('utf8')))
-      } catch (error) {
-        rejectPromise(new Error(`invalid JSON body: ${error instanceof Error ? error.message : String(error)}`))
-      }
+      settle(() => {
+        if (chunks.length === 0) {
+          resolvePromise({})
+          return
+        }
+        try {
+          resolvePromise(JSON.parse(Buffer.concat(chunks).toString('utf8')))
+        } catch (error) {
+          rejectPromise(new Error(`invalid JSON body: ${error instanceof Error ? error.message : String(error)}`))
+        }
+      })
     })
-    req.on('error', rejectPromise)
+    req.on('error', error => settle(() => rejectPromise(error)))
     req.on('close', () => {
-      // 客户端半途断开：没有完整的体就不算读成功。
-      if (!req.complete) rejectPromise(new Error('请求体未读完：连接已关闭'))
+      // 客户端把连接关了而体没读完：不留下悬挂的 promise。
+      if (!req.complete) settle(() => rejectPromise(new Error('请求体未读完：连接已关闭')))
     })
   })
 }
@@ -70,8 +75,8 @@ export function readJsonBody(req: IncomingMessage, limit: number = BODY_LIMIT): 
 /**
  * 把读体失败翻成 HTTP 响应。超限 = 413 + `connection: close`；其它 = 400 + 原因。
  *
- * 响应结束后才销毁请求流：`connection: close` 让 Node 在写完响应后关闭 socket，
- * 剩余上传由关闭丢弃；先销毁会丢掉刚写出的响应（就是被修掉的那个 bug）。
+ * 超限时请求体通常还没读完：响应 `finish` 之后才销毁请求流，剩余上传由关闭丢弃。
+ * 提前销毁会连刚写出的响应一起丢掉（就是被修掉的那个 bug）。
  */
 export function sendBodyFailure(req: IncomingMessage, res: ServerResponse, error: unknown): void {
   const tooLarge = error instanceof BodyTooLargeError
@@ -83,5 +88,9 @@ export function sendBodyFailure(req: IncomingMessage, res: ServerResponse, error
   if (tooLarge) headers['connection'] = 'close'
   res.writeHead(tooLarge ? 413 : 400, headers)
   res.end(JSON.stringify({ error: message }))
-  if (tooLarge) res.once('finish', () => req.destroy())
+  if (tooLarge) {
+    // 响应写完再断请求：否则 RST 会抢在响应前面（真实 curl 已验证：先断则客户端拿不到状态码）。
+    if (res.writableFinished) req.destroy()
+    else res.once('finish', () => req.destroy())
+  }
 }

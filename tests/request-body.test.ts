@@ -1,5 +1,5 @@
 import { createServer, type Server } from 'node:http'
-import type { AddressInfo } from 'node:net'
+import { connect, type AddressInfo } from 'node:net'
 import { afterEach, describe, expect, it } from 'vitest'
 import { BODY_LIMIT, BodyTooLargeError, readJsonBody, sendBodyFailure } from '../src/request-body.js'
 
@@ -84,6 +84,37 @@ describe('request body limit', () => {
     expect(response.status).toBe(200)
     expect(JSON.parse(response.text)).toEqual({ received: {} })
   })
+
+  it('answers 413 as soon as the limit is crossed, without waiting for the declared body', async () => {
+    const harness = await startHarness()
+    const url = new URL(harness.url)
+    const socket = connect({ host: '127.0.0.1', port: Number(url.port) })
+    const started = Date.now()
+    const firstChunk = new Promise<string>((resolve, reject) => {
+      let seen = ''
+      socket.on('data', chunk => {
+        seen += chunk.toString('utf8')
+        if (seen.includes('\r\n')) resolve(seen)
+      })
+      socket.on('error', reject)
+      setTimeout(() => reject(new Error(`no response within 1500ms (got ${seen.length} bytes)`)), 1500)
+    })
+    try {
+      await new Promise<void>((resolve, reject) => {
+        socket.once('connect', () => resolve())
+        socket.once('error', reject)
+      })
+      // 声明 1MB，只发 300KB：旧实现要等满 1MB（或等客户端超时），新实现应在越过 256KB 时就回 413。
+      socket.write('POST /save HTTP/1.1\r\nHost: 127.0.0.1\r\ncontent-type: application/json\r\n'
+        + `content-length: ${1024 * 1024}\r\n\r\n`)
+      socket.write(Buffer.from('a'.repeat(300 * 1024)))
+      const response = await firstChunk
+      expect(response.startsWith('HTTP/1.1 413')).toBe(true)
+      expect(Date.now() - started).toBeLessThan(1500)
+    } finally {
+      socket.destroy()
+    }
+  }, 10_000)
 
   it('names the limit in the error object', () => {
     expect(new BodyTooLargeError().message).toContain(String(BODY_LIMIT))
