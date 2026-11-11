@@ -16,6 +16,7 @@ import { CliPathCache } from './dispatch.js'
 import { Limiter, TaskRegistry } from './task-registry.js'
 import { registerDispatchTool, TOOL_NAME } from './tool.js'
 import { routingHint } from './routing.js'
+import { readJsonBody, sendBodyFailure } from './request-body.js'
 import { listDshModels, resolveDshModelEndpoint, type DshModelEndpoint, type SettingsDescribeFace } from './dsh-models.js'
 import { preflightDshModel as runPreflight } from './preflight.js'
 import { discoverMcpServers } from './mcp.js'
@@ -51,9 +52,6 @@ export type { AccountingSnapshot, MaestroCliAccountingService, NativeRecoveryDia
 export type { CliUsageRecord, CliUsageState } from './usage.js'
 
 export const inject = []
-
-/** Largest accepted request body (bytes) — dispatch payloads are task text. */
-const BODY_LIMIT = 256 * 1024
 
 /** The settings namespace this plugin serves — the composition entry id, which
  * the browser half reads configForms by (the same string). */
@@ -473,32 +471,6 @@ export function apply(ctx: Context, config: Config = {}): void {
       res.end(JSON.stringify(outcome.body))
     }
 
-    const readJson = (req: IncomingMessage): Promise<unknown> => new Promise((resolvePromise, rejectPromise) => {
-      const chunks: Buffer[] = []
-      let size = 0
-      req.on('data', (chunk: Buffer) => {
-        size += chunk.length
-        if (size > BODY_LIMIT) {
-          req.destroy()
-          rejectPromise(new Error('request body too large'))
-          return
-        }
-        chunks.push(chunk)
-      })
-      req.on('end', () => {
-        if (chunks.length === 0) {
-          resolvePromise({})
-          return
-        }
-        try {
-          resolvePromise(JSON.parse(Buffer.concat(chunks).toString('utf8')))
-        } catch (error) {
-          rejectPromise(new Error(`invalid JSON body: ${error instanceof Error ? error.message : String(error)}`))
-        }
-      })
-      req.on('error', rejectPromise)
-    })
-
     /** One exact route with in-handler method dispatch. */
     const route = (path: string, label: string, handle: (req: IncomingMessage, body: unknown) => Promise<RouteOutcome> | RouteOutcome): void => {
       webCtx.effect(() => webCtx.webServer.register({ kind: 'exact', path, handler: async (req: IncomingMessage, res: ServerResponse) => {
@@ -509,10 +481,10 @@ export function apply(ctx: Context, config: Config = {}): void {
             send(res, fail(403, 'cross-origin request rejected'))
             return
           }
-          const body = req.method === 'GET' || req.method === 'HEAD' ? {} : await readJson(req)
+          const body = req.method === 'GET' || req.method === 'HEAD' ? {} : await readJsonBody(req)
           send(res, await handle(req, body))
         } catch (error) {
-          send(res, fail(400, error instanceof Error ? error.message : String(error)))
+          sendBodyFailure(req, res, error)
         }
       } }), `maestro-codex: ${label} route`)
     }
