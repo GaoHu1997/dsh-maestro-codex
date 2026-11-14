@@ -10,6 +10,7 @@ import type { Context } from '@deepseek-ai/cordis'
 import { TASK_DIFFICULTIES } from './config.js'
 import { DispatchError, parseDispatchParams, runDispatch, type DispatchDeps, type DispatchParams, type DispatchValue } from './dispatch.js'
 import type { CliUsageSession } from './usage.js'
+import { cliFailureDiagnostic } from './public-diagnostics.js'
 
 export const TOOL_NAME = 'dispatch_cli_task'
 
@@ -168,9 +169,9 @@ export function registerDispatchTool(ctx: Context, deps: MaestroToolDeps): { rea
     // keep its real failed/cancelled/timeout result (including recovery refs)
     // in the enforced output schema rather than dropping it with the throw.
     try {
-      return await runDispatch(deps, params, exec.signal)
+      return modelDispatchValue(await runDispatch(deps, params, exec.signal))
     } catch (error) {
-      if (error instanceof DispatchError && error.value !== undefined) return error.value
+      if (error instanceof DispatchError && error.value !== undefined) return modelDispatchValue(error.value)
       throw error
     }
   }
@@ -231,12 +232,23 @@ export function parseToolArgs(raw: unknown): DispatchParams | string {
   return parseDispatchParams(raw)
 }
 
+/** Failure output is a model projection, not the canonical task record.
+ * Keep recovery identity; never mistake raw product errors or partial text for
+ * a successful answer. The authorized task detail retains original diagnostics.
+ */
+export function modelDispatchValue(value: DispatchValue): DispatchValue {
+  if (value.ok) return value
+  const error = cliFailureDiagnostic(value)
+  return { ...value, error, finalText: '', notes: [error] }
+}
+
 /** The rendered result text cap: the canonical value keeps the full text, the
  * conversation surface must not eat the context window with one CLI answer. */
 const RENDER_TEXT_CAP = 20_000
 
 /** The summary text the tool result renders into the conversation. */
 export function renderSummary(value: DispatchValue): string {
+  value = modelDispatchValue(value)
   const head = `[${value.cli}] ${value.ok ? '任务完成' : '任务失败'}（${Math.round(value.durationMs / 1000)}s，model=${value.model || '默认'}）`
   const rawBody = value.finalText.trim() === '' ? '（CLI 未返回文本）' : value.finalText
   const body = rawBody.length > RENDER_TEXT_CAP

@@ -11,13 +11,16 @@ import { constants, existsSync, readFileSync, statSync } from 'node:fs'
 import { access, stat } from 'node:fs/promises'
 import path from 'node:path'
 import { StringDecoder } from 'node:string_decoder'
+import { childEnvironment, type ChildEnvironment, type ChildEnvironmentPolicy } from './child-environment.js'
 
 /** The spawn seam: everything a runner needs, injectable for tests. */
 export type SpawnFn = (file: string, args: readonly string[], options: SpawnOptionsLike) => ChildProcess
 
 export interface SpawnOptionsLike {
   cwd?: string | undefined
-  env?: Record<string, string> | undefined
+  env?: ChildEnvironment | undefined
+  /** Delegated CLIs scrub ambient credentials; other callers retain inheritance. */
+  environmentPolicy?: ChildEnvironmentPolicy | undefined
   /** `pipe` on all three stdios; the runner never inherits. */
   stdio?: readonly ('pipe' | 'ignore')[] | undefined
   windowsHide?: boolean | undefined
@@ -46,7 +49,7 @@ const MAX_LINE_CHARS = 4_000_000
 
 export const systemSpawn: SpawnFn = (file, args, options) => spawn(file, args as string[], {
   cwd: options.cwd,
-  env: options.env === undefined ? undefined : { ...process.env, ...options.env },
+  env: childEnvironment(process.env, options.env, options.environmentPolicy ?? 'inherit'),
   stdio: (options.stdio ?? ['pipe', 'pipe', 'pipe']) as ('pipe' | 'ignore')[],
   windowsHide: options.windowsHide ?? true,
   windowsVerbatimArguments: options.windowsVerbatimArguments,
@@ -226,7 +229,9 @@ export function runProcess(options: {
   file: string
   args: readonly string[]
   cwd?: string | undefined
-  env?: Record<string, string> | undefined
+  env?: ChildEnvironment | undefined
+  /** Delegated CLIs scrub ambient credentials; other callers retain inheritance. */
+  environmentPolicy?: ChildEnvironmentPolicy | undefined
   stdin?: string | undefined
   timeoutMs: number
   /** Defaults to wall-clock; CLI channels explicitly select idle. */
@@ -244,6 +249,7 @@ export function runProcess(options: {
   const child = spawnFn(launch.file, launch.args, {
     ...(options.cwd === undefined ? {} : { cwd: options.cwd }),
     ...(options.env === undefined ? {} : { env: options.env }),
+    ...(options.environmentPolicy === undefined ? {} : { environmentPolicy: options.environmentPolicy }),
     ...(launch.windowsVerbatimArguments === undefined ? {} : { windowsVerbatimArguments: launch.windowsVerbatimArguments }),
   })
 

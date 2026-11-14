@@ -2,11 +2,11 @@
 // temporary directory is written; user sessions and host packages are read-only.
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
-import { mkdir, mkdtemp, open, readFile, rm } from 'node:fs/promises';
+import { mkdir, mkdtemp, open, readFile, rm, stat } from 'node:fs/promises';
 import { createRequire } from 'node:module';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
-import { loadArtifactRuntime } from '../scripts/lib/session-artifact-runtime.mjs';
+import { loadArtifactRuntime, SUPPORTED_LEASE_VERSIONS } from '../scripts/lib/session-artifact-runtime.mjs';
 
 import fs from 'node:fs';
 const traceStarted = performance.now();
@@ -34,6 +34,9 @@ const repo = fileURLToPath(new URL('../', import.meta.url));
 const hostRequire = createRequire(join(root, 'package.json'));
 trace('runtime-import-start');
 const runtime = await loadArtifactRuntime(root);
+const persistenceEntry = hostRequire.resolve('@deepseek-ai/dsh-session-persistence-jsonl');
+const { version } = JSON.parse(await readFile(join(dirname(persistenceEntry), '..', 'package.json'), 'utf8'));
+const leaseProtocolVerified = SUPPORTED_LEASE_VERSIONS.includes(version);
 trace('runtime-import-end');
 const completed = [];
 function complete(phase) { completed.push(phase); trace(phase); }
@@ -70,6 +73,12 @@ const lockPath = join(dir, 'session.lock');
 let heldNative;
 let heldAdapter;
 try {
+  if (!leaseProtocolVerified) {
+    const unverifiedDir = join(dir, 'must-not-be-created');
+    await assert.rejects(runtime.acquireLease(unverifiedDir, header.id), /session write lease protocol is unverified/);
+    await assert.rejects(stat(unverifiedDir), error => error.code === 'ENOENT');
+    complete('unverified-write-lease-refused-before-writes');
+  } else {
   if (process.platform === 'win32') {
     // Independent native owner follows the installed persistence protocol,
     // without importing or calling any adapter lock implementation.
@@ -120,13 +129,12 @@ try {
   }
   const next = await runtime.acquireLease(dir, header.id);
   await next.release(); complete('adapter-reacquires-after-native-close');
+  }
 } finally {
   if (heldAdapter) await heldAdapter.release();
   if (heldNative) await heldNative.release();
   assert(dir.startsWith(join(repo, '.tmp', 'runtime-lease-')));
   await rm(dir, { recursive: true, force: true });
 }
-const persistenceEntry = hostRequire.resolve('@deepseek-ai/dsh-session-persistence-jsonl');
-const { version } = JSON.parse(await readFile(join(dirname(persistenceEntry), '..', 'package.json'), 'utf8'));
-console.log(JSON.stringify({ version, platform: process.platform, completed, userSessionsUntouched: true }));
+console.log(JSON.stringify({ version, platform: process.platform, leaseProtocolVerified, completed, userSessionsUntouched: true }));
 trace('report-written');

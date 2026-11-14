@@ -7,7 +7,7 @@
 
 import type { ToolExec } from './tool.js'
 import { randomUUID } from 'node:crypto'
-import { existsSync, statSync } from 'node:fs'
+import { accessSync, constants, statSync } from 'node:fs'
 import { isAbsolute } from 'node:path'
 import { modelTokenError, type EffectiveConfig, type TaskDifficulty } from './config.js'
 import { claudePermissionWarning, runClaudeTask } from './channels/claude.js'
@@ -338,7 +338,7 @@ export function parseDispatchParams(raw: unknown): DispatchParams | string {
   if (assessmentError !== undefined) return assessmentError
   const cli = typeof record['cli'] === 'string' && record['cli'].trim() !== '' ? record['cli'].trim() : 'auto'
   const cwd = typeof record['cwd'] === 'string' && record['cwd'].trim() !== '' ? record['cwd'].trim() : undefined
-  if (cwd !== undefined && (!isAbsolute(cwd) || !existsSync(cwd))) return `"cwd" 必须是已存在的绝对路径：${cwd}`
+  if (cwd !== undefined && usableWorkspaceCwd(cwd) === undefined) return `"cwd" 必须是已存在且可进入的目录绝对路径：${cwd}`
   const model = typeof record['model'] === 'string' && record['model'].trim() !== '' ? record['model'].trim() : undefined
   if (model !== undefined) {
     const error = modelTokenError(model)
@@ -369,13 +369,15 @@ export function parseDispatchParams(raw: unknown): DispatchParams | string {
 
 /**
  * A session workspace is only usable when it is an absolute path to a
- * directory that still exists. Anything else falls back to the host process
- * directory, which is always present.
+ * directory that still exists and can be entered. Unusable session-header data
+ * retains the documented host-directory fallback; explicit cwd is rejected.
  */
-function usableWorkspaceCwd(candidate: string | undefined): string | undefined {
+export function usableWorkspaceCwd(candidate: string | undefined): string | undefined {
   if (candidate === undefined || candidate === '' || !isAbsolute(candidate)) return undefined
   try {
-    return statSync(candidate).isDirectory() ? candidate : undefined
+    if (!statSync(candidate).isDirectory()) return undefined
+    accessSync(candidate, constants.X_OK)
+    return candidate
   } catch {
     return undefined
   }
@@ -454,6 +456,7 @@ export async function runDispatch(deps: DispatchDeps, params: DispatchParams, si
   // spawn/prepare would fail with ENOENT instead of running somewhere usable.
   const usableSessionCwd = usableWorkspaceCwd(params.sessionCwd)
   const cwd = requestedCwd ?? usableSessionCwd ?? process.cwd()
+  if (usableWorkspaceCwd(cwd) === undefined) throw new DispatchError(`CLI 工作区不是已存在且可进入的目录绝对路径：${cwd}`)
   if (requestedCwd === undefined) {
     if (params.sessionCwd !== undefined && usableSessionCwd === undefined) {
       notes.push(`会话工作区不可用（${params.sessionCwd}），已回退宿主进程目录：${cwd}`)
@@ -619,6 +622,7 @@ export async function runDispatch(deps: DispatchDeps, params: DispatchParams, si
         }
         onEvent('note', `prepareCommand 完成${prepared.output === '' ? '' : `：${prepared.output}`}`)
       }
+      if (usableWorkspaceCwd(cwd) === undefined) throw new DispatchError('CLI 工作区在准备期间失效，未启动 CLI')
       // CLI watchdogs measure consecutive output silence, not total runtime.
       // Warnings live beside the watchdog so actual chunks reset both clocks.
       const timeoutMs = timeoutMinutes * 60_000

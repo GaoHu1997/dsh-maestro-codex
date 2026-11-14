@@ -41,3 +41,31 @@ export function transportDiagnostic(error: unknown): string {
   if (error instanceof Error && ['AbortError', 'TimeoutError'].includes(error.name)) return '请求超时或中止'
   return '网络或传输错误'
 }
+
+/** Model-facing failure facts. Raw stderr stays in the authorized task detail. */
+export interface CliFailureInput {
+  readonly phase: string
+  readonly error?: string | undefined
+  readonly exitCode: number | null
+}
+
+const FAILURE_PHASES = ['failed', 'cancelled', 'timeout', 'interrupted'] as const
+
+/** Categorize private text, but publish only fixed labels and numeric facts. */
+export function cliFailureDiagnostic(input: CliFailureInput): string {
+  const phase = (FAILURE_PHASES as readonly string[]).includes(input.phase) ? input.phase : 'failed'
+  const text = input.error ?? ''
+  const category = phase === 'cancelled' ? 'cancelled'
+    : phase === 'timeout' ? 'timeout'
+    : phase === 'interrupted' ? 'interrupted'
+    : /category=authentication|\b401\b|\b403\b|unauthori[sz]ed|authentication|invalid.?api.?key/i.test(text) ? 'authentication'
+    : /category=rate-limit|\b429\b|rate.?limit|too many requests|quota|限流|额度/i.test(text) ? 'rate-limit'
+    : /category=timeout|timed? ?out|timeout|超时/i.test(text) ? 'timeout'
+    : /category=access-policy|permission.?denied|access.?denied|sandbox.*fail|权限.*拒绝/i.test(text) ? 'access-policy'
+    : /category=transport|ECONN|ENOTFOUND|EAI_AGAIN|EPIPE|UND_ERR|network|网络|stream.*disconnect/i.test(text) ? 'transport'
+    : /category=invalid-result|未返回.*(?:结果|答复)|缺少.*(?:终态|completed)|invalid.?result|terminal.*(?:missing|invalid)|result.*(?:缺失|为空)/i.test(text) ? 'invalid-result'
+    : typeof input.exitCode === 'number' && input.exitCode !== 0 ? 'process'
+    : 'unknown'
+  const exit = typeof input.exitCode === 'number' && Number.isSafeInteger(input.exitCode) ? `, exitCode=${input.exitCode}` : ''
+  return `CLI 失败（phase=${phase}, category=${category}${exit}）；原始诊断与部分输出已保留在任务详情`
+}

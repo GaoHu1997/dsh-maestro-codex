@@ -16,7 +16,7 @@ function fixture() {
     else if (!child.spawnArgs.includes('-p')) child.finish('')
     else {
       order.push('cli')
-      child.finish(JSON.stringify({ type: 'result', subtype: 'success', result: 'finished', session_id: 'pipeline-thread', usage: { input_tokens: 10, output_tokens: 4, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 } }))
+      child.finish(JSON.stringify({ type: 'result', subtype: 'success', is_error: false, result: 'finished', session_id: 'pipeline-thread', usage: { input_tokens: 10, output_tokens: 4, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 } }))
     }
   })
   const registry = new TaskRegistry(), controllers = new Map<string, AbortController>()

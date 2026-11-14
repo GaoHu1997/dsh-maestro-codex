@@ -4,11 +4,12 @@ import { describe, expect, it } from 'vitest'
 
 const cardSource = readFileSync(new URL('../src/client/MaestroCard.tsx', import.meta.url), 'utf8')
 const headerSource = readFileSync(new URL('../src/client/header/CliCatalogChip.tsx', import.meta.url), 'utf8')
+const headerRegistrationSource = readFileSync(new URL('../src/client/header/register.tsx', import.meta.url), 'utf8')
 
 function stylesheet(source: string, constant: string): string {
   const match = source.match(new RegExp(`const ${constant} = \u0060([\\s\\S]*?)\u0060`))
   if (match?.[1] === undefined) throw new Error(`Missing ${constant}`)
-  return match[1].replaceAll('${BODY_FLAG}', 'data-maestro-cli-header')
+  return match[1]
 }
 
 const cardCss = postcss.parse(stylesheet(cardSource, 'CARD_CSS'))
@@ -31,7 +32,7 @@ function declarations(css: postcss.Root, selector: string): Record<string, strin
 }
 
 describe('CLI settings and header style isolation', () => {
-  it('uses disjoint class names for the globally injected styles', () => {
+  it('uses disjoint class names for settings and locally scoped header styles', () => {
     const cardClasses = classes(cardCss)
     const headerClasses = classes(headerCss)
     expect([...cardClasses].filter(name => headerClasses.has(name))).toEqual([])
@@ -39,7 +40,29 @@ describe('CLI settings and header style isolation', () => {
     expect([...headerClasses].every(name => name.startsWith('dmch-'))).toBe(true)
     expect(headerSource).toContain('className={`dmch-row')
     expect(headerSource).toContain('data-dmc-trigger=""')
-    expect(headerSource).toContain(':not([data-dmc-trigger])')
+  })
+
+  it('composes the owned unified header through public slots without suppressing native DOM', () => {
+    headerCss.walkRules(rule => {
+      expect(rule.selector).not.toMatch(/(?:^|[\s>+~,])body(?=[\s.#:\[>+~,]|$)|\[aria-haspopup|\[aria-label|data-subagent|data-maestro-core-chip|data-slot/)
+    })
+    expect(headerSource).not.toContain(':not([data-dmc-trigger])')
+    expect(headerSource).not.toContain('data-maestro-cli-header')
+    expect(headerSource).not.toContain('data-maestro-core-chip')
+    expect(headerSource).not.toContain('MutationObserver')
+    expect(headerRegistrationSource).toContain('slots.entries?.(HEADER_ACTIONS)')
+    expect(headerRegistrationSource).toContain('slots.entriesOfSlot?.(HEADER_FOOTER)')
+    expect(headerRegistrationSource).not.toContain('document.querySelector')
+  })
+
+  it('uses explicit executor icons from the existing brand registry without duplicate pseudo-icons', () => {
+    expect(headerSource).toContain('EXECUTOR_BRANDS[executor]')
+    expect(headerSource).toContain('data-cli-icon={executor}')
+    expect(headerSource).toContain('role="img"')
+    expect(headerSource).toContain('data-cli-summary={executor}')
+    expect(declarations(headerCss, '.dmch-executor-icon')).toMatchObject({ width: '12px', height: '12px' })
+    expect(declarations(headerCss, '[data-dmc-chip] .dmch-badge[data-cli-executor]::before')).toMatchObject({ content: 'none' })
+    expect(headerSource).not.toContain('data-maestro-cli-header')
   })
 
   it('stacks expanded settings below the full-width accordion header', () => {

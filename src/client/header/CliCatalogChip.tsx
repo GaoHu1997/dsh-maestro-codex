@@ -1,26 +1,4 @@
-/**
- * 会话页头的「N 个子智能体」替换版。
- *
- * 内核那颗 chip（`conversation.session.header.actions` 的 `subagent-catalog`）
- * 只渲染有本地 Session 的目录行：CLI 子代理是 `mode: 'external'`，没有子会话，
- * 所以既没有运行状态、也没有 token。目录投影本身不携带这些字段，改数据补不进去。
- *
- * 这里在同一个 slot 里注册一颗自己的 chip，并把内核那颗用 CSS 让位：
- *
- * - 直接子代理（本地）保留原名、运行点、token、耗时，点击还是打开会话；
- * - CLI 子代理合并显示阶段、耗时、token（`maestroCliUsage` 投影）；
- * - 计数把两类合在一起，页头因此看得到“现在总共几个子智能体、谁在跑”。
- *
- * 每行行头统一挂**执行者徽标**（`data-cli-executor`）：dsh 原生行标 DSH，
- * CLI 行标它真正的执行者 claude / codex。样式复用看板节点右上角的同一份
- * 品牌色与 logo（board/accent.ts 按 id 注入），两处一个词汇表。
- * 「可续接 / 一次性」这类模式词不在这里出现——行头已经说明是谁在执行。
- *
- * 内核 DOM 一旦改结构，`:has(...)` 选择器会失效——失效的后果是两颗 chip 同时
- * 出现，而不是丢信息，所以不做更深的 DOM 改写。
- *
- * @module dsh-maestro-codex/client/header/CliCatalogChip
- */
+/** Maestro-owned unified catalog: executor icons, state, usage and native CLI continuation. */
 
 import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from 'react'
 import { useCliAccess } from '../access.js'
@@ -29,24 +7,19 @@ import { SessionPage } from '../board/Session.js'
 import { hasBoardTranscriptAside, jumpBoardAddress, jumpBoardCliSession } from '../board/bridge.js'
 import type { SidebarSubagentAddress } from '../board/upstream/context-types.js'
 
-import { TERMINAL_PHASES, type MaestroTaskSummary } from '../../wire.js'
+import { TERMINAL_PHASES, type MaestroTaskSummary, type MaestroCliId } from '../../wire.js'
 import {
   formatDuration, formatTokens, taskDuration, timingSummary,
   type BoardCatalogEntry, type BoardTokenUsage,
 } from '../board/model.js'
-import { injectBoardAccent, DSH_BADGE_TITLE } from '../board/accent.js'
+import { injectBoardAccent, DSH_BADGE_TITLE, EXECUTOR_BRANDS } from '../board/accent.js'
 import {
-  useCliTasks, useNow, useSessionList, type BoardHost,
+  useCliTasks, useNow, useSessionList, type BoardHost, type BoardSessionList,
 } from '../board/data.js'
-
-/** 页头 chip 的样式表 id（幂等注入）。 */
-const HEADER_STYLE_ID = 'dsh-maestro-codex-header-styles'
-
-/** 生效期间挂在 body 上，让 CSS 只隐藏内核 chip 而不影响其它页。 */
-const BODY_FLAG = 'data-maestro-cli-header'
 
 const HEADER_CSS = `
 .dmch-wrap { display: inline-flex; align-items: center; min-width: 0; position: relative; }
+.dmch-wrap.dmch-footer { display: block; width: 100%; }
 .dmch-trigger {
   display: inline-flex; align-items: center; gap: 4px; min-height: 28px; padding: 3px 2px;
   border: 0; border-radius: var(--dsw-radius-sm, 6px); background: none; cursor: pointer;
@@ -56,6 +29,10 @@ const HEADER_CSS = `
 .dmch-trigger:hover, .dmch-trigger:focus-visible { color: var(--dsw-alias-label-primary, var(--dsh-text-primary, #1a1e26)); }
 .dmch-trigger svg { flex: none; transition: transform .12s ease; }
 .dmch-trigger-on svg.dmch-chevron { transform: rotate(180deg); }
+.dmch-executors { display: inline-flex; align-items: center; gap: 6px; }
+.dmch-executor-summary { display: inline-flex; align-items: center; gap: 3px; font-size: 10px; font-variant-numeric: tabular-nums; }
+.dmch-executor-icon { display: inline-block; flex: none; width: 12px; height: 12px; }
+[data-dmc-chip] .dmch-badge[data-cli-executor]::before { content: none; }
 .dmch-dot { flex: none; width: 6px; height: 6px; border-radius: 50%; background: var(--dsw-alias-label-tertiary, #8e97a8); }
 .dmch-dot-running { background: var(--dsw-alias-state-success-primary, #16a34a); animation: dmch-pulse 1.4s ease-in-out infinite; }
 .dmch-dot-done { background: var(--dsw-alias-label-tertiary, #8e97a8); }
@@ -74,7 +51,8 @@ const HEADER_CSS = `
   backdrop-filter: none;
 }
 .dmch-menu-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; padding: 6px 8px 4px; font-size: 10.5px; color: var(--dsw-alias-label-tertiary, #646d80); }
-.dmch-menu-body { display: flex; flex-direction: column; gap: 1px; overflow: auto; }
+.dmch-menu-scroll { flex: 1 1 auto; min-height: 0; overflow: auto; }
+.dmch-menu-body { display: flex; flex-direction: column; gap: 1px; }
 .dmch-row {
   display: flex; align-items: flex-start; gap: 6px; width: 100%; min-height: 42px;
   padding: 6px 7px 6px 9px; border: 0; border-radius: var(--dsw-radius-md, 8px);
@@ -104,46 +82,16 @@ const HEADER_CSS = `
 .dmch-empty { padding: 12px 10px; font-size: 11px; color: var(--dsw-alias-label-tertiary, #646d80); text-align: center; }
 .dmch-foot { padding: 4px 8px 6px; font-size: 10px; color: var(--dsw-alias-label-tertiary, #646d80); }
 
-/* 内核那颗 chip 只在 body 标记存在时让位；标记由下面的 effect 打在它的根节点上。
- * 选择器/标记失效的后果只是两颗并存，不会丢信息。第二行是兜底：直接把内核
- * 触发器按钮藏掉（自己的按钮带 data-dmc-trigger，不会被选中）。 */
-body[${BODY_FLAG}] [data-maestro-core-chip] { display: none !important; }
-body[${BODY_FLAG}] button[aria-haspopup="tree"][aria-label*="子智能体"]:not([data-dmc-trigger]),
-body[${BODY_FLAG}] button[aria-haspopup="tree"][aria-label*="subagent" i]:not([data-dmc-trigger]) { display: none !important; }
+.dmch-inline { position: static; z-index: auto; width: auto; max-width: none; max-height: none; padding: 4px 0 0; border: 0; box-shadow: none; background: none; }
+.dmch-inline .dmch-menu-head { padding-inline: 7px; }
+.dmch-inline .dmch-menu-body, .dmch-inline .dmch-menu-scroll { overflow: visible; }
 `
 
 /** 没有 host 时的稳定空壳（避免每次渲染新建对象导致订阅反复重建）。 */
 const EMPTY_HOST: BoardHost = { get: () => undefined }
 
-let headerStyleInjected = false
-let bodyFlagUsers = 0
-
 function useHeaderStyles(): void {
-  useEffect(() => {
-    // 行头执行者徽标的品牌色/logo 来自看板的注入式样式表（accent.ts），
-    // 与看板节点右上角同一个词汇表、同一份配色。
-    injectBoardAccent()
-    if (headerStyleInjected) return
-    headerStyleInjected = true
-    if (document.querySelector(`style[data-maestro-header=${JSON.stringify(HEADER_STYLE_ID)}]`) === null) {
-      const tag = document.createElement('style')
-      tag.dataset.maestroHeader = HEADER_STYLE_ID
-      tag.textContent = HEADER_CSS
-      document.head.appendChild(tag)
-    }
-  }, [])
-}
-
-function useBodyFlag(on: boolean): void {
-  useEffect(() => {
-    if (!on) return
-    bodyFlagUsers += 1
-    document.body.setAttribute(BODY_FLAG, '1')
-    return () => {
-      bodyFlagUsers -= 1
-      if (bodyFlagUsers <= 0) document.body.removeAttribute(BODY_FLAG)
-    }
-  }, [on])
+  useEffect(() => { injectBoardAccent() }, [])
 }
 
 /** 页头一行：本地子代理、CLI 子代理、其它 external 目录行共用。 */
@@ -165,6 +113,19 @@ interface HeaderRow {
    * DSH = dsh 原生子智能体；external 行不知道执行者，不给徽标。
    */
   readonly executor?: string
+}
+
+const EXECUTOR_NAMES: Readonly<Record<string, string>> = { claude: 'Claude', codex: 'Codex', grok: 'Grok', DSH: 'DSH' }
+const EXECUTOR_ORDER = ['claude', 'codex', 'grok', 'DSH'] as const
+
+/** Reuse licensed existing masks, with an explicit accessible icon node. */
+export function ExecutorIcon({ executor }: { readonly executor: string }): ReactNode {
+  const brand = Object.hasOwn(EXECUTOR_BRANDS, executor) ? EXECUTOR_BRANDS[executor] : undefined
+  if (brand === undefined) return null
+  const mask = `${brand.mask} center / contain no-repeat`
+  return <span className="dmch-executor-icon" data-cli-icon={executor} role="img"
+    aria-label={`${EXECUTOR_NAMES[executor] ?? executor} 图标`}
+    style={{ color: brand.color, backgroundColor: 'currentColor', WebkitMask: mask, mask }} />
 }
 
 /** 一颗点。 */
@@ -194,40 +155,59 @@ export function headerTokenText(tokens: HeaderTokenUsage | undefined, options: {
  *
  * slot 注入了 `host`（会话 feed 的入口），标准 props 带来当前的 `sessionId`。
  */
-export function CliCatalogChip(props: { readonly sessionId?: string; readonly host?: BoardHost }): ReactNode {
+export function CliCatalogChip(props: {
+  readonly sessionId?: string | undefined
+  readonly host?: BoardHost | undefined
+  readonly nativeCatalog?: boolean | undefined
+  readonly addressedChild?: boolean | undefined
+  readonly inline?: boolean | undefined
+  readonly sessionList?: BoardSessionList | undefined
+  readonly fallbackTask?: { readonly taskId: string; readonly cli?: MaestroCliId } | undefined
+  readonly openCliFallback?: ((taskId: string, cli?: MaestroCliId) => void) | undefined
+  readonly onCloseFallback?: (() => void) | undefined
+  readonly footerAvailable?: boolean | undefined
+  readonly renderFooter?: (() => ReactNode) | undefined
+}): ReactNode {
   useHeaderStyles()
-  const { sessionId, host } = props
+  const { sessionId, host, inline = false } = props
   const [open, setOpen] = useState(false)
   const [openError, setOpenError] = useState<string>()
   const [menuAt, setMenuAt] = useState<{ left: number; top: number }>()
-  const rootRef = useRef<HTMLSpanElement>(null)
+  const rootRef = useRef<HTMLDivElement>(null)
   const menuRef = useRef<HTMLDivElement>(null)
-  const list = useSessionList(host ?? EMPTY_HOST)
+  const rootList = useSessionList(props.sessionList === undefined ? host ?? EMPTY_HOST : EMPTY_HOST)
+  const list = props.sessionList ?? rootList
   const access = useCliAccess(list, sessionId)
   const [sessionTask, setSessionTask] = useState<HeaderRow | undefined>(undefined)
-  useEffect(() => { setSessionTask(undefined); setOpen(false); setOpenError(undefined) }, [sessionId, access?.token])
-  const tasks = useCliTasks(sessionId !== undefined, sessionId === undefined ? undefined : [sessionId], access)
-  const nativeAside = hasBoardTranscriptAside(host ?? EMPTY_HOST)
-
+  useEffect(() => { setSessionTask(undefined); setOpen(false); setOpenError(undefined); props.onCloseFallback?.() }, [sessionId, access?.token, props.onCloseFallback])
   const session = sessionId === undefined ? undefined : list.byId[sessionId]
-  const isChild = session?.origin === 'subagent'
+  const isChild = props.addressedChild === true || session?.origin === 'subagent'
+  const projection = sessionId === undefined ? undefined : list.projectionsBySession?.[sessionId]
+  const catalogError = projection?.state === 'error'
+  const catalogPending = projection?.state === 'loading' || projection?.state === 'idle'
+  const catalogUnavailable = projection === undefined
+  const catalogUncertain = catalogError || catalogPending || catalogUnavailable
+  const active = sessionId !== undefined && !isChild
+  const tasks = useCliTasks(active, sessionId === undefined ? undefined : [sessionId], access)
+  const nativeAside = hasBoardTranscriptAside(host ?? EMPTY_HOST)
 
   // 只有真的在跑的任务/子会话才需要每秒推进耗时。空闲时完全停表：页头 chip
   // 常驻会话页，每秒 setState 一次会让整块 header 跟着重渲染，而打字也发生在
   // 同一个 renderer 主线程上。已结算的耗时是静态值，不依赖“现在”。
   const ticking = useMemo<boolean>(() => {
+    if (!active) return false
     if (tasks.tasks.some(task => !(TERMINAL_PHASES as readonly string[]).includes(task.phase))) return true
-    if (sessionId === undefined) return false
+    if (sessionId === undefined || inline) return false
     const projections = list.projectionsBySession ?? {}
     const catalog = projections[sessionId]?.values.subagentCatalog ?? []
     return catalog.some(entry => entry.mode !== 'external'
       && (list.byId[entry.id]?.running === true
         || projections[entry.id]?.values.subagentTiming?.active !== undefined))
-  }, [tasks.tasks, list, sessionId])
+  }, [tasks.tasks, list, sessionId, active, inline])
   const now = useNow(ticking)
 
   const rows = useMemo<HeaderRow[]>(() => {
-    if (sessionId === undefined || list.byId[sessionId] === undefined) return []
+    if (sessionId === undefined) return []
     const projections = list.projectionsBySession ?? {}
     const catalog: readonly BoardCatalogEntry[] = projections[sessionId]?.values.subagentCatalog ?? []
 
@@ -244,11 +224,12 @@ export function CliCatalogChip(props: { readonly sessionId?: string; readonly ho
       }
     }
 
-    const cliTasks: readonly MaestroTaskSummary[] = tasks.tasks.filter(task => task.sessionId === sessionId)
+    const cliTasks: readonly MaestroTaskSummary[] = [...new Map(tasks.tasks.filter(task => task.sessionId === sessionId).map(task => [task.id, task])).values()]
     const cliIds = new Set(cliTasks.map(task => task.id))
     const out: HeaderRow[] = []
+    const catalogEntries = [...new Map(catalog.map(entry => [entry.id, entry])).values()]
 
-    for (const entry of catalog) {
+    for (const entry of catalogEntries) {
       if (entry.mode === 'external') continue
       const mirroredTaskId = entry.id.startsWith('cli-') ? entry.id.slice(4) : entry.id
       if (cliIds.has(mirroredTaskId)) continue
@@ -304,10 +285,10 @@ export function CliCatalogChip(props: { readonly sessionId?: string; readonly ho
     }
 
     // 别的插件写的 external 目录行：没有 task 可合并，保留成不可点的叶子。
-    for (const entry of catalog) {
+    for (const entry of catalogEntries) {
       if (entry.mode !== 'external') continue
-      // 插件自己写的 CLI 目录行 childId 就是 taskId（早期版本还用过 `cli-` 前缀）。
-      const mirrored = cliIds.has(entry.id) || (entry.id.startsWith('cli-') && cliIds.has(entry.id.slice(4)))
+      const mirroredTaskId = entry.id.startsWith('cli-') ? entry.id.slice(4) : entry.id
+      const mirrored = cliIds.has(mirroredTaskId) || out.some(row => row.key === `cli:${mirroredTaskId}`)
       if (mirrored) continue
       out.push({
         key: `external:${entry.id}`,
@@ -322,42 +303,24 @@ export function CliCatalogChip(props: { readonly sessionId?: string; readonly ho
       if (left.running !== right.running) return left.running ? -1 : 1
       return left.label.localeCompare(right.label, 'zh-Hans-CN')
     })
-  }, [sessionId, list, tasks.tasks, now])
+  }, [sessionId, list, tasks.tasks, now, inline])
 
+  const executorCounts = EXECUTOR_ORDER.map(executor => ({ executor, count: rows.filter(row => row.executor === executor).length })).filter(item => item.count > 0)
   const runningCount = rows.filter(row => row.running).length
-  /* 只在存在子智能体时接管：纯本地子代理也使用插件统一样式，避免原生菜单与 CLI/DSH 混合菜单外观不一致。 */
-  const visible = rows.length > 0 && sessionId !== undefined && !isChild
-  useBodyFlag(visible)
-
-  /* 把内核那颗 chip 藏起来：slot 条目按 id 去重且先注册者胜，插件无法注销它，
-   * 只能在自己的 chip 挂载后从 DOM 上让位。只认带「子智能体/subagent」的
-   * aria-label 且不在本 chip 内的触发器，避免误伤作业、用量等其它页头按钮。 */
+  const hasFeedback = tasks.error !== undefined || tasks.loading
+  const team = projection?.values.agentTeam as { readonly enabled?: boolean; readonly tasks?: readonly { readonly status?: string }[]; readonly failure?: unknown } | undefined
+  const teamContent = props.footerAvailable === true && team?.enabled === true
+    && (team.tasks?.some(task => task.status !== 'deleted') === true || team.failure !== undefined)
+  const visible = (rows.length > 0 || hasFeedback || teamContent || catalogUncertain) && sessionId !== undefined && !isChild
+  const title = rows.length > 0 ? `${String(rows.length)} 个${catalogUncertain ? '已知' : ''}子智能体` : '子智能体 / 协作'
   useEffect(() => {
-    if (!visible) return
-    const slot = document.querySelector('[data-slot="conversation.session.header.actions"]')
-    if (slot === null) return
-    const marked = new Set<HTMLElement>()
-    const apply = (): void => {
-      for (const trigger of slot.querySelectorAll<HTMLElement>('button[aria-haspopup="tree"]')) {
-        if (trigger.closest('[data-dmc-chip]') !== null) continue
-        if (!/(个子智能体|subagent)/i.test(trigger.getAttribute('aria-label') ?? '')) continue
-        const parent = trigger.parentElement
-        // 根节点若还挂着别的按钮就不整块藏，只藏触发器本身。
-        const target = parent !== null && parent.querySelectorAll('button').length === 1 ? parent : trigger
-        target.setAttribute('data-maestro-core-chip', '1')
-        marked.add(target)
-      }
-    }
-    apply()
-    const observer = new MutationObserver(apply)
-    observer.observe(slot, { childList: true, subtree: true })
-    return () => {
-      observer.disconnect()
-      for (const element of marked) element.removeAttribute('data-maestro-core-chip')
-    }
+    if (!visible) setOpen(false)
   }, [visible])
 
-  const close = useCallback(() => { setOpen(false) }, [])
+  const close = useCallback(() => {
+    setOpen(false)
+    if (!inline) rootRef.current?.querySelector<HTMLButtonElement>('[data-dmc-trigger]')?.focus()
+  }, [inline])
   useEffect(() => {
     if (!open) return
     const onPointer = (event: PointerEvent): void => {
@@ -375,7 +338,13 @@ export function CliCatalogChip(props: { readonly sessionId?: string; readonly ho
     }
   }, [open, close])
 
-  if (!visible) return null
+  const fallbackId = props.fallbackTask?.taskId ?? sessionTask?.target
+  const fallbackCli = props.fallbackTask?.cli ?? sessionTask?.cliTask?.cli
+  const overlay = fallbackId === undefined ? null : createPortal(
+    <div style={{ position: 'fixed', inset: 24, zIndex: 121 }}>
+      <SessionPage taskId={fallbackId} {...(fallbackCli === undefined ? {} : { cli: fallbackCli })} {...(sessionId === undefined ? {} : { sessionIds: [sessionId] })} {...(access === undefined ? {} : { access })} onClose={() => { setSessionTask(undefined); props.onCloseFallback?.() }} />
+    </div>, document.body)
+  if (!visible) return overlay
 
   const toggle = (): void => {
     if (open) { setOpen(false); return }
@@ -391,28 +360,35 @@ export function CliCatalogChip(props: { readonly sessionId?: string; readonly ho
   }
 
   return (
-    <span className="dmch-wrap" ref={rootRef} data-dmc-chip="">
-      <button
+    <div className={inline ? 'dmch-wrap dmch-footer' : 'dmch-wrap'} ref={rootRef} data-dmc-chip="">
+      <style data-maestro-header="catalog">{HEADER_CSS}</style>
+      {inline ? null : <button
         type="button"
         className={`dmch-trigger${open ? ' dmch-trigger-on' : ''}`}
         data-dmc-trigger=""
         aria-haspopup="tree"
         aria-expanded={open}
-        aria-label={`${String(rows.length)} 个子智能体`}
+        aria-label={`${title}${executorCounts.length === 0 ? '' : `；${executorCounts.map(item => `${EXECUTOR_NAMES[item.executor]} ${item.count} 个`).join('，')}`}`}
         onClick={toggle}
       >
         {runningCount > 0 ? <span className="dmch-dot dmch-dot-running" /> : undefined}
-        <span>{rows.length} 个子智能体</span>
+        <span>{title}</span>
+        <span className="dmch-executors" aria-hidden="true">
+          {executorCounts.map(({ executor, count }) => <span key={executor} className="dmch-executor-summary" data-cli-summary={executor}
+            title={`${EXECUTOR_NAMES[executor]} · ${String(count)} 个`}>
+            <ExecutorIcon executor={executor} /><span>{count}</span>
+          </span>)}
+        </span>
         <svg className="dmch-chevron" width="12" height="12" viewBox="0 0 12 12" aria-hidden="true">
           <path d="M3 4.5 6 7.5 9 4.5" fill="none" stroke="currentColor" strokeWidth="1.2" strokeLinecap="round" strokeLinejoin="round" />
         </svg>
-      </button>
-      {open && menuAt !== undefined
-        ? createPortal(
+      </button>}
+      {inline || (open && menuAt !== undefined)
+        ? ((panel: ReactNode) => inline ? panel : createPortal(panel, document.body))(
           <div
-            className="dmch-menu"
+            className={inline ? 'dmch-menu dmch-inline' : 'dmch-menu'}
             ref={menuRef}
-            style={{ left: menuAt.left, top: menuAt.top }}
+            style={inline ? undefined : { left: menuAt?.left, top: menuAt?.top }}
             role="tree"
             aria-label="子智能体"
             // 菜单 portal 到 body，脱离 wrap 的 data-dmc-chip 作用域；行头
@@ -421,8 +397,9 @@ export function CliCatalogChip(props: { readonly sessionId?: string; readonly ho
           >
             <div className="dmch-menu-head">
               <span>{runningCount > 0 ? `${String(runningCount)} 个运行中` : '全部已结束'}</span>
-              <span>{rows.length} 个</span>
+              <span>{rows.length > 0 ? title : tasks.loading || catalogPending ? '读取中' : '列表不可用'}</span>
             </div>
+            <div className="dmch-menu-scroll">
             <div className="dmch-menu-body">
               {rows.map((row) => {
                 const tokens = headerTokenText(row.tokens, row)
@@ -437,7 +414,10 @@ export function CliCatalogChip(props: { readonly sessionId?: string; readonly ho
                     disabled={!canOpen}
                     onClick={!canOpen ? undefined : () => {
                       if (row.cli === true) {
-                        if (row.cliTask === undefined || !jumpBoardCliSession(host ?? EMPTY_HOST, row.cliTask, sessionId === undefined ? undefined : [sessionId])) setSessionTask(row)
+                        if (row.cliTask === undefined || !jumpBoardCliSession(host ?? EMPTY_HOST, row.cliTask, sessionId === undefined ? undefined : [sessionId])) {
+                          if (props.openCliFallback !== undefined && row.target !== undefined) props.openCliFallback(row.target, row.cliTask?.cli)
+                          else setSessionTask(row)
+                        }
                       } else if (row.childAddress === undefined || !jumpBoardAddress(host ?? EMPTY_HOST, row.childAddress)) {
                         setOpenError('无法打开 DSH 子会话，请确认右侧会话栏已加载后重试。')
                         return
@@ -453,7 +433,8 @@ export function CliCatalogChip(props: { readonly sessionId?: string; readonly ho
                         {row.executor === undefined ? undefined : (
                           <span className="dmch-badge" data-cli-executor={row.executor}
                             title={row.executor === 'DSH' ? DSH_BADGE_TITLE : `CLI · ${row.executor}`}>
-                            {row.executor}
+                            <ExecutorIcon executor={row.executor} />
+                            <span>{EXECUTOR_NAMES[row.executor] ?? row.executor}</span>
                           </span>
                         )}
                         <span className="dmch-label">{row.label}</span>
@@ -468,17 +449,20 @@ export function CliCatalogChip(props: { readonly sessionId?: string; readonly ho
                 )
               })}
             </div>
+            {props.footerAvailable === true ? <div className="dmch-extension">{props.renderFooter?.()}</div> : null}
+            </div>
+            {catalogError ? <div className="dmch-foot" role="alert">DSH 子智能体目录读取失败；这里只显示已知条目，请刷新后重试。</div> : null}
+            {catalogPending ? <div className="dmch-foot" role="status">DSH 子智能体目录尚未读取完成；这里只显示已知条目。</div> : null}
+            {catalogUnavailable ? <div className="dmch-foot" role="status">DSH 子智能体目录信息暂不可用；这里只显示已知条目。</div> : null}
+            {tasks.error === undefined ? null : <div className="dmch-foot" role="alert">CLI 任务列表无法读取：{tasks.error}</div>}
+            {tasks.loading && rows.length === 0 ? <div className="dmch-foot" role="status">正在读取 CLI 任务</div> : null}
             {openError === undefined ? null : <div className="dmch-foot" role="alert">{openError}</div>}
-            <div className="dmch-foot">显示已采集的 CLI 用量；未采集不代表零消耗</div>
+            <div className="dmch-foot">图标标明执行器；同一任务去重显示，未采集用量不代表零消耗。</div>
           </div>,
-          document.body,
         )
         : undefined}
-      {sessionTask?.target === undefined ? null : createPortal(
-        <div style={{ position: 'fixed', inset: 24, zIndex: 121 }}>
-          <SessionPage taskId={sessionTask.target} {...(sessionTask.cliTask === undefined ? {} : { cli: sessionTask.cliTask.cli })} {...(sessionId === undefined ? {} : { sessionIds: [sessionId] })} {...(access === undefined ? {} : { access })} onClose={() => { setSessionTask(undefined) }} />
-        </div>, document.body)}
-    </span>
+      {overlay}
+    </div>
   )
 }
 

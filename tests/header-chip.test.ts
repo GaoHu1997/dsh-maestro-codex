@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
 import { act, createElement } from 'react'
-import { createRoot } from 'react-dom/client'
+import { createRoot, type Root } from 'react-dom/client'
 import { renderToStaticMarkup } from 'react-dom/server'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 
@@ -61,6 +61,18 @@ describe('CliCatalogChip', () => {
     expect(html).toContain('data-dmc-trigger')
   })
 
+  it('retains the owned unified trigger and explicit executor summaries with legacy nativeCatalog=true', () => {
+    const html = renderToStaticMarkup(createElement(CliCatalogChip, { sessionId: 's1', nativeCatalog: true, host: { get: () => undefined } }))
+    expect(html).toContain('2 个子智能体')
+    expect(html).toContain('data-dmc-trigger')
+    expect(html).toContain('data-cli-summary="DSH"')
+    expect(html).toContain('data-cli-summary="codex"')
+    expect(html).toContain('data-cli-icon="DSH"')
+    expect(html).toContain('data-cli-icon="codex"')
+    expect(html).toContain('Codex 1 个')
+    expect(html).not.toContain('CLI 任务 (')
+  })
+
   it('hides itself on subagent sessions (the core lineage chip owns that header)', () => {
     const html = renderToStaticMarkup(createElement(CliCatalogChip, { sessionId: 'child-1', host: { get: () => undefined } }))
     expect(html).toBe('')
@@ -70,7 +82,9 @@ describe('CliCatalogChip', () => {
 /* 菜单行要等触发器点开才渲染，静态渲染只出 chip 本体；这里直接驱动组件
  * 的菜单层：行头执行者徽标 + 副行的模式词（已移除）。 */
 describe('header catalog menu rows', () => {
+  const roots: Root[] = []
   afterEach(() => {
+    act(() => { for (const root of roots.splice(0)) root.unmount() })
     document.querySelector('.dmch-menu')?.remove()
     document.body.innerHTML = ''
     document.body.removeAttribute('data-maestro-cli-header')
@@ -80,6 +94,7 @@ describe('header catalog menu rows', () => {
     const container = document.createElement('div')
     document.body.appendChild(container)
     const root = createRoot(container)
+    roots.push(root)
     act(() => {
       root.render(createElement(CliCatalogChip, { sessionId: 's1', host: { get: () => undefined } }))
     })
@@ -96,6 +111,13 @@ describe('header catalog menu rows', () => {
     const badges = [...menu.querySelectorAll<HTMLElement>('[data-cli-executor]')].map(badge => badge.dataset.cliExecutor)
     // dsh 原生行标 DSH；CLI 行标它真正的执行者（不是笼统的 CLI）。
     expect(badges.sort()).toEqual(['DSH', 'codex'])
+    for (const executor of badges) {
+      const icon = menu.querySelector(`[data-cli-executor="${executor}"] [data-cli-icon="${executor}"]`)
+      expect(icon).not.toBeNull()
+      expect(icon?.getAttribute('role')).toBe('img')
+    }
+    expect(menu.textContent).toContain('运行中')
+    expect(menu.textContent).toContain('tok')
     expect(menu.textContent).not.toContain('可续接')
     expect(menu.textContent).not.toContain('一次性')
     // CLI 行副行不再重复 CLI 名（执行者徽标已经说了）。

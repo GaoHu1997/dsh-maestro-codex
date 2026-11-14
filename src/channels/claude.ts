@@ -329,7 +329,12 @@ export async function runClaudeTask(options: {
 
   let finalText = ''
   let sessionId = ''
+  // A failed/malformed terminal result is irreversible within this one run.
+  // This is intentionally local: Grok shares display/usage helpers, not this
+  // Claude Code result contract.
   let resultError: string | undefined
+  let successfulResultSeen = false
+  let protocolStreamFailed = false
   let resultStats: Record<string, string | number | boolean> = {}
   let liveUsage: Record<string, string | number | boolean> = {}
   const toolNamesById = new Map<string, string>()
@@ -365,25 +370,39 @@ export async function runClaudeTask(options: {
     if (frame.type === 'result') {
       const parsed = claudeResultOf(frame)
       finalText = parsed.finalText
-      resultStats = parsed.stats
-      if (frame.is_error === true && (frame.result ?? '').trim() !== '') resultError = frame.result
+      resultStats = { ...resultStats, ...parsed.stats }
+      if (frame.subtype !== 'success') {
+        resultError ??= frame.is_error === true && finalText.trim() !== ''
+          ? finalText
+          : `Claude CLI 未返回成功终态（result subtype=${frame.subtype ?? 'unknown'}）`
+      } else if (frame.is_error !== false) {
+        resultError ??= frame.is_error === true && finalText.trim() !== ''
+          ? finalText
+          : 'Claude CLI 返回无效终态（success result 必须明确 is_error=false）'
+      } else if (finalText.trim() === '') {
+        resultError ??= 'Claude CLI 未返回文本结果（result 帧缺失或为空）'
+      } else {
+        successfulResultSeen = true
+      }
     }
-    // Live counters: assistant frames move them as the answer streams, the
-    // result frame lands the authoritative totals.
+    // Keep measured usage even without an observer or a terminal result:
+    // cancellation, timeout and malformed endings must not erase real spend.
+    // Result totals replace their supplied buckets; absent buckets stay known.
     const streamed = frame.type === 'result' ? frame.usage : frame.type === 'assistant' ? frame.message?.usage : undefined
-    if (streamed !== undefined && options.onUsage !== undefined) {
+    if (streamed !== undefined) {
       liveUsage = mergeLiveUsage(liveUsage, streamed, frame.type === 'result' ? 'result' : 'assistant')
-      options.onUsage({ ...liveUsage })
+      options.onUsage?.({ ...liveUsage })
     }
   }
 
-  const { outcome } = runProcess({
+  const { child, outcome } = runProcess({
     ...(options.spawnFn === undefined ? {} : { spawnFn: options.spawnFn }),
     file: options.claudePath,
     args,
     ...(options.cwd === undefined ? {} : { cwd: options.cwd }),
     ...(Object.keys(env).length === 0 ? {} : { env }),
     stdin: options.task,
+    environmentPolicy: 'scrub',
     timeoutMs: options.timeoutMs,
     timeoutMode: 'idle',
     onTimeoutWarning: remainingMs => {
@@ -398,13 +417,20 @@ export async function runClaudeTask(options: {
       options.onEvent('note', `stderr: ${line.slice(0, 300)}`)
     },
   })
-  const ended = await outcome
+  const onProtocolStreamError = (): void => { protocolStreamFailed = true }
+  child.stdout?.on('error', onProtocolStreamError)
+  const ended = await outcome.finally(() => { child.stdout?.removeListener('error', onProtocolStreamError) })
 
-  const stats = { ...resultStats }
+  const stats = { ...liveUsage, ...resultStats }
+  // Assistant input/cache counts describe one message, not whole-run totals.
+  // Preserve the samples as known subtotals without inventing complete spend.
+  for (const key of ['inputTokens', 'outputTokens', 'cachedInputTokens', 'cacheWriteTokens']) {
+    if (typeof liveUsage[key] === 'number' && typeof resultStats[key] !== 'number') stats[`usagePartial_${key}`] = true
+  }
   if (sessionId !== '') stats['sessionId'] = sessionId
   if (ended.timedOut) stats['timedOut'] = true
   if (recovery.timedOut) stats['reconnectTimedOut'] = true
-  const ok = !ended.timedOut && !recovery.timedOut && !options.signal.aborted && ended.code === 0 && finalText.trim() !== '' && resultError === undefined
+  const ok = !ended.timedOut && !recovery.timedOut && !options.signal.aborted && ended.code === 0 && !protocolStreamFailed && successfulResultSeen && finalText.trim() !== '' && resultError === undefined
   return {
     ok,
     finalText,
@@ -415,6 +441,7 @@ export async function runClaudeTask(options: {
     error: (options.signal.aborted ? '任务已取消，进程已被终止' : undefined)
       ?? (recovery.timedOut ? `CLI 持续重连/重试 ${String(Math.round(options.timeoutMs / 1000))} 秒仍未恢复，进程已被终止（重连诊断不会延长等待）` : undefined)
       ?? resultError
+      ?? (protocolStreamFailed ? 'Claude CLI stdout 协议流失败（输出完整性未确认）' : undefined)
       ?? (ended.timedOut ? `连续无 stdout/stderr 输出 ${String(Math.round(options.timeoutMs / 1000))} 秒超时，进程已被终止（无输出保护，不代表任务语义进展）` : undefined)
       ?? (ended.code === 0 ? undefined : `进程退出码 ${ended.code ?? 'null'}${ended.stderrTail.trim() === '' ? '' : `：${lastLines(ended.stderrTail)}`}`)
       // Exit 0 with no text is a silent CLI (filtered output, crashed renderer):

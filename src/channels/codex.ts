@@ -408,6 +408,7 @@ export async function runCodexTask(options: {
   let threadId = ''
   let turnStatus: 'completed' | 'failed' | undefined
   let pendingStreamError = false
+  let protocolStreamFailed = false
   const failureReasons: string[] = []
   let stats: RolloutUsageStats = {}
   const reconnectController = new AbortController()
@@ -499,7 +500,9 @@ export async function runCodexTask(options: {
       options.onUsage?.({ ...mergeCodexUsageStats(liveUsage, stats) })
     }
     if (frame.type === 'turn.completed') {
-      turnStatus = 'completed'
+      // One exec request owns one terminal turn. A failed terminal cannot be
+      // rehabilitated by a later completion; individual tool/stream retries can.
+      if (turnStatus !== 'failed') turnStatus = 'completed'
       // Some builds emit top-level errors during reconnects. A subsequent
       // completed turn is positive recovery evidence, not a failed task.
       pendingStreamError = false
@@ -512,13 +515,14 @@ export async function runCodexTask(options: {
 
   let ended: ChildOutcome
   try {
-    const { outcome } = runProcess({
+    const { child, outcome } = runProcess({
       ...(options.spawnFn === undefined ? {} : { spawnFn: options.spawnFn }),
       file: options.codexPath,
       args,
       ...(options.cwd === undefined ? {} : { cwd: options.cwd }),
       ...(Object.keys(env).length === 0 ? {} : { env }),
       stdin: options.task,
+      environmentPolicy: 'scrub',
       timeoutMs: options.timeoutMs,
       timeoutMode: 'idle',
       onTimeoutWarning: remainingMs => {
@@ -532,7 +536,9 @@ export async function runCodexTask(options: {
         options.onEvent('note', `stderr: ${line.slice(0, 300)}`)
       },
     })
-    ended = await outcome
+    const onProtocolStreamError = (): void => { protocolStreamFailed = true }
+    child.stdout?.on('error', onProtocolStreamError)
+    ended = await outcome.finally(() => { child.stdout?.removeListener('error', onProtocolStreamError) })
   } finally {
     clearReconnect()
     usageTail?.stop()
@@ -543,16 +549,19 @@ export async function runCodexTask(options: {
   if (threadId !== '') runStats['threadId'] = threadId
   if (timedOut) runStats['timedOut'] = true
   if (reconnectTimedOut) runStats['reconnectTimedOut'] = true
-  // Individual tool errors are recoverable. Final turn/stream state, process
-  // exit, and an actual answer decide whether this CLI task returned a result.
+  // Individual tool errors are recoverable. Exec JSONL's turn.completed is
+  // authoritative; legacy msg text remains visible but supplies no independent
+  // completion contract. Do not infer completion from a message or exit 0.
   const noAnswer = finalText.trim() === ''
-  const ok = !timedOut && !options.signal.aborted && ended.code === 0 && turnStatus !== 'failed' && !pendingStreamError && !noAnswer
+  const ok = !timedOut && !options.signal.aborted && ended.code === 0 && !protocolStreamFailed && turnStatus === 'completed' && !pendingStreamError && !noAnswer
   if (!ok) {
     if (reconnectTimedOut) failureReasons.push(reconnectFailure)
     else if (ended.timedOut) failureReasons.push(`连续无 stdout/stderr 输出 ${String(Math.round(options.timeoutMs / 1000))} 秒超时，进程已被终止（无输出保护，不代表任务语义进展）`)
     else if (options.signal.aborted) failureReasons.push('任务已取消，进程已被终止')
     if (ended.code !== 0) failureReasons.push(`进程退出码 ${ended.code ?? 'null'}`)
+    if (protocolStreamFailed) failureReasons.push('Codex CLI stdout 协议流失败（输出完整性未确认）')
     if (noAnswer) failureReasons.push('Codex CLI 未返回最终答复（缺少非空 agent_message）')
+    if (turnStatus === undefined && !noAnswer && !pendingStreamError) failureReasons.push('Codex CLI 未返回成功终态（缺少 turn.completed）')
     if (ended.stderrTail.trim() !== '') failureReasons.push(`stderr：\n${ended.stderrTail}`)
   }
   return {

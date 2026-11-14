@@ -446,6 +446,7 @@ async function runGrokTaskInHome(options: Parameters<typeof runGrokTask>[0], gro
       args,
       ...(options.cwd === undefined ? {} : { cwd: options.cwd }),
       env,
+      environmentPolicy: 'scrub',
       stdin: options.task,
       timeoutMs: options.timeoutMs,
       timeoutMode: 'idle',

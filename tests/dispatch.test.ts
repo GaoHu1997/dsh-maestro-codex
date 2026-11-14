@@ -261,7 +261,7 @@ describe('runDispatch', () => {
         },
         finish: () => {
           child.finish(JSON.stringify({
-            type: 'result', subtype: 'success', result: 'claude 完成',
+            type: 'result', subtype: 'success', is_error: false, result: 'claude 完成',
             usage: { input_tokens: 900, output_tokens: 30, cache_read_input_tokens: 100, cache_creation_input_tokens: 0 },
           }))
         },
@@ -798,7 +798,7 @@ describe('usage reporting', () => {
       attempt += 1
       const ok = succeeds && attempt === 2
       child.finish(JSON.stringify({
-        type: 'result', is_error: !ok, session_id: `s${attempt}`, num_turns: attempt,
+        type: 'result', subtype: ok ? 'success' : 'error_during_execution', is_error: !ok, session_id: `s${attempt}`, num_turns: attempt,
         result: ok ? 'done' : 'failed', duration_ms: attempt * 10, total_cost_usd: attempt / 10,
         usage: { input_tokens: attempt * 11, output_tokens: attempt * 5, cache_read_input_tokens: attempt * 7, cache_creation_input_tokens: attempt * 3 },
       }), ok ? 0 : 1)

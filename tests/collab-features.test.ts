@@ -52,7 +52,7 @@ function collabCliSpawn(options: { codexRuns?: number; failFirstCodex?: boolean 
     child.onStdin = input => { stdinTexts.push(input) }
     child.finish([
       JSON.stringify({ type: 'system', subtype: 'init', session_id: 's-resume' }),
-      JSON.stringify({ type: 'result', subtype: 'success', result: 'claude 完成', num_turns: 1 }),
+      JSON.stringify({ type: 'result', subtype: 'success', is_error: false, result: 'claude 完成', num_turns: 1 }),
     ].join('\n'))
   })
   return { ...spawn, codexRunsOf: () => codexRuns, stdinTexts }

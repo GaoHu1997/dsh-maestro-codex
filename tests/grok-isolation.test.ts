@@ -75,7 +75,7 @@ describe('Grok MCP environment isolation', () => {
   beforeAll(() => {
     shimDir = mkdtempSync(join(tmpdir(), 'maestro-grok-shim-'))
     writeFileSync(join(shimDir, 'package.json'), JSON.stringify({ type: 'module' }))
-    for (const name of ['spawn', 'mcp-env-shim']) {
+    for (const name of ['child-environment', 'spawn', 'mcp-env-shim']) {
       const source = readFileSync(fileURLToPath(new URL(`../src/${name}.ts`, import.meta.url)), 'utf8')
       writeFileSync(join(shimDir, `${name}.js`), ts.transpileModule(source, {
         compilerOptions: { target: ts.ScriptTarget.ES2023, module: ts.ModuleKind.ES2022 },

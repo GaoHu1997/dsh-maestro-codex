@@ -49,7 +49,7 @@ describe('runClaudeTask reconnect recovery budget', () => {
       child.onStdin = () => { /* keep the process running */ }
       child.once('close', () => { clearInterval(chatter) })
       setTimeout(() => {
-        child.finish(JSON.stringify({ type: 'result', subtype: 'success', result: '完成了', num_turns: 1, session_id: 's1' }))
+        child.finish(JSON.stringify({ type: 'result', subtype: 'success', is_error: false, result: '完成了', num_turns: 1, session_id: 's1' }))
       }, 240)
     })
     const result = await runClaudeTask({

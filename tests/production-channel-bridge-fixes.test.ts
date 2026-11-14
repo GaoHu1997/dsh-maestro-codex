@@ -167,7 +167,7 @@ describe('production fixes: CLI protocol and stream integrity', () => {
 
   it('ignores null/array/malformed nested Claude and Codex frames while retaining later valid results', async () => {
     const frames = ['null', '[]', '1', '{"type":"assistant","message":{"content":[null,{"type":"text","text":7}],"usage":null}}']
-    const { spawnFn } = scriptedSpawn(child => { child.finish([...frames, JSON.stringify({ type: 'result', result: 'answer', subtype: 'success' })].join('\n')) })
+    const { spawnFn } = scriptedSpawn(child => { child.finish([...frames, JSON.stringify({ type: 'result', result: 'answer', subtype: 'success', is_error: false })].join('\n')) })
     const result = await runClaudeTask({ spawnFn, claudePath: 'fake', task: 'task', cwd: undefined, model: '', permissionMode: 'inherit', baseUrl: '', authToken: '', timeoutMs: 5000, signal: new AbortController().signal, onUsage: () => {}, onEvent: () => {} })
     expect(result.ok).toBe(true)
     expect(() => codexFrameEvents({ type: 'item.completed', item: { type: 'reasoning', summary: [null, { text: 7 }] } } as unknown as Parameters<typeof codexFrameEvents>[0])).not.toThrow()

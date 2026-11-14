@@ -78,7 +78,7 @@ function makeDeps(config: EffectiveConfig = effectiveOf({ claudeCliPath: process
 
 /** A settled, continuable task as the session page would find it. */
 function seedContinuable(registry: TaskRegistry, id = 'task-1', cli: 'claude' | 'codex' = 'claude', sessionId: string = 's1'): void {
-  const task = registry.create({ id, cli, title: '首轮任务', cwd: '/work/repo', model: 'm1', ...(sessionId === undefined ? {} : { sessionId }) })
+  const task = registry.create({ id, cli, title: '首轮任务', cwd: process.cwd(), model: 'm1', ...(sessionId === undefined ? {} : { sessionId }) })
   registry.setPhase(task, 'running', '开始执行')
   // The runner records the CLI session reference inside the extensible stats
   // contract; the reply route and the summary both read it from there.
@@ -190,7 +190,7 @@ describe('handleTaskReply validation', () => {
       }),
     }
     // 首轮：归属 s-owner 会话，带上一轮解析出的 dsh 模型（回复据此继承）。
-    const seeded = registry.create({ id: 'task-1', cli: 'claude', title: '首轮任务', cwd: '/work/repo', model: 'm1', sessionId: owner.id })
+    const seeded = registry.create({ id: 'task-1', cli: 'claude', title: '首轮任务', cwd: process.cwd(), model: 'm1', sessionId: owner.id })
     registry.setPhase(seeded, 'running', '开始执行')
     seeded.stats = { sessionRef: 's-first', dshModel: 'wb::gpt-6.1' }
     registry.setPhase(seeded, 'done', '执行完成')
@@ -403,7 +403,7 @@ describe('runDispatch reply semantics', () => {
       controllers,
       pathCache: new CliPathCache(() => config, spawn.spawnFn),
       spawnFn: spawn.spawnFn,
-    }, { cli: 'claude', sessionId: 's1', cwd: '/work/repo', task: '续发指令', replyTo: 'task-1', resume: 's-first' }, new AbortController().signal)
+    }, { cli: 'claude', sessionId: 's1', cwd: process.cwd(), task: '续发指令', replyTo: 'task-1', resume: 's-first' }, new AbortController().signal)
     expect(value.ok).toBe(true)
     const reply = registry.list().find(task => task.replyTo === 'task-1')
     expect(reply?.replyTo).toBe('task-1')

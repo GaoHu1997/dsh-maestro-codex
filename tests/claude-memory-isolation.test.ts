@@ -16,7 +16,7 @@ describe('delegated Claude repository-memory isolation', () => {
       expect(child.spawnArgs).not.toContain('--no-session-persistence')
       expect(child.spawnArgs).not.toContain('--dangerously-skip-permissions')
       if (resume !== undefined) expect(child.spawnArgs.slice(child.spawnArgs.indexOf('--resume'), child.spawnArgs.indexOf('--resume') + 2)).toEqual(['--resume', resume])
-      child.finish(JSON.stringify({ type: 'result', result: 'test-only answer', session_id: resume ?? 'test-only-session' }))
+      child.finish(JSON.stringify({ type: 'result', subtype: 'success', is_error: false, result: 'test-only answer', session_id: resume ?? 'test-only-session' }))
     })
     const result = await runClaudeTask({
       spawnFn: (file, args, options) => {

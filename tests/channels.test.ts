@@ -190,7 +190,7 @@ describe('runClaudeTask (fake spawn)', () => {
         child.finish([
           JSON.stringify({ type: 'system', subtype: 'init', session_id: 's9', model: 'm' }),
           JSON.stringify({ type: 'assistant', message: { content: [{ type: 'text', text: '思考中' }] } }),
-          JSON.stringify({ type: 'result', subtype: 'success', result: '任务完成 42', num_turns: 2, session_id: 's9' }),
+          JSON.stringify({ type: 'result', subtype: 'success', is_error: false, result: '任务完成 42', num_turns: 2, session_id: 's9' }),
         ].join('\n'))
       }
     })
@@ -231,7 +231,7 @@ describe('runClaudeTask (fake spawn)', () => {
           CLAUDE_CODE_DISABLE_AUTO_MEMORY: '1',
         },
       })
-      child.finish(JSON.stringify({ type: 'result', subtype: 'success', result: 'done' }))
+      child.finish(JSON.stringify({ type: 'result', subtype: 'success', is_error: false, result: 'done' }))
     })
     const result = await runClaudeTask({
       spawnFn,
@@ -256,7 +256,7 @@ describe('runClaudeTask (fake spawn)', () => {
       child.finish([
         JSON.stringify({ type: 'assistant', message: { content: [{ type: 'text', text: '想' }], usage: { input_tokens: 900, cache_read_input_tokens: 100, cache_creation_input_tokens: 0, output_tokens: 5 } } }),
         JSON.stringify({ type: 'assistant', message: { content: [{ type: 'text', text: '答' }], usage: { input_tokens: 1200, cache_read_input_tokens: 800, cache_creation_input_tokens: 0, output_tokens: 7 } } }),
-        JSON.stringify({ type: 'result', subtype: 'success', result: '完成', usage: { input_tokens: 2100, cache_read_input_tokens: 1800, cache_creation_input_tokens: 0, output_tokens: 42 } }),
+        JSON.stringify({ type: 'result', subtype: 'success', is_error: false, result: '完成', usage: { input_tokens: 2100, cache_read_input_tokens: 1800, cache_creation_input_tokens: 0, output_tokens: 42 } }),
       ].join('\n'))
     })
     const usage: Array<Record<string, string | number | boolean>> = []
@@ -309,7 +309,7 @@ describe('runClaudeTask (fake spawn)', () => {
     const { spawnFn } = scriptedSpawn(child => {
       child.finish([
         JSON.stringify({ type: 'system', subtype: 'init', session_id: 's1' }),
-        JSON.stringify({ type: 'result', subtype: 'success', result: '' }),
+        JSON.stringify({ type: 'result', subtype: 'success', is_error: false, result: '' }),
       ].join('\n'))
     })
     const result = await runClaudeTask({

@@ -26,7 +26,7 @@ function fixture(hold = false) {
     if (child.spawnArgs[0] === '--version') child.finish('claude version 9.9.9')
     else if (!child.spawnArgs.includes('-p')) child.finish('')
     else if (hold) launched.resolve(child)
-    else child.finish(JSON.stringify({ type: 'result', subtype: 'success', result: 'finished', session_id: 'thread-1' }))
+    else child.finish(JSON.stringify({ type: 'result', subtype: 'success', is_error: false, result: 'finished', session_id: 'thread-1' }))
   })
   const registry = new TaskRegistry(), controllers = new Map<string, AbortController>()
   const limiter = new Limiter(() => 1)
@@ -219,7 +219,7 @@ describe('synchronous same-thread reservation crosses historical anchors and rel
     await vi.waitFor(() => expect(f.spawn.launches.map(launch => launch.spawnArgs)).toContainEqual(expect.arrayContaining(['-p'])))
     const child = f.spawn.launches.find(launch => launch.spawnArgs.includes('-p'))
     expect(child).toBeDefined()
-    child?.finish(JSON.stringify({ type: 'result', subtype: 'success', result: 'finished', session_id: 'thread-1' }))
+    child?.finish(JSON.stringify({ type: 'result', subtype: 'success', is_error: false, result: 'finished', session_id: 'thread-1' }))
     await vi.waitFor(() => expect({ phase: f.registry.get((first.body as { id: string }).id)?.phase,
       controllers: f.controllers.size, claim: f.registry.resumeBusy('claude', 'thread-1') }).toEqual({ phase: 'done', controllers: 0, claim: false }))
     expect(f.registry.resumeBusy('claude', 'thread-1')).toBe(false)
@@ -229,7 +229,7 @@ describe('synchronous same-thread reservation crosses historical anchors and rel
     expect(next.status).toBe(200)
     const taskId = (next.body as { id: string }).id
     await vi.waitFor(() => expect(f.spawn.launches.filter(launch => launch.spawnArgs.includes('-p'))).toHaveLength(2))
-    f.spawn.launches.filter(launch => launch.spawnArgs.includes('-p')).at(-1)?.finish(JSON.stringify({ type: 'result', subtype: 'success', result: 'next finished', session_id: 'thread-1' }))
+    f.spawn.launches.filter(launch => launch.spawnArgs.includes('-p')).at(-1)?.finish(JSON.stringify({ type: 'result', subtype: 'success', is_error: false, result: 'next finished', session_id: 'thread-1' }))
     await vi.waitFor(() => expect(f.controllers.has(taskId)).toBe(false))
     expect(f.registry.resumeBusy('claude', 'thread-1')).toBe(false)
   })

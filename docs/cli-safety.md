@@ -20,6 +20,16 @@ CLI 任务的父会话归属来自宿主 `ToolExec.agent.id`。`sessions`/`scope
 
 Codex `exec resume` 不支持初次 exec 的 `--sandbox` 参数。续接使用等价的 `-c sandbox_mode="workspace-write"` / `read-only` 和 `-c approval_policy="never"` 配置，不能为了续接成功擅自改成 bypass。
 
+## 执行终态、环境与工作目录
+
+Claude 的 `result` 必须明确为 `subtype: success`、`is_error: false` 且文本非空；失败或畸形终态不能被随后一条成功覆盖。Codex exec JSONL 必须观察到 `turn.completed`；只有答案、退出码 0 或旧 `msg` 文本不能证明成功，`turn.failed` 也不能被后续 completed 覆盖。两通道的 stdout 传输失败均阻止成功结算。单次工具错误和可恢复重连仍可在真实成功终态后完成；失败、取消、超时仍保留实际用量和真实续接引用。旧输出若缺少标准成功字段会明确失败，不通过放宽判断兼容未知协议。
+
+三个委派 CLI 显式选择安全环境策略：先清除宿主环境里名称含 `KEY` / `PASSWORD` / `SECRET` / `TOKEN` 以及大小写不敏感的 `DSH_*`，再注入当前任务明确需要的模型凭据、桥接别名和运行设置。PATH、HOME、CODEX_HOME、语言与代理基础环境保留；Windows 显式覆盖按大小写不敏感合并，`undefined` 表示删除。npm 管理、版本检测、Git 快照和 prepare 等通用进程仍默认继承，不把 CLI 安全策略与 idle 超时耦合。
+
+环境名称清理是启发式，不是文件系统沙箱或密钥仓库隔离；原生设置文件可能仍保存凭据。依赖宿主环境中无关 Git/云服务 token 的自定义任务不能再假定这些值会隐式进入 CLI。模型及 MCP 明确声明的凭据继续按现有任务范围注入；不会为解阻自动扩大权限或改用 CLI 自身供应商。
+
+显式 cwd 和最终执行目录都必须是现存、可进入的目录绝对路径，普通文件不能当作工作区；准备步骤后复核目录。省略 cwd 时仍保留本会话目录优先及原有、带提示的宿主目录回退，不在这批优化中静默改变配置语义。可进入性检查不代替 scoped 路径边界，也不能消除检查与实际 spawn 之间的文件系统竞态。
+
 ## 桥接权限
 
 Skill 全文接口与目录遵守同一允许模型调用策略，撤销后不能靠已知名字直读。工具目录采用当前名称排除表，白名单变化对新调用立即生效。每次执行尝试结束时，在发布成功、失败、超时或取消终态之前同步撤销 token，并中止进行中的宿主调用；自动重试不能沿用上一尝试的 token。配置文件清理的延迟或失败不能延长授权。
@@ -43,6 +53,16 @@ stdio MCP 是直接子进程配置；HTTP MCP 是宿主工具桥接路径，不�
 公开模型目录中的端点标签删除 URL userinfo、全部 query 和 fragment；真实模型调用仍使用私有解析出的原端点和凭据。预检响应正文仅用于状态与协议分类，不进入公开 detail；网络异常只展示固定白名单错误码或通用说明。宿主工具和技能加载的意外异常、目录发现及暂存失败不向子代理或日志透传原始异常文本。
 
 宿主工具有意返回的结构化失败正文仍遵守其公开输出契约（包括生图失败正文），不会因为脱敏把失败改写为成功。工具正文自身的敏感数据控制由宿主工具负责，不应把它与意外异常回显混为一谈。
+
+`dispatch_cli_task` 的失败 schema 值及其对话渲染使用同一安全投影：只给固定阶段/类别与有效退出码，不默认复制原始 stderr、任意产品错误、失败时部分文本或原始 notes 到父模型。taskId、真实 sessionRef、cwd 等恢复身份仍返回，`ok:false` 与原终态不变；受当前父会话能力控制的任务详情继续保存原始错误、部分输出与实际用量，供排障及原 CLI 续接。成功答案保持原文和既有长度上限。安全摘要不是修改 canonical 任务记录，也不能被当作已经成功完成。
+
+## 顶部目录与新版宿主
+
+Maestro 自有统一入口始终是主入口：顶部与菜单行显式展示 Claude / Codex / Grok / DSH 品牌图标，保留执行器徽标、状态、用量与原 CLI 续接。人数从自有混合目录按 taskId/childSessionId 去重，不用原生计数替代，也不把 Team 任务计成人数。通过公开同 id/priority 注册覆盖原生 actions 计数单元，不靠 body 标记、ARIA CSS 或 MutationObserver 隐藏 DOM；原生独立 lineage 和 composer 注册不动。
+
+真实 `slots.entries()` 返回的 id 在 `entry.options.id`，不能用扁平 fake 掩盖探测错误。原生 footer 是唯一声明，不能在自有赢家重复声明或借它的 renderer 权限。自有入口声明独立 `.maestro.footer`，将 `entriesOfSlot` 的有效叶子贡献经正常 `slots.register` 镜像，并由当前 scope 的 `props.renderSlot` 渲染；不手工调用外部 inject/component、不导入宿主 Client 包。包含 children/store 的复杂贡献不盲目复制；源贡献卸载及 owner 清理会解除镜像。当前 Team 是标准 session scope 的叶子贡献。
+
+市场与直接安装重复加载时，顶部共享当前应用 lease，只保留一颗自有入口；活跃 owner 卸载移交剩余 owner，最后清理订阅、镜像与注册，不改用户插件配置。CLI 列表仍要求当前父会话能力，缺失权限或读取失败明确反馈；DSH 目录错误、加载中或投影信息暂不可用时也保留自有入口，只标「已知」条目而不伪称完整人数或零任务。CLI fallback 会话由自有稳定入口持有，不因菜单关闭或原生记录到来而消失，父会话/token 变更清理。源码、真实 SlotCore 探针与单测均不等于当前 GUI 视觉核验。
 
 ## 宿主能力检测
 
